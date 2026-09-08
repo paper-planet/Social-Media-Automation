@@ -1,0 +1,5 @@
+# Ignore local account sessions and state tracking files
+session_*.json
+history_*.json
+scraper_session.json
+*.log
