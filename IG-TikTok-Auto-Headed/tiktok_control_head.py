@@ -8,12 +8,11 @@ Local-only TikTok automation dashboard with:
 - Open Login -> user completes TikTok login/challenge manually -> Save Login
 - Quick Login validates a saved profile only when explicitly clicked
 - Disconnect keeps saved profile; Clear Saved Login removes TikTok cookies/storage
-- Per-account modes:
-    balanced, upload_only, follow_only, engage_only, dm_only, manual
+- Independent per-account feature switches for posts, follows, engagement, DMs and comments
 - Per-account editable persona/caption/DM/comment prompts
 - Per-account caption/reply char limits
 - Per-account target accounts / hashtags
-- Follow-only mode for followers/following/both of configured target accounts
+- Follow feature can use followers/following/both of configured target accounts
 - Conservative shared write pacing across accounts in this process
 - Video "watching": samples 3-9 chronological frames (default 5)
 - Requires local Ollama vision by default for video posting
@@ -246,14 +245,15 @@ def load_accounts() -> list[dict[str, Any]]:
         aid = str(item.get("id", "")).strip()
         user = normalize_username(item.get("username", ""))
         if aid and user:
-            out.append(
-                {
-                    "id": aid,
-                    "username": user,
-                    "enabled": bool(item.get("enabled", True)),
-                }
-            )
-    return out or json.loads(json.dumps(DEFAULT_ACCOUNTS))
+            out.append({
+                "id": aid,
+                "username": user,
+                "enabled": bool(item.get("enabled", True)),
+            })
+        if len(out) >= 3:
+            break
+    return out
+
 
 
 ACCOUNTS = load_accounts()
@@ -281,8 +281,9 @@ def add_account(username: str) -> dict[str, Any]:
         if a["username"].lower() == username.lower():
             return a
 
-    # Re-adding the same removed username restores its old account id, which
-    # reconnects the same persistent Chromium profile/history/settings.
+    if len(ACCOUNTS) >= 3:
+        raise RuntimeError("The Control Head supports a maximum of 3 configured TikTok accounts.")
+
     removed = load_json(REMOVED_ACCOUNTS_FILE, {})
     removed = removed if isinstance(removed, dict) else {}
     restored_id = str(removed.get(username.lower(), "")).strip()
@@ -305,6 +306,7 @@ def add_account(username: str) -> dict[str, Any]:
     save_accounts()
     ensure_account_analytics(account)
     return account
+
 
 
 def rename_account(account_id: str, username: str) -> None:
@@ -477,7 +479,6 @@ def normalize_list(value: Any, strip_prefix: str = "") -> list[str]:
 
 def default_settings(account: dict[str, Any]) -> dict[str, Any]:
     return {
-        "mode": "balanced",
         "persona_prompt": PERSONA_DEFAULT,
         "caption_prompt": (
             "Narrate what actually happens in the video. For POV/selfie/vlog "
@@ -500,29 +501,29 @@ def default_settings(account: dict[str, Any]) -> dict[str, Any]:
         "follow_limit": 2,
         "video_frames": 5,
         "require_video_vision": True,
-        "enable_dm_replies": True,
-        "enable_comment_replies": True,
+
+        # Independent feature switches.
+        "enable_posts": True,
+        "enable_follow": True,
+        "enable_engage": True,
+        "enable_dms": True,
+        "enable_comments": True,
+
         "headless_automation": False,
         "max_writes_per_window": 5,
         "write_window_seconds": 1200,
         "write_min_gap_seconds": 45,
         "upload_cooldown_seconds": 2400,
         "max_writes_per_workflow": 2,
-        "workflow_min_seconds": 480,
-        "workflow_max_seconds": 1200,
+        "workflow_min_seconds": 360,
+        "workflow_max_seconds": 900,
     }
+
 
 
 def sanitize_settings(account: dict[str, Any], raw: Any) -> dict[str, Any]:
     base = default_settings(account)
     raw = raw if isinstance(raw, dict) else {}
-
-    mode = str(raw.get("mode", base["mode"])).strip().lower()
-    if mode not in {
-        "balanced", "upload_only", "follow_only",
-        "engage_only", "dm_only", "manual",
-    }:
-        mode = "balanced"
 
     source = str(raw.get("follow_source", base["follow_source"])).strip().lower()
     if source not in {"followers", "following", "both"}:
@@ -538,41 +539,47 @@ def sanitize_settings(account: dict[str, Any], raw: Any) -> dict[str, Any]:
     wmin = iv("workflow_min_seconds", 60, 7200)
     wmax = max(wmin, iv("workflow_max_seconds", wmin, 14400))
 
+    legacy_mode = str(raw.get("mode", "")).strip().lower()
+    legacy_map = {
+        "balanced": (True, True, True, True, True),
+        "upload_only": (True, False, False, False, False),
+        "follow_only": (False, True, False, False, False),
+        "engage_only": (False, False, True, False, True),
+        "dm_only": (False, False, False, True, False),
+        "manual": (False, False, False, False, False),
+    }
+    legacy = legacy_map.get(legacy_mode, (True, True, True, True, True))
+
+    def feature(name, idx, old_alias=None):
+        if name in raw:
+            return bool(raw[name])
+        if old_alias and old_alias in raw:
+            return bool(raw[old_alias])
+        if legacy_mode:
+            return bool(legacy[idx])
+        return bool(base[name])
+
     return {
-        "mode": mode,
-        "persona_prompt": str(
-            raw.get("persona_prompt", base["persona_prompt"])
-        )[:6000],
-        "caption_prompt": str(
-            raw.get("caption_prompt", base["caption_prompt"])
-        )[:4000],
+        "persona_prompt": str(raw.get("persona_prompt", base["persona_prompt"]))[:6000],
+        "caption_prompt": str(raw.get("caption_prompt", base["caption_prompt"]))[:4000],
         "dm_prompt": str(raw.get("dm_prompt", base["dm_prompt"]))[:4000],
-        "comment_prompt": str(
-            raw.get("comment_prompt", base["comment_prompt"])
-        )[:4000],
+        "comment_prompt": str(raw.get("comment_prompt", base["comment_prompt"]))[:4000],
         "caption_char_limit": iv("caption_char_limit", 80, 2000),
         "reply_char_limit": iv("reply_char_limit", 20, 1000),
-        "target_accounts": normalize_list(
-            raw.get("target_accounts", base["target_accounts"]), "@"
-        ),
-        "target_hashtags": normalize_list(
-            raw.get("target_hashtags", base["target_hashtags"]), "#"
-        ),
+        "target_accounts": normalize_list(raw.get("target_accounts", base["target_accounts"]), "@"),
+        "target_hashtags": normalize_list(raw.get("target_hashtags", base["target_hashtags"]), "#"),
         "follow_source": source,
         "follow_limit": iv("follow_limit", 1, 10),
         "video_frames": iv("video_frames", 3, 9),
-        "require_video_vision": bool(
-            raw.get("require_video_vision", base["require_video_vision"])
-        ),
-        "enable_dm_replies": bool(
-            raw.get("enable_dm_replies", base["enable_dm_replies"])
-        ),
-        "enable_comment_replies": bool(
-            raw.get("enable_comment_replies", base["enable_comment_replies"])
-        ),
-        "headless_automation": bool(
-            raw.get("headless_automation", base["headless_automation"])
-        ),
+        "require_video_vision": bool(raw.get("require_video_vision", base["require_video_vision"])),
+
+        "enable_posts": feature("enable_posts", 0),
+        "enable_follow": feature("enable_follow", 1),
+        "enable_engage": feature("enable_engage", 2),
+        "enable_dms": feature("enable_dms", 3, "enable_dm_replies"),
+        "enable_comments": feature("enable_comments", 4, "enable_comment_replies"),
+
+        "headless_automation": bool(raw.get("headless_automation", base["headless_automation"])),
         "max_writes_per_window": iv("max_writes_per_window", 1, 20),
         "write_window_seconds": iv("write_window_seconds", 60, 7200),
         "write_min_gap_seconds": iv("write_min_gap_seconds", 10, 600),
@@ -581,6 +588,7 @@ def sanitize_settings(account: dict[str, Any], raw: Any) -> dict[str, Any]:
         "workflow_min_seconds": wmin,
         "workflow_max_seconds": wmax,
     }
+
 
 
 def load_settings_file() -> dict[str, Any]:
@@ -604,18 +612,31 @@ def save_settings(account_id: str, patch: Any) -> dict[str, Any]:
         raise ValueError("Settings must be an object.")
 
     data = load_settings_file()
-    current = data.get(account_id, {})
-    current = dict(current) if isinstance(current, dict) else {}
+    before = sanitize_settings(account, data.get(account_id, {}))
+    current = dict(data.get(account_id, {})) if isinstance(data.get(account_id, {}), dict) else {}
     current.update(patch)
     clean = sanitize_settings(account, current)
-    data[account_id] = clean
-    save_json(SETTINGS_FILE, data)
-    add_activity(
-        f"{account['username']}: saved Control Head settings "
-        f"(mode={clean['mode']})",
-        "good",
-    )
+
+    if clean != before:
+        data[account_id] = clean
+        save_json(SETTINGS_FILE, data)
+        enabled = [
+            label for key, label in (
+                ("enable_posts", "posts"),
+                ("enable_follow", "follow"),
+                ("enable_engage", "engage"),
+                ("enable_dms", "DMs"),
+                ("enable_comments", "comments"),
+            )
+            if clean.get(key)
+        ]
+        add_activity(
+            f"{account['username']}: behavior auto-saved: "
+            + (", ".join(enabled) if enabled else "all features off"),
+            "good",
+        )
     return clean
+
 
 
 # =============================================================================
@@ -1762,34 +1783,6 @@ def choose_unused_folder(
     return random.choice(available) if available else None
 
 
-def choose_mode_task(
-    mode: str,
-    forced_task: str | None = None,
-    account_id: str | None = None,
-) -> str:
-    if forced_task:
-        return forced_task
-    if mode == "manual":
-        return "none"
-    if mode == "upload_only":
-        return "upload"
-    if mode == "follow_only":
-        return "follow"
-    if mode == "engage_only":
-        return "engage"
-    if mode == "dm_only":
-        return "dm"
-
-    choices = ["upload", "follow", "engage"]
-    if account_id:
-        last_task = LAST_TASK_BY_ACCOUNT.get(account_id)
-        if last_task in choices and len(choices) > 1:
-            remaining = [c for c in choices if c != last_task]
-            if remaining:
-                return random.choice(remaining)
-    return random.choice(choices)
-
-
 def maybe_human_delay(fraction: float = 1.0) -> None:
     lo = max(0.0, ACTION_HUMAN_DELAY_MIN_SECONDS * float(fraction))
     hi = max(lo, ACTION_HUMAN_DELAY_MAX_SECONDS * float(fraction))
@@ -1848,6 +1841,8 @@ def execute_upload(
 ) -> int:
     account = find_account(account_id)
     settings = get_settings(account_id)
+    if not settings.get("enable_posts", False):
+        return 0
     folders = discover_media_folders()
     selected = choose_unused_folder(account_id, folders)
     if not selected:
@@ -2115,7 +2110,7 @@ def handle_dms(
 ) -> int:
     account = find_account(account_id)
     settings = get_settings(account_id)
-    if not settings["enable_dm_replies"]:
+    if not settings.get("enable_dms", False):
         return 0
 
     sent = 0
@@ -2140,6 +2135,8 @@ def handle_dms(
         return 0
 
     for index in range(min(4, threads.count())):
+        if not get_settings(account_id).get("enable_dms", False):
+            break
         if sent >= min(per_pass_limit, int(settings["max_writes_per_workflow"])):
             break
 
@@ -2236,7 +2233,7 @@ def handle_comments(
 ) -> int:
     account = find_account(account_id)
     settings = get_settings(account_id)
-    if not settings["enable_comment_replies"]:
+    if not settings.get("enable_comments", False):
         return 0
 
     username = account["username"].lstrip("@")
@@ -2253,6 +2250,8 @@ def handle_comments(
     sent = 0
     per_pass_limit = max(1, min(MAX_COMMENT_REPLIES_PER_PASS_DEFAULT, int(settings["max_writes_per_workflow"])))
     for index in range(min(5, comments.count())):
+        if not get_settings(account_id).get("enable_comments", False):
+            break
         if sent >= min(per_pass_limit, int(settings["max_writes_per_workflow"])):
             break
         container = comments.nth(index)
@@ -2317,6 +2316,8 @@ def engage_hashtag(
 ) -> int:
     account = find_account(account_id)
     settings = get_settings(account_id)
+    if not settings.get("enable_engage", False):
+        return 0
     tags = settings["target_hashtags"]
     if not tags:
         add_activity(
@@ -2339,6 +2340,8 @@ def engage_hashtag(
     max_actions = int(settings["max_writes_per_workflow"])
 
     for _ in range(3):
+        if not get_settings(account_id).get("enable_engage", False):
+            break
         if actions >= max_actions:
             break
         key = stable_key("video", page.url)
@@ -2380,6 +2383,8 @@ def follow_target_network(
     """
     account = find_account(account_id)
     settings = get_settings(account_id)
+    if not settings.get("enable_follow", False):
+        return 0
     targets = settings["target_accounts"]
 
     if not targets:
@@ -2435,6 +2440,8 @@ def follow_target_network(
     # Re-query after clicks because TikTok can mutate the modal DOM.
     index = 0
     while followed < max_follow and index < 30:
+        if not get_settings(account_id).get("enable_follow", False):
+            break
         buttons = root.get_by_role(
             "button",
             name=re.compile(r"^Follow$", re.I),
@@ -2557,23 +2564,13 @@ def run_account_once(
     account = find_account(account_id)
     if not account:
         return
-
     if account_id not in CONNECTED_ACCOUNTS:
-        add_activity(
-            f"{account['username']}: skipped; account is disconnected",
-            "warn",
-        )
         return
 
     lock = account_lock(account_id)
     if not lock.acquire(blocking=False):
-        add_activity(
-            f"{account['username']}: profile is already busy",
-            "warn",
-        )
         return
 
-    settings = get_settings(account_id)
     history = load_history(account_id)
 
     try:
@@ -2587,12 +2584,8 @@ def run_account_once(
             return
         ACCOUNT_COOLDOWNS.pop(account_id, None)
 
-        update_account(
-            account_id,
-            status=f"Running: {settings['mode']}",
-            last_error=None,
-            cooldown_until=None,
-        )
+        settings = get_settings(account_id)
+        update_account(account_id, status="Running", last_error=None, cooldown_until=None)
 
         with sync_playwright() as p:
             context = launch_profile(
@@ -2613,74 +2606,74 @@ def run_account_once(
                     auto_enabled=False,
                     last_error=reason,
                 )
-                add_activity(
-                    f"{account['username']}: automation stopped: {reason}",
-                    "warn",
-                )
                 context.close()
                 return
 
-            mode = settings["mode"]
-            task = choose_mode_task(
-                mode,
-                forced_task=forced_task or NEXT_TASK_OVERRIDE.pop(account_id, None),
-                account_id=account_id,
-            )
+            dm_count = comment_count = post_count = like_count = follow_count = 0
 
-            dm_count = 0
-            comment_count = 0
-            post_count = 0
-            like_count = 0
-            follow_count = 0
-
-            if (
-                settings["enable_dm_replies"]
-                and mode not in {"manual"}
-                and (task == "dm" or should_run_periodic_check(LAST_DM_CHECK, account_id, DM_CHECK_INTERVAL_SECONDS))
-            ):
-                dm_count = handle_dms(page, account_id, history)
-
-            if (
-                settings["enable_comment_replies"]
-                and mode in {"balanced", "engage_only"}
-                and (task == "comments" or should_run_periodic_check(LAST_COMMENT_CHECK, account_id, COMMENT_CHECK_INTERVAL_SECONDS))
-            ):
-                comment_count = handle_comments(page, account_id, history)
-
-            if task == "upload":
+            # Manual tasks still honor feature checkboxes. Manual DM is intentionally removed.
+            if forced_task == "upload":
                 post_count = execute_upload(page, account_id, history)
-            elif task == "follow":
-                follow_count = follow_target_network(
-                    page, account_id, history
-                )
-            elif task == "engage":
-                like_count = engage_hashtag(
-                    page, account_id, history
-                )
-            elif task == "comments":
-                comment_count += handle_comments(
-                    page, account_id, history
-                )
-            elif task == "dm":
-                dm_count += handle_dms(
-                    page, account_id, history
-                )
+            elif forced_task == "follow":
+                follow_count = follow_target_network(page, account_id, history)
+            elif forced_task == "engage":
+                like_count = engage_hashtag(page, account_id, history)
+            elif forced_task == "comments":
+                comment_count = handle_comments(page, account_id, history)
+            else:
+                # Re-read current settings at execution time so checkbox changes
+                # immediately control background behavior.
+                settings = get_settings(account_id)
 
-            LAST_TASK_BY_ACCOUNT[account_id] = task
+                if (
+                    settings.get("enable_dms", False)
+                    and should_run_periodic_check(
+                        LAST_DM_CHECK, account_id, DM_CHECK_INTERVAL_SECONDS
+                    )
+                ):
+                    dm_count = handle_dms(page, account_id, history)
+
+                if (
+                    settings.get("enable_comments", False)
+                    and should_run_periodic_check(
+                        LAST_COMMENT_CHECK, account_id, COMMENT_CHECK_INTERVAL_SECONDS
+                    )
+                ):
+                    comment_count = handle_comments(page, account_id, history)
+
+                settings = get_settings(account_id)
+                choices = []
+                if settings.get("enable_posts", False):
+                    choices.append("upload")
+                if settings.get("enable_follow", False):
+                    choices.append("follow")
+                if settings.get("enable_engage", False):
+                    choices.append("engage")
+
+                if choices:
+                    last_task = LAST_TASK_BY_ACCOUNT.get(account_id)
+                    alternatives = [x for x in choices if x != last_task] or choices
+                    task = random.choice(alternatives)
+                    LAST_TASK_BY_ACCOUNT[account_id] = task
+
+                    if task == "upload":
+                        post_count = execute_upload(page, account_id, history)
+                    elif task == "follow":
+                        follow_count = follow_target_network(page, account_id, history)
+                    elif task == "engage":
+                        like_count = engage_hashtag(page, account_id, history)
+
             save_history(account_id, history)
             current = load_analytics()["accounts"].get(account_id, {})
             update_account(
                 account_id,
-                status=f"Idle: {mode}",
+                status="Connected / Auto On" if account_id in AUTO_ENABLED_ACCOUNTS else "Connected / Auto Off",
                 connected=True,
                 posts_sent=int(current.get("posts_sent") or 0) + post_count,
                 likes_sent=int(current.get("likes_sent") or 0) + like_count,
                 follows_sent=int(current.get("follows_sent") or 0) + follow_count,
                 dm_replies=int(current.get("dm_replies") or 0) + dm_count,
-                comment_replies=(
-                    int(current.get("comment_replies") or 0) + comment_count
-                ),
-                last_action=task,
+                comment_replies=int(current.get("comment_replies") or 0) + comment_count,
                 last_checked=now_iso(),
             )
 
@@ -2688,7 +2681,6 @@ def run_account_once(
                 collect_metrics(page, account_id)
             except Exception:
                 pass
-
             context.close()
 
     except Exception as exc:
@@ -2700,19 +2692,17 @@ def run_account_once(
             last_error=str(exc),
             cooldown_until=cooldown.isoformat(timespec="seconds"),
         )
-        add_activity(
-            f"{account['username']}: automation error: {exc}",
-            "error",
-        )
-        traceback.print_exc()
+        add_activity(f"{account['username']}: automation error: {exc}", "error")
     finally:
         lock.release()
 
 
+
 def start_manual_action(account_id: str, task: str) -> None:
-    allowed = {"upload", "follow", "engage", "comments", "dm"}
+    # Manual DM mode intentionally removed.
+    allowed = {"upload", "follow", "engage", "comments"}
     if task not in allowed:
-        raise ValueError("Unsupported task.")
+        raise ValueError("Unsupported manual task.")
     if account_id not in CONNECTED_ACCOUNTS:
         raise RuntimeError("Quick Login or Save Login first.")
     thread = threading.Thread(
@@ -2722,6 +2712,7 @@ def start_manual_action(account_id: str, task: str) -> None:
         name=f"tiktok-{task}-{account_id}",
     )
     thread.start()
+
 
 
 def enable_auto(account_id: str, enabled: bool) -> None:
@@ -2736,7 +2727,7 @@ def enable_auto(account_id: str, enabled: bool) -> None:
         update_account(
             account_id,
             auto_enabled=True,
-            status=f"Auto: {get_settings(account_id)['mode']}",
+            status="Connected / Auto On",
         )
         add_activity(
             f"{account['username']}: automation enabled",
@@ -2761,35 +2752,32 @@ def enable_auto(account_id: str, enabled: bool) -> None:
 
 def scheduler_loop() -> None:
     add_activity(
-        "TikTok scheduler started; accounts are serialized to reduce bursts",
+        "TikTok scheduler started; up to 3 enabled accounts can work concurrently while writes remain paced",
         "good",
     )
-    while not AUTOMATION_STOP.wait(2):
-        due_accounts = [
-            aid
-            for aid in list(AUTO_ENABLED_ACCOUNTS)
-            if aid in CONNECTED_ACCOUNTS
-            and time.monotonic() >= NEXT_DUE.get(aid, 0.0)
-        ]
-        if not due_accounts:
-            continue
+    while not AUTOMATION_STOP.wait(1.0):
+        now = time.monotonic()
+        for account_id in list(AUTO_ENABLED_ACCOUNTS):
+            if account_id not in CONNECTED_ACCOUNTS:
+                continue
+            if now < NEXT_DUE.get(account_id, 0.0):
+                continue
 
-        # Intentionally run one account at a time.
-        account_id = random.choice(due_accounts)
-        settings = get_settings(account_id)
-        run_account_once(account_id)
+            settings = get_settings(account_id)
+            delay = random.randint(
+                int(settings["workflow_min_seconds"]),
+                int(settings["workflow_max_seconds"]),
+            )
+            # Reserve next slot before starting so the scheduler cannot duplicate-launch.
+            NEXT_DUE[account_id] = now + delay
 
-        delay = random.randint(
-            int(settings["workflow_min_seconds"]),
-            int(settings["workflow_max_seconds"]),
-        )
-        NEXT_DUE[account_id] = time.monotonic() + delay
-        account = find_account(account_id)
-        add_activity(
-            f"{account['username']}: next automatic pass in "
-            f"{delay // 60}m {delay % 60}s",
-            "info",
-        )
+            threading.Thread(
+                target=run_account_once,
+                args=(account_id, None),
+                daemon=True,
+                name=f"tiktok-auto-{account_id}",
+            ).start()
+
 
 
 def start_scheduler() -> None:
@@ -2965,7 +2953,8 @@ function splitList(v){return String(v||"").split(/[\n,]+/).map(x=>x.trim()).filt
 async function api(action,payload={}){const r=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,...payload})});const d=await r.json().catch(()=>({ok:false,error:"Invalid response"}));if(!r.ok||!d.ok)throw new Error(d.error||`HTTP ${r.status}`);return d;}
 
 document.addEventListener("focusin",e=>{if(e.target.matches("input,textarea,select"))editing=true});
-document.addEventListener("focusout",()=>setTimeout(()=>{editing=!!document.querySelector("input:focus,textarea:focus,select:focus")},0));
+document.addEventListener("focusout",e=>{const card=e.target.closest?.(".card[data-account-id]");setTimeout(()=>{editing=!!document.querySelector("input:focus,textarea:focus,select:focus");if(card&&!editing)autoSaveSettings(card.dataset.accountId,true)},0)});
+document.addEventListener("change",e=>{const card=e.target.closest?.(".card[data-account-id]");if(card)autoSaveSettings(card.dataset.accountId,true)});
 
 function accountCard(id,a){
   const s=a.settings||{};
@@ -2973,7 +2962,7 @@ function accountCard(id,a){
   const status=connected?"CONNECTED":"DISCONNECTED";
   const tags=(s.target_hashtags||[]).join(", ");
   const targets=(s.target_accounts||[]).join(", ");
-  return `<div class="card">
+  return `<div class="card" data-account-id="${esc(id)}">
     <div class="cardhead">
       <div>
         <h2>${esc(a.username)}</h2>
@@ -3014,16 +3003,25 @@ function accountCard(id,a){
         <button onclick="task('${id}','upload')" ${!connected?"disabled":""}>Post Once</button>
         <button onclick="task('${id}','follow')" ${!connected?"disabled":""}>Follow Target</button>
         <button onclick="task('${id}','engage')" ${!connected?"disabled":""}>Engage Hashtag</button>
-        <button onclick="task('${id}','dm')" ${!connected?"disabled":""}>DM Scan</button>
         <button onclick="task('${id}','comments')" ${!connected?"disabled":""}>Reply Comments</button>
       </div>
     </div>
 
     <div class="section">
-      <b>Behavior / Mode Settings</b>
+      <b>Behavior Features & Settings</b>
       <div class="fieldgrid">
         <div><label>Account username</label><input id="name_${id}" value="${esc(a.username)}"></div>
-        <div><label>Mode</label><select id="mode_${id}">${["balanced","upload_only","follow_only","engage_only","dm_only","manual"].map(m=>`<option value="${m}" ${s.mode===m?"selected":""}>${m.replaceAll("_"," ")}</option>`).join("")}</select></div>
+        <div style="grid-column:1/-1">
+          <label>Enabled features</label>
+          <div class="row">
+            <label><input id="posts_${id}" type="checkbox" style="width:auto" ${s.enable_posts?"checked":""}> Posts</label>
+            <label><input id="follow_${id}" type="checkbox" style="width:auto" ${s.enable_follow?"checked":""}> Follow</label>
+            <label><input id="engage_${id}" type="checkbox" style="width:auto" ${s.enable_engage?"checked":""}> Hashtag / Engage</label>
+            <label><input id="dms_${id}" type="checkbox" style="width:auto" ${s.enable_dms?"checked":""}> DMs</label>
+            <label><input id="comments_${id}" type="checkbox" style="width:auto" ${s.enable_comments?"checked":""}> Comment Replies</label>
+          </div>
+          <div class="small">Unchecked features are not polled or executed.</div>
+        </div>
         <div><label>Follow source</label><select id="fsource_${id}">${["both","followers","following"].map(m=>`<option value="${m}" ${s.follow_source===m?"selected":""}>${m}</option>`).join("")}</select></div>
         <div><label>Follow limit / pass</label><input id="followlim_${id}" type="number" min="1" max="10" value="${s.follow_limit||2}"></div>
         <div><label>Caption char limit</label><input id="caplim_${id}" type="number" min="80" max="2000" value="${s.caption_char_limit||350}"></div>
@@ -3053,12 +3051,9 @@ function accountCard(id,a){
 
       <div class="row">
         <label><input id="reqvision_${id}" type="checkbox" style="width:auto" ${s.require_video_vision?"checked":""}> Require real multi-frame vision for videos</label>
-        <label><input id="dmen_${id}" type="checkbox" style="width:auto" ${s.enable_dm_replies?"checked":""}> Auto-reply DMs</label>
-        <label><input id="commenten_${id}" type="checkbox" style="width:auto" ${s.enable_comment_replies?"checked":""}> Auto-reply comments</label>
         <label><input id="headless_${id}" type="checkbox" style="width:auto" ${s.headless_automation?"checked":""}> Headless automation</label>
       </div>
       <div class="row">
-        <button class="goodbtn" onclick="saveSettings('${id}')">Save Settings</button>
         <button onclick="saveName('${id}')">Save Username</button>
         <button class="danger" onclick="removeTikTokAccount('${id}', ${JSON.stringify(a.username)})">Remove Account</button>
       </div>
@@ -3083,6 +3078,23 @@ function renderPosts(items){
 function render(data){
   const accounts=data.accounts||{};
   document.getElementById("accounts").innerHTML=Object.entries(accounts).map(([id,a])=>accountCard(id,a)).join("");
+  for(const [id,a] of Object.entries(accounts)){
+    const s=a.settings||{};
+    settingsSignatures[id]=JSON.stringify({
+      enable_posts:!!s.enable_posts,enable_follow:!!s.enable_follow,
+      enable_engage:!!s.enable_engage,enable_dms:!!s.enable_dms,
+      enable_comments:!!s.enable_comments,follow_source:s.follow_source,
+      follow_limit:Number(s.follow_limit),caption_char_limit:Number(s.caption_char_limit),
+      reply_char_limit:Number(s.reply_char_limit),video_frames:Number(s.video_frames),
+      max_writes_per_window:Number(s.max_writes_per_window),write_window_seconds:Number(s.write_window_seconds),
+      write_min_gap_seconds:Number(s.write_min_gap_seconds),upload_cooldown_seconds:Number(s.upload_cooldown_seconds),
+      workflow_min_seconds:Number(s.workflow_min_seconds),workflow_max_seconds:Number(s.workflow_max_seconds),
+      target_accounts:s.target_accounts||[],target_hashtags:s.target_hashtags||[],
+      persona_prompt:s.persona_prompt||"",caption_prompt:s.caption_prompt||"",
+      dm_prompt:s.dm_prompt||"",comment_prompt:s.comment_prompt||"",
+      require_video_vision:!!s.require_video_vision,headless_automation:!!s.headless_automation
+    });
+  }
   renderPosts(data.recent_posts||[]);
   const act=data.activity||[];
   document.getElementById("activity").innerHTML=act.map(x=>`<div class="logrow ${x.level==="error"?"bad":x.level==="warn"?"warn":x.level==="good"?"ok":""}"><span class="small">${esc(x.time||"")}</span> ${esc(x.message||"")}</div>`).join("");
@@ -3095,7 +3107,7 @@ async function refreshNow(force=false){
   const auto=document.getElementById("autoRefresh").checked;
   if(!force&&(!auto||editing)){document.getElementById("refreshState").textContent=editing?"Refresh paused while typing":"Auto refresh off";return;}
   refreshBusy=true;
-  try{const r=await fetch("/api/metrics",{cache:"no-store"});const d=await r.json();render(d);document.getElementById("refreshState").textContent="Updated "+new Date().toLocaleTimeString();}
+  try{if(!editing) await autoSaveVisibleSettings(); const r=await fetch("/api/metrics",{cache:"no-store"});const d=await r.json();render(d);document.getElementById("refreshState").textContent="Updated "+new Date().toLocaleTimeString();}
   catch(e){document.getElementById("refreshState").textContent="Refresh error";}
   finally{refreshBusy=false;}
 }
@@ -3106,9 +3118,13 @@ async function clearLogin(id){if(!confirm("Clear saved TikTok login cookies/stor
 async function openFolder(folder){try{await api("open_folder",{folder});toast("Opened source folder.");}catch(e){toast(e.message,true)}}
 async function saveName(id){const username=document.getElementById(`name_${id}`).value;try{await api("save_name",{account_id:id,username});editing=false;await refreshNow(true);toast("Username saved.");}catch(e){toast(e.message,true)}}
 
-async function saveSettings(id){
-  const s={
-    mode:document.getElementById(`mode_${id}`).value,
+function collectSettings(id){
+  return {
+    enable_posts:document.getElementById(`posts_${id}`).checked,
+    enable_follow:document.getElementById(`follow_${id}`).checked,
+    enable_engage:document.getElementById(`engage_${id}`).checked,
+    enable_dms:document.getElementById(`dms_${id}`).checked,
+    enable_comments:document.getElementById(`comments_${id}`).checked,
     follow_source:document.getElementById(`fsource_${id}`).value,
     follow_limit:Number(document.getElementById(`followlim_${id}`).value),
     caption_char_limit:Number(document.getElementById(`caplim_${id}`).value),
@@ -3127,12 +3143,30 @@ async function saveSettings(id){
     dm_prompt:document.getElementById(`dmprompt_${id}`).value,
     comment_prompt:document.getElementById(`commentprompt_${id}`).value,
     require_video_vision:document.getElementById(`reqvision_${id}`).checked,
-    enable_dm_replies:document.getElementById(`dmen_${id}`).checked,
-    enable_comment_replies:document.getElementById(`commenten_${id}`).checked,
     headless_automation:document.getElementById(`headless_${id}`).checked,
   };
-  try{await api("save_settings",{account_id:id,settings:s});editing=false;await refreshNow(true);toast("Settings saved.");}
-  catch(e){toast(e.message,true)}
+}
+
+const settingsSignatures={};
+
+async function autoSaveSettings(id,quiet=true){
+  const card=document.querySelector(`.card[data-account-id="${CSS.escape(id)}"]`);
+  if(!card) return;
+  const settings=collectSettings(id);
+  const sig=JSON.stringify(settings);
+  if(settingsSignatures[id]===sig) return;
+  try{
+    await api("save_settings",{account_id:id,settings});
+    settingsSignatures[id]=sig;
+    if(!quiet) toast("Behavior updated.");
+  }catch(e){
+    if(!quiet) toast(e.message,true);
+  }
+}
+
+async function autoSaveVisibleSettings(){
+  const ids=[...document.querySelectorAll(".card[data-account-id]")].map(x=>x.dataset.accountId);
+  await Promise.all(ids.map(id=>autoSaveSettings(id,true)));
 }
 
 
@@ -3146,7 +3180,7 @@ async function removeTikTokAccount(id,username){
 }
 
 async function addAccountPrompt(){
-  const u=prompt("TikTok username to add:");
+  const u=prompt("TikTok username to add (maximum 3 configured accounts):");
   if(!u)return;
   try{await api("add_account",{username:u});await refreshNow(true);}
   catch(e){toast(e.message,true)}
