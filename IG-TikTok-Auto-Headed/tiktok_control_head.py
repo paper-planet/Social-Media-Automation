@@ -80,6 +80,7 @@ DATA_ROOT = APP_ROOT / "data"
 HISTORY_ROOT = DATA_ROOT / "history"
 CACHE_ROOT = DATA_ROOT / "cache"
 ACCOUNTS_FILE = DATA_ROOT / "accounts.json"
+REMOVED_ACCOUNTS_FILE = DATA_ROOT / "removed_accounts.json"
 SETTINGS_FILE = DATA_ROOT / "control_settings.json"
 ANALYTICS_FILE = DATA_ROOT / "analytics.json"
 RECENT_POSTS_FILE = DATA_ROOT / "recent_posts.json"
@@ -132,6 +133,33 @@ locations, or private information. Never mention being an AI, bot, automation,
 prompt, or Ollama. Do not use slurs, threats, or attacks on protected traits."""
 
 
+# Conservative automation pacing defaults to reduce repetitive/spammy behavior.
+DM_CHECK_INTERVAL_SECONDS = max(
+    60, int(os.environ.get("TIKTOK_DM_CHECK_INTERVAL_SECONDS", "120"))
+)
+COMMENT_CHECK_INTERVAL_SECONDS = max(
+    120, int(os.environ.get("TIKTOK_COMMENT_CHECK_INTERVAL_SECONDS", "300"))
+)
+DM_THREAD_REPLY_COOLDOWN_SECONDS = max(
+    60, int(os.environ.get("TIKTOK_DM_THREAD_REPLY_COOLDOWN_SECONDS", "1800"))
+)
+MAX_DM_REPLIES_PER_PASS_DEFAULT = max(
+    1, int(os.environ.get("TIKTOK_MAX_DM_REPLIES_PER_PASS", "1"))
+)
+MAX_COMMENT_REPLIES_PER_PASS_DEFAULT = max(
+    1, int(os.environ.get("TIKTOK_MAX_COMMENT_REPLIES_PER_PASS", "1"))
+)
+ACTION_HUMAN_DELAY_MIN_SECONDS = max(
+    0, int(os.environ.get("TIKTOK_ACTION_HUMAN_DELAY_MIN_SECONDS", "8"))
+)
+ACTION_HUMAN_DELAY_MAX_SECONDS = max(
+    ACTION_HUMAN_DELAY_MIN_SECONDS,
+    int(os.environ.get("TIKTOK_ACTION_HUMAN_DELAY_MAX_SECONDS", "16")),
+)
+CONTROL_HEAD_REFRESH_SECONDS = max(
+    5, int(os.environ.get("TIKTOK_CONTROL_HEAD_REFRESH_SECONDS", "10"))
+)
+
 # =============================================================================
 # Runtime state
 # =============================================================================
@@ -143,6 +171,9 @@ AUTO_ENABLED_ACCOUNTS: set[str] = set()
 ACCOUNT_COOLDOWNS: dict[str, datetime] = {}
 NEXT_TASK_OVERRIDE: dict[str, str] = {}
 NEXT_DUE: dict[str, float] = {}
+LAST_DM_CHECK: dict[str, float] = {}
+LAST_COMMENT_CHECK: dict[str, float] = {}
+LAST_TASK_BY_ACCOUNT: dict[str, str] = {}
 
 LOGIN_SAVE_EVENTS: dict[str, threading.Event] = {}
 LOGIN_CANCEL_EVENTS: dict[str, threading.Event] = {}
@@ -245,14 +276,31 @@ def add_account(username: str) -> dict[str, Any]:
     username = normalize_username(username)
     if not username:
         raise ValueError("Invalid TikTok username.")
+
     for a in ACCOUNTS:
         if a["username"].lower() == username.lower():
             return a
+
+    # Re-adding the same removed username restores its old account id, which
+    # reconnects the same persistent Chromium profile/history/settings.
+    removed = load_json(REMOVED_ACCOUNTS_FILE, {})
+    removed = removed if isinstance(removed, dict) else {}
+    restored_id = str(removed.get(username.lower(), "")).strip()
+
     used = {a["id"] for a in ACCOUNTS}
-    n = 1
-    while f"tt_{n}" in used:
-        n += 1
-    account = {"id": f"tt_{n}", "username": username, "enabled": True}
+    reserved = {str(v) for v in removed.values() if v}
+
+    if restored_id and restored_id not in used:
+        account_id = restored_id
+        removed.pop(username.lower(), None)
+        save_json(REMOVED_ACCOUNTS_FILE, removed)
+    else:
+        n = 1
+        while f"tt_{n}" in used or f"tt_{n}" in reserved:
+            n += 1
+        account_id = f"tt_{n}"
+
+    account = {"id": account_id, "username": username, "enabled": True}
     ACCOUNTS.append(account)
     save_accounts()
     ensure_account_analytics(account)
@@ -269,6 +317,57 @@ def rename_account(account_id: str, username: str) -> None:
     account["username"] = username
     save_accounts()
     ensure_account_analytics(account)
+
+
+def remove_account(account_id: str) -> dict[str, Any]:
+    """
+    Remove an account from the Control Head configuration while preserving its
+    persistent Chromium profile, history and settings for easy re-add/recovery.
+    """
+    account = find_account(account_id)
+    if not account:
+        raise ValueError("Unknown account.")
+
+    login_thread = LOGIN_THREADS.get(account_id)
+    if login_thread and login_thread.is_alive():
+        raise RuntimeError("Close the login browser before removing this account.")
+
+    lock = account_lock(account_id)
+    if lock.locked():
+        raise RuntimeError("Account is busy. Stop automation and try again.")
+
+    CONNECTED_ACCOUNTS.discard(account_id)
+    AUTO_ENABLED_ACCOUNTS.discard(account_id)
+    ACCOUNT_COOLDOWNS.pop(account_id, None)
+    NEXT_TASK_OVERRIDE.pop(account_id, None)
+    NEXT_DUE.pop(account_id, None)
+    LAST_DM_CHECK.pop(account_id, None)
+    LAST_COMMENT_CHECK.pop(account_id, None)
+    LAST_TASK_BY_ACCOUNT.pop(account_id, None)
+
+    removed = load_json(REMOVED_ACCOUNTS_FILE, {})
+    removed = removed if isinstance(removed, dict) else {}
+    removed[account["username"].lower()] = account_id
+    save_json(REMOVED_ACCOUNTS_FILE, removed)
+
+    ACCOUNTS.remove(account)
+    save_accounts()
+
+    data = load_analytics()
+    data.get("accounts", {}).pop(account_id, None)
+    save_analytics(data)
+
+    add_activity(
+        f"{account['username']}: removed from configured accounts; "
+        "persistent profile/history/settings were preserved",
+        "good",
+    )
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "username": account["username"],
+        "preserved_local_data": True,
+    }
 
 
 # =============================================================================
@@ -404,13 +503,13 @@ def default_settings(account: dict[str, Any]) -> dict[str, Any]:
         "enable_dm_replies": True,
         "enable_comment_replies": True,
         "headless_automation": False,
-        "max_writes_per_window": 6,
-        "write_window_seconds": 900,
-        "write_min_gap_seconds": 30,
-        "upload_cooldown_seconds": 1800,
-        "max_writes_per_workflow": 3,
-        "workflow_min_seconds": 300,
-        "workflow_max_seconds": 720,
+        "max_writes_per_window": 5,
+        "write_window_seconds": 1200,
+        "write_min_gap_seconds": 45,
+        "upload_cooldown_seconds": 2400,
+        "max_writes_per_workflow": 2,
+        "workflow_min_seconds": 480,
+        "workflow_max_seconds": 1200,
     }
 
 
@@ -533,6 +632,7 @@ def load_history(account_id: str) -> dict[str, Any]:
         "replied_dms": [],
         "sent_dm_texts": [],
         "dm_reply_memory": {},
+        "dm_thread_last_reply_at": {},
         "replied_comments": [],
         "liked_videos": [],
         "followed_users": [],
@@ -1662,6 +1762,50 @@ def choose_unused_folder(
     return random.choice(available) if available else None
 
 
+def choose_mode_task(
+    mode: str,
+    forced_task: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    if forced_task:
+        return forced_task
+    if mode == "manual":
+        return "none"
+    if mode == "upload_only":
+        return "upload"
+    if mode == "follow_only":
+        return "follow"
+    if mode == "engage_only":
+        return "engage"
+    if mode == "dm_only":
+        return "dm"
+
+    choices = ["upload", "follow", "engage"]
+    if account_id:
+        last_task = LAST_TASK_BY_ACCOUNT.get(account_id)
+        if last_task in choices and len(choices) > 1:
+            remaining = [c for c in choices if c != last_task]
+            if remaining:
+                return random.choice(remaining)
+    return random.choice(choices)
+
+
+def maybe_human_delay(fraction: float = 1.0) -> None:
+    lo = max(0.0, ACTION_HUMAN_DELAY_MIN_SECONDS * float(fraction))
+    hi = max(lo, ACTION_HUMAN_DELAY_MAX_SECONDS * float(fraction))
+    if hi > 0:
+        time.sleep(random.uniform(lo, hi))
+
+
+def should_run_periodic_check(cache: dict[str, float], key: str, interval_seconds: int) -> bool:
+    now = time.monotonic()
+    last = cache.get(key, 0.0)
+    if now - last < max(1, int(interval_seconds)):
+        return False
+    cache[key] = now
+    return True
+
+
 # =============================================================================
 # TikTok actions
 # =============================================================================
@@ -1975,6 +2119,8 @@ def handle_dms(
         return 0
 
     sent = 0
+    per_pass_limit = max(1, min(MAX_DM_REPLIES_PER_PASS_DEFAULT, int(settings["max_writes_per_workflow"])))
+    history.setdefault("dm_thread_last_reply_at", {})
     goto(page, "https://www.tiktok.com/messages", 2200)
 
     selectors = [
@@ -1994,7 +2140,7 @@ def handle_dms(
         return 0
 
     for index in range(min(4, threads.count())):
-        if sent >= min(2, int(settings["max_writes_per_workflow"])):
+        if sent >= min(per_pass_limit, int(settings["max_writes_per_workflow"])):
             break
 
         try:
@@ -2039,6 +2185,9 @@ def handle_dms(
             continue
 
         thread_key = stable_key("thread", page.url or str(index))
+        last_thread_reply_at = float(history.get("dm_thread_last_reply_at", {}).get(thread_key, 0.0) or 0.0)
+        if last_thread_reply_at and time.time() - last_thread_reply_at < DM_THREAD_REPLY_COOLDOWN_SECONDS:
+            continue
         prior = history["dm_reply_memory"].get(thread_key, [])
         conversation = "\n".join(texts[-8:])
 
@@ -2055,6 +2204,7 @@ def handle_dms(
         if not wait_for_write_slot(account_id, "dm"):
             break
 
+        maybe_human_delay(1.0)
         editor = page.locator("div[contenteditable='true']").last
         if not editor.count():
             continue
@@ -2068,6 +2218,7 @@ def handle_dms(
         history["sent_dm_texts"] = history["sent_dm_texts"][-200:]
         prior.append(reply)
         history["dm_reply_memory"][thread_key] = prior[-20:]
+        history["dm_thread_last_reply_at"][thread_key] = time.time()
 
         sent += 1
         add_activity(
@@ -2100,8 +2251,9 @@ def handle_comments(
 
     comments = page.locator("[data-e2e='comment-item']")
     sent = 0
+    per_pass_limit = max(1, min(MAX_COMMENT_REPLIES_PER_PASS_DEFAULT, int(settings["max_writes_per_workflow"])))
     for index in range(min(5, comments.count())):
-        if sent >= min(2, int(settings["max_writes_per_workflow"])):
+        if sent >= min(per_pass_limit, int(settings["max_writes_per_workflow"])):
             break
         container = comments.nth(index)
         try:
@@ -2129,6 +2281,7 @@ def handle_comments(
         if not wait_for_write_slot(account_id, "comment"):
             break
 
+        maybe_human_delay(0.6)
         button = container.get_by_text("Reply", exact=True).first
         if not button.count():
             continue
@@ -2468,21 +2621,11 @@ def run_account_once(
                 return
 
             mode = settings["mode"]
-            task = forced_task or NEXT_TASK_OVERRIDE.pop(account_id, None)
-            if not task:
-                if mode == "manual":
-                    task = "none"
-                elif mode == "upload_only":
-                    task = "upload"
-                elif mode == "follow_only":
-                    task = "follow"
-                elif mode == "engage_only":
-                    task = "engage"
-                elif mode == "dm_only":
-                    task = "dm"
-                else:
-                    choices = ["upload", "follow", "engage"]
-                    task = random.choice(choices)
+            task = choose_mode_task(
+                mode,
+                forced_task=forced_task or NEXT_TASK_OVERRIDE.pop(account_id, None),
+                account_id=account_id,
+            )
 
             dm_count = 0
             comment_count = 0
@@ -2490,12 +2633,17 @@ def run_account_once(
             like_count = 0
             follow_count = 0
 
-            if settings["enable_dm_replies"] and mode not in {"manual"}:
+            if (
+                settings["enable_dm_replies"]
+                and mode not in {"manual"}
+                and (task == "dm" or should_run_periodic_check(LAST_DM_CHECK, account_id, DM_CHECK_INTERVAL_SECONDS))
+            ):
                 dm_count = handle_dms(page, account_id, history)
 
             if (
                 settings["enable_comment_replies"]
                 and mode in {"balanced", "engage_only"}
+                and (task == "comments" or should_run_periodic_check(LAST_COMMENT_CHECK, account_id, COMMENT_CHECK_INTERVAL_SECONDS))
             ):
                 comment_count = handle_comments(page, account_id, history)
 
@@ -2518,6 +2666,7 @@ def run_account_once(
                     page, account_id, history
                 )
 
+            LAST_TASK_BY_ACCOUNT[account_id] = task
             save_history(account_id, history)
             current = load_analytics()["accounts"].get(account_id, {})
             update_account(
@@ -2583,7 +2732,7 @@ def enable_auto(account_id: str, enabled: bool) -> None:
         raise RuntimeError("Connect the account first.")
     if enabled:
         AUTO_ENABLED_ACCOUNTS.add(account_id)
-        NEXT_DUE[account_id] = time.monotonic() + random.randint(5, 15)
+        NEXT_DUE[account_id] = time.monotonic() + random.randint(30, 90)
         update_account(
             account_id,
             auto_enabled=True,
@@ -2789,7 +2938,7 @@ button{background:#282e40;color:var(--text);border:1px solid var(--border);borde
 <div class="notice">
   <b>Login flow:</b> Open Login → finish login/CAPTCHA/challenge yourself in Chromium → press Save Login.
   Future runs can use Quick Login. Disconnect keeps the persistent profile. Clear Saved Login removes TikTok cookies/storage.
-  Automation never starts just because the Python process started.
+  Automation never starts just because the Python process started. An account can stay configured and even connected with AUTO OFF while other accounts run.
 </div>
 
 <div id="accounts" class="grid"></div>
@@ -2807,6 +2956,7 @@ button{background:#282e40;color:var(--text);border:1px solid var(--border);borde
 <div id="toast" class="toast"></div>
 
 <script>
+const CONTROL_HEAD_REFRESH_SECONDS=10;
 let editing=false,refreshBusy=false;
 
 function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
@@ -2910,6 +3060,7 @@ function accountCard(id,a){
       <div class="row">
         <button class="goodbtn" onclick="saveSettings('${id}')">Save Settings</button>
         <button onclick="saveName('${id}')">Save Username</button>
+        <button class="danger" onclick="removeTikTokAccount('${id}', ${JSON.stringify(a.username)})">Remove Account</button>
       </div>
     </div>
   </div>`;
@@ -2984,6 +3135,16 @@ async function saveSettings(id){
   catch(e){toast(e.message,true)}
 }
 
+
+async function removeTikTokAccount(id,username){
+  if(!confirm(`Remove ${username} from the TikTok Control Head?\n\nIts persistent browser profile/history/settings will be preserved locally.`)) return;
+  try{
+    await api("remove_account",{account_id:id});
+    await refreshNow(true);
+    toast(`Removed ${username}.`);
+  }catch(e){toast(e.message,true)}
+}
+
 async function addAccountPrompt(){
   const u=prompt("TikTok username to add:");
   if(!u)return;
@@ -2992,7 +3153,7 @@ async function addAccountPrompt(){
 }
 
 document.getElementById("autoRefresh").addEventListener("change",()=>refreshNow(true));
-setInterval(()=>refreshNow(false),5000);
+setInterval(()=>refreshNow(false),CONTROL_HEAD_REFRESH_SECONDS*1000);
 refreshNow(true);
 </script>
 </body>
@@ -3049,6 +3210,10 @@ class Handler(BaseHTTPRequestHandler):
                     self,
                     open_media_folder(body.get("folder", "")),
                 )
+                return
+
+            if action == "remove_account":
+                response_json(self, remove_account(account_id))
                 return
 
             account = find_account(account_id)
