@@ -174,18 +174,3 @@ it was visually analyzed when no suitable vision model/frames are available.
 Each Control Head records successful uploads and shows the exact local source
 folder. Use **Open Folder** to inspect/remove unwanted source material from the
 media pool.
-
-## Repository safety
-
-Do not commit:
-
-- `.social-control-suite/`
-- session JSON files
-- browser profile directories
-- cookies
-- histories
-- `.env`
-- downloaded media
-
-The included `.gitignore` blocks common runtime/session paths, but always inspect
-`git status` before pushing.
