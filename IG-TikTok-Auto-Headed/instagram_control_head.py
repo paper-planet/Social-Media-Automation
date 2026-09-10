@@ -105,7 +105,7 @@ def _load_external_fan_roster():
                 "target_hashtags": list(target_hashtags) if isinstance(target_hashtags, list) else [],
                 "competitor_accounts": list(target_accounts) if isinstance(target_accounts, list) else [],
             }
-        return roster
+        return dict(list(roster.items())[:3])
     except Exception as exc:
         print(f"⚠️ Could not load Instagram accounts file {IG_ACCOUNTS_FILE}: {exc}")
         return {}
@@ -239,7 +239,6 @@ def _control_settings_path():
 
 def _default_control_settings(username, conf):
     return {
-        "mode": "balanced",
         "persona_prompt": RAGE_BAIT_PERSONA,
         "caption_prompt": (
             "Narrate what is actually happening in the media. For POV/selfie/vlog "
@@ -262,8 +261,14 @@ def _default_control_settings(username, conf):
         "follow_limit": 2,
         "video_frames": 5,
         "require_video_vision": True,
-        "enable_dm_replies": True,
-        "enable_comment_replies": True,
+
+        # Independent behavior switches. There is no hidden mode routing.
+        "enable_posts": True,
+        "enable_follow": True,
+        "enable_engage": True,
+        "enable_dms": True,
+        "enable_comments": True,
+
         "max_writes_per_window": MAX_WRITES_PER_WINDOW,
         "write_window_seconds": WRITE_WINDOW_SECONDS,
         "write_min_gap_seconds": WRITE_MIN_GAP_SECONDS,
@@ -272,6 +277,7 @@ def _default_control_settings(username, conf):
         "max_dm_replies_per_pass": MAX_DM_REPLIES_PER_PASS,
         "max_comment_replies_per_pass": MAX_COMMENT_REPLIES_PER_PASS,
     }
+
 
 
 def _normalize_string_list(value, prefix_to_strip=""):
@@ -292,23 +298,42 @@ def _normalize_string_list(value, prefix_to_strip=""):
 
 
 def _sanitize_control_settings(username, conf, raw):
-    base=_default_control_settings(username, conf)
-    raw=raw if isinstance(raw, dict) else {}
-    mode=str(raw.get("mode", base["mode"])).strip().lower()
-    if mode not in {"balanced","upload_only","follow_only","engage_only","dm_only","manual"}:
-        mode="balanced"
+    base = _default_control_settings(username, conf)
+    raw = raw if isinstance(raw, dict) else {}
 
-    follow_source=str(raw.get("follow_source", base["follow_source"])).strip().lower()
-    if follow_source not in {"followers","following","both"}:
-        follow_source="both"
+    follow_source = str(raw.get("follow_source", base["follow_source"])).strip().lower()
+    if follow_source not in {"followers", "following", "both"}:
+        follow_source = "both"
 
     def as_int(key, lo, hi):
-        try: v=int(raw.get(key, base[key]))
-        except Exception: v=int(base[key])
-        return max(lo,min(hi,v))
+        try:
+            v = int(raw.get(key, base[key]))
+        except Exception:
+            v = int(base[key])
+        return max(lo, min(hi, v))
+
+    # Migrate old mode-based settings once, but do not return/store a mode.
+    legacy_mode = str(raw.get("mode", "")).strip().lower()
+    legacy_map = {
+        "balanced": (True, True, True, True, True),
+        "upload_only": (True, False, False, False, False),
+        "follow_only": (False, True, False, False, False),
+        "engage_only": (False, False, True, False, True),
+        "dm_only": (False, False, False, True, False),
+        "manual": (False, False, False, False, False),
+    }
+    legacy = legacy_map.get(legacy_mode, (True, True, True, True, True))
+
+    def feature(name, legacy_index, old_alias=None):
+        if name in raw:
+            return bool(raw[name])
+        if old_alias and old_alias in raw:
+            return bool(raw[old_alias])
+        if legacy_mode:
+            return bool(legacy[legacy_index])
+        return bool(base[name])
 
     return {
-        "mode": mode,
         "persona_prompt": str(raw.get("persona_prompt", base["persona_prompt"]))[:6000],
         "caption_prompt": str(raw.get("caption_prompt", base["caption_prompt"]))[:4000],
         "dm_prompt": str(raw.get("dm_prompt", base["dm_prompt"]))[:4000],
@@ -325,14 +350,22 @@ def _sanitize_control_settings(username, conf, raw):
         "follow_limit": as_int("follow_limit", 1, 20),
         "video_frames": as_int("video_frames", 3, 9),
         "require_video_vision": bool(raw.get("require_video_vision", base["require_video_vision"])),
-        "enable_dm_replies": bool(raw.get("enable_dm_replies", base["enable_dm_replies"])),
-        "enable_comment_replies": bool(raw.get("enable_comment_replies", base["enable_comment_replies"])),
+
+        "enable_posts": feature("enable_posts", 0),
+        "enable_follow": feature("enable_follow", 1),
+        "enable_engage": feature("enable_engage", 2),
+        "enable_dms": feature("enable_dms", 3, "enable_dm_replies"),
+        "enable_comments": feature("enable_comments", 4, "enable_comment_replies"),
+
         "max_writes_per_window": as_int("max_writes_per_window", 1, 30),
         "write_window_seconds": as_int("write_window_seconds", 60, 7200),
         "write_min_gap_seconds": as_int("write_min_gap_seconds", 8, 600),
         "upload_cooldown_seconds": as_int("upload_cooldown_seconds", 300, 21600),
         "max_writes_per_workflow": as_int("max_writes_per_workflow", 1, 10),
+        "max_dm_replies_per_pass": as_int("max_dm_replies_per_pass", 1, 5),
+        "max_comment_replies_per_pass": as_int("max_comment_replies_per_pass", 1, 5),
     }
+
 
 
 def load_control_settings():
@@ -365,22 +398,39 @@ def get_account_control_settings(username, conf=None):
 
 
 def update_account_control_settings(username, patch):
-    conf=CONTROL_ROSTER.get(username) or FAN_ROSTER.get(username)
+    conf = CONTROL_ROSTER.get(username) or FAN_ROSTER.get(username)
     if not conf:
         raise ValueError(f"Unknown account @{username}")
-    data=load_control_settings()
-    merged=dict(data.get(username, {}))
     if not isinstance(patch, dict):
         raise ValueError("settings payload must be an object")
+
+    data = load_control_settings()
+    before = _sanitize_control_settings(username, conf, data.get(username, {}))
+    merged = dict(data.get(username, {}))
     merged.update(patch)
-    clean=_sanitize_control_settings(username, conf, merged)
-    data[username]=clean
-    save_control_settings(data)
-    update_account_metric(
-        username,"add_history",
-        value=f"⚙️ Saved Control Head settings; mode={clean['mode']}."
-    )
+    clean = _sanitize_control_settings(username, conf, merged)
+
+    # Auto-refresh may submit settings repeatedly. Only touch disk/log when changed.
+    if clean != before:
+        data[username] = clean
+        save_control_settings(data)
+        enabled = [
+            label for key, label in (
+                ("enable_posts", "posts"),
+                ("enable_follow", "follow"),
+                ("enable_engage", "engage"),
+                ("enable_dms", "DMs"),
+                ("enable_comments", "comments"),
+            )
+            if clean.get(key)
+        ]
+        update_account_metric(
+            username,
+            "add_history",
+            value="⚙️ Behavior auto-saved: " + (", ".join(enabled) if enabled else "all features off"),
+        )
     return clean
+
 
 
 def _clip_chars(text, limit):
@@ -1660,104 +1710,87 @@ Attempt {attempt}/4.
 
 
 def harvest_and_amplify_networks(cl, history, config, username, actions_performed):
-    s=get_account_control_settings(username,config)
-    targets=s["target_accounts"] or list(config.get("competitor_accounts") or [])
-    if not targets:
-        update_account_metric(username,"add_history",value="⚠️ No target accounts configured.")
+    s = get_account_control_settings(username, config)
+    if not s.get("enable_follow", False):
         return actions_performed
 
-    follow_limit=min(
-        int(s["follow_limit"]),
-        int(s["max_writes_per_workflow"]),
-    )
-    mode=s["mode"]
+    targets = s["target_accounts"] or list(config.get("competitor_accounts") or [])
+    if not targets:
+        update_account_metric(username, "add_history", value="⚠️ Follow is enabled but no target accounts are configured.")
+        return actions_performed
 
-    if mode=="follow_only":
-        active_target=random.choice(targets)
-    else:
-        if not history.get("competitor_pool"):
-            history["competitor_pool"]=list(targets)
-        usable=[x for x in history["competitor_pool"] if x] or targets
-        active_target=random.choice(usable)
-
-    update_account_metric(username,"add_history",value=f"🎯 Target node: @{active_target}")
+    follow_limit = min(int(s["follow_limit"]), int(s["max_writes_per_workflow"]))
+    active_target = random.choice(targets)
+    update_account_metric(username, "add_history", value=f"🎯 Follow target: @{active_target}")
 
     try:
-        target_id=cl.user_id_from_username(active_target)
-        source=s["follow_source"]
-        sweep_type=random.choice(["followers","following"]) if source=="both" else source
-        max_id_key=f"{active_target}:{sweep_type}_next_max_id"
-        current_max_id=history.get(max_id_key) or ""
+        target_id = cl.user_id_from_username(active_target)
+        source = s["follow_source"]
+        sweep_type = random.choice(["followers", "following"]) if source == "both" else source
+        max_id_key = f"{active_target}:{sweep_type}_next_max_id"
+        current_max_id = history.get(max_id_key) or ""
 
-        if sweep_type=="followers":
-            users,next_max_id=cl.user_followers_v1_chunk(
-                target_id,max_amount=max(10,follow_limit*4),max_id=current_max_id
+        if sweep_type == "followers":
+            users, next_max_id = cl.user_followers_v1_chunk(
+                target_id, max_amount=max(10, follow_limit * 4), max_id=current_max_id
             )
         else:
-            users,next_max_id=cl.user_following_v1_chunk(
-                target_id,max_amount=max(10,follow_limit*4),max_id=current_max_id
+            users, next_max_id = cl.user_following_v1_chunk(
+                target_id, max_amount=max(10, follow_limit * 4), max_id=current_max_id
             )
-        history[max_id_key]=next_max_id
-        update_account_metric(
-            username,"add_history",
-            value=f"📑 Cataloged {len(users)} {sweep_type} accounts from @{active_target}."
-        )
+        history[max_id_key] = next_max_id
 
-        followed_this_pass=0
+        followed_this_pass = 0
         for u in users:
-            if followed_this_pass>=follow_limit:
+            # Re-read settings while running so an unchecked Follow box takes effect immediately.
+            if not get_account_control_settings(username, config).get("enable_follow", False):
                 break
-            u_pk,u_name=int(u.pk),u.username
+            if followed_this_pass >= follow_limit:
+                break
 
-            # Balanced mode may discover future target nodes. Follow-only mode
-            # stays strictly inside followers/following of the configured targets.
-            if (
-                mode!="follow_only"
-                and u_name not in history.get("competitor_pool",[])
-                and u_name not in targets
-                and not getattr(u,"is_private",False)
-            ):
-                history.setdefault("competitor_pool",[]).append(u_name)
-
+            u_pk, u_name = int(u.pk), u.username
             if u_pk in history["followed_users"] or u_pk in history["blocked_or_missing"]:
                 continue
             try:
-                friendship=cl.user_friendship_v1(u_pk)
+                friendship = cl.user_friendship_v1(u_pk)
                 if not friendship.following and not friendship.outgoing_request:
-                    if not wait_for_write_slot(username,"follow"):
+                    if not wait_for_write_slot(username, "follow"):
                         break
                     if cl.user_follow(u_pk):
-                        record_write(username,"follow")
+                        record_write(username, "follow")
                         history["followed_users"].append(u_pk)
-                        followed_this_pass+=1
-                        actions_performed+=1
-                        update_account_metric(username,"total_follows",increment=1)
+                        followed_this_pass += 1
+                        actions_performed += 1
+                        update_account_metric(username, "total_follows", increment=1)
                         update_account_metric(
-                            username,"add_history",
+                            username, "add_history",
                             value=f"👤 Followed @{u_name} from @{active_target}'s {sweep_type}."
                         )
-            except (UserNotFound,PrivateError):
+            except (UserNotFound, PrivateError):
                 history["blocked_or_missing"].append(u_pk)
             except FeedbackRequired:
                 raise
             except Exception as exc:
                 update_account_metric(
-                    username,"add_history",
+                    username, "add_history",
                     value=f"⚠️ Follow skipped for @{u_name}: {str(exc)[:60]}"
                 )
     except FeedbackRequired:
         raise
     except Exception as exc:
         update_account_metric(
-            username,"add_history",
-            value=f"⚠️ Target scrape error on @{active_target}: {str(exc)[:80]}"
+            username, "add_history",
+            value=f"⚠️ Target follow error on @{active_target}: {str(exc)[:80]}"
         )
     return actions_performed
 
 
 
+
 def interact_with_hashtags(cl, history, config, username, actions_performed):
     s=get_account_control_settings(username,config)
+    if not s.get("enable_engage", False):
+        return actions_performed
     tags=s["target_hashtags"] or list(config.get("target_hashtags") or [])
     if not tags:
         update_account_metric(username,"add_history",value="⚠️ No target hashtags configured.")
@@ -1825,6 +1858,8 @@ def interact_with_hashtags(cl, history, config, username, actions_performed):
 
 
 def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
+    if not get_account_control_settings(username).get("enable_dms", False):
+        return 0
     processed = 0
     settings = get_account_control_settings(username)
     per_pass_limit = max(1, int(settings.get("max_dm_replies_per_pass", MAX_DM_REPLIES_PER_PASS)))
@@ -1895,6 +1930,8 @@ def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
     )
 
     for source, thread_stub in records:
+        if not get_account_control_settings(username).get("enable_dms", False):
+            break
         if processed >= min(max_replies, MAX_WRITES_PER_WORKFLOW, per_pass_limit):
             break
         if getattr(thread_stub, "is_group", False):
@@ -2066,6 +2103,8 @@ def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
 
 
 def handle_post_comments(cl, history, username):
+    if not get_account_control_settings(username).get("enable_comments", False):
+        return 0
     processed = 0
     settings = get_account_control_settings(username)
     per_pass_limit = max(1, int(settings.get("max_comment_replies_per_pass", MAX_COMMENT_REPLIES_PER_PASS)))
@@ -2074,6 +2113,8 @@ def handle_post_comments(cl, history, username):
         for media in my_medias:
             comments = cl.media_comments(media.id, amount=15)
             for comment in comments:
+                if not get_account_control_settings(username).get("enable_comments", False):
+                    return processed
                 if processed >= min(3, per_pass_limit, MAX_WRITES_PER_WORKFLOW):
                     return processed
                 if (
@@ -2371,6 +2412,8 @@ def verify_media_visibility(cl, uploaded_media, username, kind):
 
 
 def execute_repost_flow(cl, history, username, folder_pool):
+    if not get_account_control_settings(username).get("enable_posts", False):
+        return False
     update_account_metric(
         username, "add_history",
         value="Scanning media pool for an unused folder..."
@@ -2753,91 +2796,90 @@ def patch_obsolete_qe_expose(cl, username):
 
 def run_profile_workflow(username, conf, folder_pool):
     global NEXT_TASK_OVERRIDE
+
     if username in CONTROL_DISCONNECTED_ACCOUNTS:
-        update_account_metric(username,"status",status="Disconnected")
+        update_account_metric(username, "status", status="Disconnected")
         return "disconnected"
-    if username in CONTROL_PAUSED_ACCOUNTS:
-        update_account_metric(username,"status",status="Paused")
+
+    forced_task = NEXT_TASK_OVERRIDE.pop(username, None)
+    if username in CONTROL_PAUSED_ACCOUNTS and not forced_task:
+        update_account_metric(username, "status", status="Connected / Auto Off")
         return "paused"
 
-    cl=CLIENT_CACHE.get(username)
+    cl = CLIENT_CACHE.get(username)
     if cl is None:
-        update_account_metric(username,"status",status="Disconnected")
+        update_account_metric(username, "status", status="Disconnected")
         return "disconnected"
 
-    patch_obsolete_qe_expose(cl,username)
-    settings=get_account_control_settings(username,conf)
-    mode=settings["mode"]
-    update_account_metric(username,"status",status=f"Active: {mode}")
+    patch_obsolete_qe_expose(cl, username)
+    settings = get_account_control_settings(username, conf)
+    update_account_metric(username, "status", status="Active")
 
-    history=load_json(conf["history_file"],{
-        "posted_ids":[],"replied_dms":[],"replied_comments":[],
-        "liked_medias":[],"commented_medias":[],"followed_users":[],
-        "blocked_or_missing":[],"competitor_pool":[],
-        "followers_next_max_id":None,"following_next_max_id":None,
-        "dm_reply_memory":{},
+    history = load_json(conf["history_file"], {
+        "posted_ids": [], "replied_dms": [], "replied_comments": [],
+        "liked_medias": [], "commented_medias": [], "followed_users": [],
+        "blocked_or_missing": [], "competitor_pool": [],
+        "followers_next_max_id": None, "following_next_max_id": None,
+        "dm_reply_memory": {},
     })
-    actions_performed=0
-    try:
-        forced_task=NEXT_TASK_OVERRIDE.pop(username,None)
-        if forced_task=="dm_scan":
-            handle_direct_messages(cl,history,username,max_replies=5,debug=True)
-        elif forced_task=="comments":
-            handle_post_comments(cl,history,username)
-        elif forced_task=="networking":
-            actions_performed=harvest_and_amplify_networks(
-                cl,history,conf,username,actions_performed
-            )
-        elif forced_task=="hashtags":
-            actions_performed=interact_with_hashtags(
-                cl,history,conf,username,actions_performed
-            )
-        elif forced_task=="repost":
-            execute_repost_flow(cl,history,username,folder_pool)
-        else:
-            if settings["enable_dm_replies"]:
-                handle_direct_messages(cl,history,username)
 
-            if mode=="manual":
-                pass
-            elif mode=="dm_only":
-                pass
-            elif mode=="upload_only":
-                if folder_pool:
-                    execute_repost_flow(cl,history,username,folder_pool)
-            elif mode=="follow_only":
-                actions_performed=harvest_and_amplify_networks(
-                    cl,history,conf,username,actions_performed
-                )
-            elif mode=="engage_only":
-                if settings["enable_comment_replies"]:
-                    handle_post_comments(cl,history,username)
-                actions_performed=interact_with_hashtags(
-                    cl,history,conf,username,actions_performed
-                )
-            else:
-                if settings["enable_comment_replies"]:
-                    handle_post_comments(cl,history,username)
-                roll=random.random()
-                if roll<0.40 and folder_pool:
-                    execute_repost_flow(cl,history,username,folder_pool)
-                elif roll<0.75:
-                    actions_performed=harvest_and_amplify_networks(
-                        cl,history,conf,username,actions_performed
+    actions_performed = 0
+    try:
+        # Manual actions remain available for non-DM features, but each action
+        # still obeys its feature checkbox.
+        if forced_task == "comments":
+            handle_post_comments(cl, history, username)
+        elif forced_task == "networking":
+            actions_performed = harvest_and_amplify_networks(
+                cl, history, conf, username, actions_performed
+            )
+        elif forced_task == "hashtags":
+            actions_performed = interact_with_hashtags(
+                cl, history, conf, username, actions_performed
+            )
+        elif forced_task == "repost":
+            execute_repost_flow(cl, history, username, folder_pool)
+        else:
+            # DMs/comments are independent listeners. They run ONLY if checked.
+            if settings.get("enable_dms", False):
+                handle_direct_messages(cl, history, username)
+            if settings.get("enable_comments", False):
+                handle_post_comments(cl, history, username)
+
+            # Pick one outward activity each workflow from the currently enabled
+            # features. Re-read settings first so Control Head changes take effect.
+            settings = get_account_control_settings(username, conf)
+            choices = []
+            if settings.get("enable_posts", False) and folder_pool:
+                choices.append("repost")
+            if settings.get("enable_follow", False):
+                choices.append("networking")
+            if settings.get("enable_engage", False):
+                choices.append("hashtags")
+
+            if choices:
+                task = random.choice(choices)
+                if task == "repost":
+                    execute_repost_flow(cl, history, username, folder_pool)
+                elif task == "networking":
+                    actions_performed = harvest_and_amplify_networks(
+                        cl, history, conf, username, actions_performed
                     )
-                else:
-                    actions_performed=interact_with_hashtags(
-                        cl,history,conf,username,actions_performed
+                elif task == "hashtags":
+                    actions_performed = interact_with_hashtags(
+                        cl, history, conf, username, actions_performed
                     )
     finally:
-        save_json(conf["history_file"],history)
-        if username in CONTROL_PAUSED_ACCOUNTS:
-            update_account_metric(username,"status",status="Paused")
-        elif username in CONTROL_DISCONNECTED_ACCOUNTS:
-            update_account_metric(username,"status",status="Disconnected")
+        save_json(conf["history_file"], history)
+        if username in CONTROL_DISCONNECTED_ACCOUNTS:
+            update_account_metric(username, "status", status="Disconnected")
+        elif username in CONTROL_PAUSED_ACCOUNTS:
+            update_account_metric(username, "status", status="Connected / Auto Off")
         else:
-            update_account_metric(username,"status",status=f"Idle: {mode}")
+            update_account_metric(username, "status", status="Connected / Auto On")
+
     return "ran"
+
 
 
 
@@ -2959,12 +3001,12 @@ def _control_add_account(username):
         raise ValueError("Enter a valid Instagram username.")
     if username in CONTROL_ROSTER:
         return {"ok": True, "username": username, "existing": True}
+    if len(CONTROL_ROSTER) >= 3:
+        raise RuntimeError("The Control Head supports a maximum of 3 configured Instagram accounts.")
 
     conf = _new_instagram_account_conf(username)
     FAN_ROSTER[username] = conf
     CONTROL_ROSTER[username] = conf
-
-    # New accounts are configured but completely inactive.
     CONTROL_DISCONNECTED_ACCOUNTS.add(username)
     CONTROL_PAUSED_ACCOUNTS.add(username)
     AUTH_EVENT[username] = "disconnected"
@@ -2977,6 +3019,7 @@ def _control_add_account(username):
         "existing": False,
         "session_file": conf["session_file"],
     }
+
 
 
 def _control_remove_account(username):
@@ -3261,7 +3304,7 @@ def _control_pause(username, pause):
 
 def _control_queue_task(username, task):
     username = str(username or "").strip().lstrip("@")
-    allowed = {"repost", "networking", "hashtags", "comments", "dm_scan"}
+    allowed = {"repost", "networking", "hashtags", "comments"}
 
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
@@ -3468,12 +3511,18 @@ function toast(msg, bad=false){
 }
 
 document.addEventListener("focusin", e=>{
-  if(e.target.matches("input,textarea")) editing=true;
+  if(e.target.matches("input,textarea,select")) editing=true;
 });
 document.addEventListener("focusout", e=>{
+  const card=e.target.closest?.(".card[data-user]");
   setTimeout(()=>{
-    editing=!!document.querySelector("input:focus,textarea:focus");
+    editing=!!document.querySelector("input:focus,textarea:focus,select:focus");
+    if(card && !editing) autoSaveBehavior(card.dataset.user,true);
   },0);
+});
+document.addEventListener("change", e=>{
+  const card=e.target.closest?.(".card[data-user]");
+  if(card) autoSaveBehavior(card.dataset.user,true);
 });
 
 function cardHtml(user,a){
@@ -3549,15 +3598,18 @@ function cardHtml(user,a){
 
 
     <div class="section">
-      <b>Behavior / Mode Settings</b>
+      <b>Behavior Features & Settings</b>
       <div class="fieldgrid">
-        <div>
-          <label>Mode</label>
-          <select id="mode_${esc(user)}">
-            ${["balanced","upload_only","follow_only","engage_only","dm_only","manual"].map(
-              m=>`<option value="${m}" ${s.mode===m?"selected":""}>${m.replaceAll("_"," ")}</option>`
-            ).join("")}
-          </select>
+        <div style="grid-column:1/-1">
+          <label>Enabled features</label>
+          <div class="row">
+            <label><input id="posts_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_posts?"checked":""}> Posts</label>
+            <label><input id="follow_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_follow?"checked":""}> Follow</label>
+            <label><input id="engage_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_engage?"checked":""}> Hashtag / Engage</label>
+            <label><input id="dms_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_dms?"checked":""}> DMs</label>
+            <label><input id="comments_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_comments?"checked":""}> Comment Replies</label>
+          </div>
+          <div class="small">Unchecked features are not polled or executed in background automation.</div>
         </div>
         <div>
           <label>Follow source</label>
@@ -3593,31 +3645,16 @@ function cardHtml(user,a){
 
       <div class="row">
         <label><input id="reqvision_${esc(user)}" type="checkbox" style="width:auto" ${s.require_video_vision?"checked":""}> Require multi-frame vision for videos</label>
-        <label><input id="dmen_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_dm_replies?"checked":""}> Auto-reply DMs</label>
-        <label><input id="commenten_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_comment_replies?"checked":""}> Auto-reply comments</label>
       </div>
-      <div class="row"><button class="good" onclick="saveBehavior('${esc(user)}')">Save Behavior Settings</button></div>
     </div>
 
     <div class="section">
       <b>Manual actions</b>
       <div class="row">
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
-        <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','dm_scan')">DM Scan</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','networking')">Network</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','hashtags')">Hashtags</button>
-      </div>
-    </div>
-
-    <div class="section">
-      <b>Send DM</b>
-      <label>Recipient</label>
-      <input id="to_${esc(user)}" placeholder="@username">
-      <label>Message</label>
-      <textarea id="msg_${esc(user)}" placeholder="Type a message..."></textarea>
-      <div class="row">
-        <button ${connected ? "":"disabled"} onclick="sendDm('${esc(user)}')">Send DM</button>
       </div>
     </div>
 
@@ -3662,6 +3699,24 @@ function render(data){
   grid.innerHTML=Object.entries(latestData)
     .map(([u,a])=>cardHtml(u,a))
     .join("");
+  for(const [u,a] of Object.entries(latestData)){
+    if(a && a.control && a.control.settings){
+      const s=a.control.settings;
+      behaviorSignatures[u]=JSON.stringify({
+        enable_posts:!!s.enable_posts,enable_follow:!!s.enable_follow,
+        enable_engage:!!s.enable_engage,enable_dms:!!s.enable_dms,
+        enable_comments:!!s.enable_comments,follow_source:s.follow_source,
+        caption_char_limit:Number(s.caption_char_limit),reply_char_limit:Number(s.reply_char_limit),
+        follow_limit:Number(s.follow_limit),video_frames:Number(s.video_frames),
+        max_writes_per_window:Number(s.max_writes_per_window),write_window_seconds:Number(s.write_window_seconds),
+        write_min_gap_seconds:Number(s.write_min_gap_seconds),upload_cooldown_seconds:Number(s.upload_cooldown_seconds),
+        target_accounts:s.target_accounts||[],target_hashtags:s.target_hashtags||[],
+        persona_prompt:s.persona_prompt||'',caption_prompt:s.caption_prompt||'',
+        dm_prompt:s.dm_prompt||'',comment_prompt:s.comment_prompt||'',
+        require_video_vision:!!s.require_video_vision
+      });
+    }
+  }
 }
 
 async function api(action,payload={}){
@@ -3688,6 +3743,7 @@ async function refreshNow(force=false){
 
   refreshBusy=true;
   try{
+    if(!editing) await autoSaveVisibleBehavior();
     const r=await fetch("/api/metrics",{cache:"no-store"});
     const data=await r.json();
     render(data);
@@ -3703,7 +3759,7 @@ async function refreshNow(force=false){
 
 
 async function addInstagramAccount(){
-  const username=prompt("Instagram username to add:");
+  const username=prompt("Instagram username to add (maximum 3 configured accounts):");
   if(!username) return;
   try{
     const result=await api("add_account",{username});
@@ -3781,9 +3837,13 @@ function splitList(v){
   return String(v||"").split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);
 }
 
-async function saveBehavior(user){
-  const settings={
-    mode:document.getElementById(`mode_${user}`).value,
+function collectBehavior(user){
+  return {
+    enable_posts:document.getElementById(`posts_${user}`).checked,
+    enable_follow:document.getElementById(`follow_${user}`).checked,
+    enable_engage:document.getElementById(`engage_${user}`).checked,
+    enable_dms:document.getElementById(`dms_${user}`).checked,
+    enable_comments:document.getElementById(`comments_${user}`).checked,
     follow_source:document.getElementById(`fsource_${user}`).value,
     caption_char_limit:Number(document.getElementById(`caplim_${user}`).value),
     reply_char_limit:Number(document.getElementById(`replim_${user}`).value),
@@ -3800,25 +3860,29 @@ async function saveBehavior(user){
     dm_prompt:document.getElementById(`dmprompt_${user}`).value,
     comment_prompt:document.getElementById(`commentprompt_${user}`).value,
     require_video_vision:document.getElementById(`reqvision_${user}`).checked,
-    enable_dm_replies:document.getElementById(`dmen_${user}`).checked,
-    enable_comment_replies:document.getElementById(`commenten_${user}`).checked,
   };
-  try{
-    await api("save_settings",{username:user,settings});
-    editing=false;
-    await refreshNow(true);
-    toast(`Saved behavior settings for @${user}.`);
-  }catch(e){toast(e.message,true)}
 }
 
-async function sendDm(user){
-  const to=document.getElementById(`to_${user}`).value;
-  const message=document.getElementById(`msg_${user}`).value;
+const behaviorSignatures={};
+
+async function autoSaveBehavior(user,quiet=true){
+  const card=document.querySelector(`.card[data-user="${CSS.escape(user)}"]`);
+  if(!card) return;
+  const settings=collectBehavior(user);
+  const sig=JSON.stringify(settings);
+  if(behaviorSignatures[user]===sig) return;
   try{
-    await api("send_dm",{username:user,recipient:to,message});
-    document.getElementById(`msg_${user}`).value="";
-    toast(`DM sent from @${user}.`);
-  }catch(e){toast(e.message,true)}
+    await api("save_settings",{username:user,settings});
+    behaviorSignatures[user]=sig;
+    if(!quiet) toast(`Behavior updated for @${user}.`);
+  }catch(e){
+    if(!quiet) toast(e.message,true);
+  }
+}
+
+async function autoSaveVisibleBehavior(){
+  const users=[...document.querySelectorAll(".card[data-user]")].map(x=>x.dataset.user);
+  await Promise.all(users.map(u=>autoSaveBehavior(u,true)));
 }
 
 document.getElementById("autoRefresh").addEventListener("change",()=>{
@@ -3883,12 +3947,6 @@ refreshNow(true);
                     username, str(body.get("task", ""))
                 )
 
-            elif action == "send_dm":
-                result = _control_send_dm(
-                    username,
-                    body.get("recipient", ""),
-                    body.get("message", ""),
-                )
 
             elif action == "save_settings":
                 result = _control_save_settings(
@@ -4018,6 +4076,8 @@ def poll_all_cached_dms(active_roster, force=False, debug=False):
             continue
         if username in CONTROL_PAUSED_ACCOUNTS:
             continue
+        if not get_account_control_settings(username, conf).get("enable_dms", False):
+            continue
 
         cl = CLIENT_CACHE.get(username)
         if cl is None:
@@ -4063,19 +4123,69 @@ def poll_all_cached_dms(active_roster, force=False, debug=False):
 
 
 
+
+ACCOUNT_WORKFLOW_THREADS = {}
+ACCOUNT_WORKFLOW_THREADS_LOCK = threading.RLock()
+
+
+def _background_account_workflow(username, conf, next_workflow_at):
+    try:
+        folder_pool = discover_local_media_folders()
+        result = run_profile_workflow(username, conf, folder_pool)
+    except FeedbackRequired as exc:
+        cooldown_target = datetime.now() + timedelta(hours=2)
+        ACCOUNT_COOLDOWNS[username] = cooldown_target
+        update_account_metric(username, "cooldown_until", value=cooldown_target.strftime("%H:%M"))
+        update_account_metric(username, "status", status="Rate Cooldown")
+        update_account_metric(
+            username, "add_history",
+            value=f"Instagram requested a cooldown: {str(exc)[:70]}"
+        )
+        result = "throttled"
+    except Exception as exc:
+        update_account_metric(
+            username, "add_history",
+            value=f"Workflow error: {type(exc).__name__}: {str(exc)[:100]}"
+        )
+        result = "error"
+
+    if result == "ran":
+        delay = random.randint(WORKFLOW_SLEEP_MIN, WORKFLOW_SLEEP_MAX)
+    else:
+        delay = WORKFLOW_RETRY_IDLE_SECONDS
+
+    with ACCOUNT_WORKFLOW_THREADS_LOCK:
+        next_workflow_at[username] = time.monotonic() + delay
+        ACCOUNT_WORKFLOW_THREADS.pop(username, None)
+
+
+def _start_background_account_workflow(username, conf, next_workflow_at):
+    with ACCOUNT_WORKFLOW_THREADS_LOCK:
+        existing = ACCOUNT_WORKFLOW_THREADS.get(username)
+        if existing and existing.is_alive():
+            return False
+        thread = threading.Thread(
+            target=_background_account_workflow,
+            args=(username, conf, next_workflow_at),
+            daemon=True,
+            name=f"instagram-workflow-{username}",
+        )
+        ACCOUNT_WORKFLOW_THREADS[username] = thread
+        thread.start()
+        return True
+
+
 def main():
     global CONTROL_ROSTER
 
     ensure_data_root()
     active_roster = _active_roster()
-    if not active_roster:
-        print(f"No Instagram accounts are configured in {IG_ACCOUNTS_FILE}. Run the suite launcher setup first.")
-        return
 
+    # Hard dashboard cap. An empty roster is valid: the Control Head still
+    # starts so the first account can be added from the browser.
+    active_roster = dict(list(active_roster.items())[:3])
     CONTROL_ROSTER = active_roster
 
-    # CRITICAL: every process start begins disconnected. Existing session JSON
-    # files are kept but are not loaded or validated until Quick Login is clicked.
     CLIENT_CACHE.clear()
     CONTROL_DISCONNECTED_ACCOUNTS.clear()
     CONTROL_DISCONNECTED_ACCOUNTS.update(active_roster.keys())
@@ -4086,147 +4196,68 @@ def main():
 
     for user in active_roster:
         AUTH_EVENT[user] = "disconnected"
-        update_account_metric(user, "status", status="Disconnected")
+        update_account_metric(user, "status", status="Disconnected / Auto Off")
 
     print(f"Instagram Control Head: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {MEDIA_ROOT}")
-    print("Configured accounts: " + ", ".join(f"@{u}" for u in active_roster))
-    print("Boot mode: DISCONNECTED")
-    print(
-        "No Instagram login/API calls will occur until you press Quick Login "
-        "or Login & Save Session in the Control Head."
-    )
-    print("Saved sessions are preserved for one-click Quick Login.")
-    print(
-        f"Write pacing: max {MAX_WRITES_PER_WINDOW} writes / "
-        f"{WRITE_WINDOW_SECONDS // 60} min per account, "
-        f"{WRITE_MIN_GAP_SECONDS}s account gap, "
-        f"{GLOBAL_WRITE_MIN_GAP_SECONDS}s shared cross-process bot gap, "
-        f"{UPLOAD_COOLDOWN_SECONDS // 60} min upload cooldown."
-    )
+    print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
+    print("Dashboard account cap: 3")
+    print("Boot mode: DISCONNECTED / AUTO OFF")
 
-    server = ThreadingHTTPServer(
-        (IG_HOST, IG_PORT),
-        DashboardAPIHandler,
-    )
-    threading.Thread(
-        target=server.serve_forever,
-        daemon=True,
-    ).start()
+    server = ThreadingHTTPServer((IG_HOST, IG_PORT), DashboardAPIHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    print("Control Head server is running.")
-
-    # Separate per-account workflow schedule. Disconnected accounts are simply
-    # skipped without login attempts.
     next_workflow_at = {
-        user: time.monotonic() + random.randint(15, 30)
+        user: time.monotonic() + random.randint(15, 35)
         for user in active_roster
     }
 
     try:
         while True:
-            # DMs only for accounts the user explicitly connected.
-            poll_all_cached_dms(active_roster)
+            # Listener respects Auto Off and the DMs checkbox.
+            poll_all_cached_dms(CONTROL_ROSTER)
 
             now_mono = time.monotonic()
-            ran_something = False
-
-            for current_user, conf in active_roster.items():
+            for current_user, conf in list(CONTROL_ROSTER.items()):
                 if current_user in CONTROL_DISCONNECTED_ACCOUNTS:
                     continue
                 if current_user not in CLIENT_CACHE:
                     continue
 
                 forced = current_user in CONTROL_FORCE_RUN
-                if current_user in CONTROL_PAUSED_ACCOUNTS and not forced:
+                auto_on = current_user not in CONTROL_PAUSED_ACCOUNTS
+                if not auto_on and not forced:
                     continue
+
                 if current_user not in next_workflow_at:
                     next_workflow_at[current_user] = now_mono + random.randint(5, 15)
-                due = now_mono >= next_workflow_at.get(
-                    current_user, float("inf")
-                )
+
+                due = now_mono >= next_workflow_at[current_user]
                 if not forced and not due:
                     continue
 
                 if forced:
                     CONTROL_FORCE_RUN.discard(current_user)
 
-                folder_pool = discover_local_media_folders()
-                result = "error"
+                # Start every due account independently. Up to 3 accounts can be
+                # working concurrently; shared write pacing still serializes risky
+                # outbound writes enough to avoid simultaneous bursts.
+                if _start_background_account_workflow(
+                    current_user, conf, next_workflow_at
+                ):
+                    next_workflow_at[current_user] = float("inf")
 
-                try:
-                    result = run_profile_workflow(
-                        current_user, conf, folder_pool
-                    )
-
-                except FeedbackRequired as exc:
-                    cooldown_target = (
-                        datetime.now() + timedelta(hours=2)
-                    )
-                    ACCOUNT_COOLDOWNS[current_user] = cooldown_target
-                    update_account_metric(
-                        current_user,
-                        "cooldown_until",
-                        value=cooldown_target.strftime("%H:%M"),
-                    )
-                    update_account_metric(
-                        current_user,
-                        "status",
-                        status="Rate Cooldown",
-                    )
-                    update_account_metric(
-                        current_user,
-                        "add_history",
-                        value=(
-                            "Instagram requested a cooldown: "
-                            f"{str(exc)[:70]}"
-                        ),
-                    )
-                    result = "throttled"
-
-                except Exception as exc:
-                    print(
-                        f"⚠️ @{current_user} workflow exception: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    update_account_metric(
-                        current_user,
-                        "add_history",
-                        value=(
-                            f"Workflow error: {type(exc).__name__}: "
-                            f"{str(exc)[:100]}"
-                        ),
-                    )
-
-                if result == "ran":
-                    delay = random.randint(
-                        WORKFLOW_SLEEP_MIN,
-                        WORKFLOW_SLEEP_MAX,
-                    )
-                    next_workflow_at[current_user] = (
-                        time.monotonic() + delay
-                    )
-                else:
-                    next_workflow_at[current_user] = (
-                        time.monotonic() + WORKFLOW_RETRY_IDLE_SECONDS
-                    )
-
-                ran_something = True
-                break
-
-            if not ran_something:
-                time.sleep(2)
+            time.sleep(1.0)
 
     except KeyboardInterrupt:
-        print(
-            "\nControl Head stopped. Saved Instagram sessions were left untouched."
-        )
+        print("\nControl Head stopped. Saved Instagram sessions were left untouched.")
     finally:
         try:
             server.shutdown()
         except Exception:
             pass
+
 
 
 
