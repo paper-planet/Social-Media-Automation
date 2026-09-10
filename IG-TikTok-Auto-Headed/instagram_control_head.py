@@ -121,9 +121,9 @@ CLIENT_CACHE = {}  # username -> authenticated instagrapi Client for this proces
 AUTH_RETRY_AFTER = {}  # username -> datetime; prevents rapid login loops
 
 # One-account instances can keep DMs responsive without making posting/actions frequent.
-DM_POLL_SECONDS = max(30, int(os.environ.get("IG_DM_POLL_SECONDS", "30")))
-WORKFLOW_SLEEP_MIN = max(DM_POLL_SECONDS, int(os.environ.get("IG_WORKFLOW_SLEEP_MIN", "240")))
-WORKFLOW_SLEEP_MAX = max(WORKFLOW_SLEEP_MIN, int(os.environ.get("IG_WORKFLOW_SLEEP_MAX", "600")))
+DM_POLL_SECONDS = max(60, int(os.environ.get("IG_DM_POLL_SECONDS", "90")))
+WORKFLOW_SLEEP_MIN = max(DM_POLL_SECONDS, int(os.environ.get("IG_WORKFLOW_SLEEP_MIN", "420")))
+WORKFLOW_SLEEP_MAX = max(WORKFLOW_SLEEP_MIN, int(os.environ.get("IG_WORKFLOW_SLEEP_MAX", "1200")))
 OLLAMA_MODEL = os.environ.get("IG_OLLAMA_MODEL", "llama3.1").strip() or "llama3.1"
 OLLAMA_VISION_MODEL = os.environ.get("IG_OLLAMA_VISION_MODEL", "").strip()
 VISION_MODEL_CACHE = {"checked": False, "name": ""}
@@ -137,13 +137,21 @@ DM_MAX_MESSAGE_AGE_HOURS = max(1, int(os.environ.get("IG_DM_MAX_MESSAGE_AGE_HOUR
 # --- CONSERVATIVE WRITE PACING ---
 # These govern WRITE actions only (likes, follows, comments, DMs, uploads).
 # Read/polling actions such as DM checks do not consume the write budget.
-WRITE_MIN_GAP_SECONDS = max(8, int(os.environ.get("IG_WRITE_MIN_GAP_SECONDS", "22")))
-GLOBAL_WRITE_MIN_GAP_SECONDS = max(5, int(os.environ.get("IG_GLOBAL_WRITE_MIN_GAP_SECONDS", "10")))
-WRITE_WINDOW_SECONDS = max(60, int(os.environ.get("IG_WRITE_WINDOW_SECONDS", "900")))
-MAX_WRITES_PER_WINDOW = max(1, int(os.environ.get("IG_MAX_WRITES_PER_WINDOW", "8")))
-MAX_WRITES_PER_WORKFLOW = max(1, int(os.environ.get("IG_MAX_WRITES_PER_WORKFLOW", "4")))
-UPLOAD_COOLDOWN_SECONDS = max(300, int(os.environ.get("IG_UPLOAD_COOLDOWN_SECONDS", "1800")))
-DM_REPLY_COOLDOWN_SECONDS = max(15, int(os.environ.get("IG_DM_REPLY_COOLDOWN_SECONDS", "45")))
+WRITE_MIN_GAP_SECONDS = max(10, int(os.environ.get("IG_WRITE_MIN_GAP_SECONDS", "40")))
+GLOBAL_WRITE_MIN_GAP_SECONDS = max(8, int(os.environ.get("IG_GLOBAL_WRITE_MIN_GAP_SECONDS", "18")))
+WRITE_WINDOW_SECONDS = max(60, int(os.environ.get("IG_WRITE_WINDOW_SECONDS", "1200")))
+MAX_WRITES_PER_WINDOW = max(1, int(os.environ.get("IG_MAX_WRITES_PER_WINDOW", "6")))
+MAX_WRITES_PER_WORKFLOW = max(1, int(os.environ.get("IG_MAX_WRITES_PER_WORKFLOW", "3")))
+UPLOAD_COOLDOWN_SECONDS = max(300, int(os.environ.get("IG_UPLOAD_COOLDOWN_SECONDS", "2400")))
+DM_REPLY_COOLDOWN_SECONDS = max(30, int(os.environ.get("IG_DM_REPLY_COOLDOWN_SECONDS", "120")))
+DM_MIN_INCOMING_AGE_SECONDS = max(0, int(os.environ.get("IG_DM_MIN_INCOMING_AGE_SECONDS", "90")))
+DM_THREAD_REPLY_COOLDOWN_SECONDS = max(60, int(os.environ.get("IG_DM_THREAD_REPLY_COOLDOWN_SECONDS", "1800")))
+MAX_DM_REPLIES_PER_PASS = max(1, int(os.environ.get("IG_MAX_DM_REPLIES_PER_PASS", "1")))
+MAX_COMMENT_REPLIES_PER_PASS = max(1, int(os.environ.get("IG_MAX_COMMENT_REPLIES_PER_PASS", "1")))
+ACTION_HUMAN_DELAY_MIN_SECONDS = max(0, int(os.environ.get("IG_ACTION_HUMAN_DELAY_MIN_SECONDS", "8")))
+ACTION_HUMAN_DELAY_MAX_SECONDS = max(ACTION_HUMAN_DELAY_MIN_SECONDS, int(os.environ.get("IG_ACTION_HUMAN_DELAY_MAX_SECONDS", "18")))
+CONTROL_HEAD_REFRESH_SECONDS = max(5, int(os.environ.get("IG_CONTROL_HEAD_REFRESH_SECONDS", "10")))
+WORKFLOW_RETRY_IDLE_SECONDS = max(15, int(os.environ.get("IG_WORKFLOW_RETRY_IDLE_SECONDS", "45")))
 
 ACCOUNT_WRITE_TIMES = {}
 ACCOUNT_LAST_WRITE = {}
@@ -160,7 +168,7 @@ LAST_DM_POLL = {}
 # Populated in main(). Accounts begin disconnected on every process start.
 CONTROL_ROSTER = {}
 CONTROL_DISCONNECTED_ACCOUNTS = set()
-CONTROL_PAUSED_ACCOUNTS = set()
+CONTROL_PAUSED_ACCOUNTS = set()  # connected accounts with background automation OFF
 CONTROL_FORCE_RUN = set()
 CONTROL_LOCK = threading.RLock()
 
@@ -261,6 +269,8 @@ def _default_control_settings(username, conf):
         "write_min_gap_seconds": WRITE_MIN_GAP_SECONDS,
         "upload_cooldown_seconds": UPLOAD_COOLDOWN_SECONDS,
         "max_writes_per_workflow": MAX_WRITES_PER_WORKFLOW,
+        "max_dm_replies_per_pass": MAX_DM_REPLIES_PER_PASS,
+        "max_comment_replies_per_pass": MAX_COMMENT_REPLIES_PER_PASS,
     }
 
 
@@ -1816,8 +1826,11 @@ def interact_with_hashtags(cl, history, config, username, actions_performed):
 
 def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
     processed = 0
+    settings = get_account_control_settings(username)
+    per_pass_limit = max(1, int(settings.get("max_dm_replies_per_pass", MAX_DM_REPLIES_PER_PASS)))
     history.setdefault("replied_dms", [])
     history.setdefault("dm_reply_memory", {})
+    history.setdefault("dm_thread_last_reply_at", {})
 
     records = []
     seen_thread_ids = set()
@@ -1882,7 +1895,7 @@ def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
     )
 
     for source, thread_stub in records:
-        if processed >= min(max_replies, MAX_WRITES_PER_WORKFLOW):
+        if processed >= min(max_replies, MAX_WRITES_PER_WORKFLOW, per_pass_limit):
             break
         if getattr(thread_stub, "is_group", False):
             continue
@@ -1940,6 +1953,8 @@ def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
                     age_hours = (now_for_msg - msg_time).total_seconds() / 3600
                     if age_hours > DM_MAX_MESSAGE_AGE_HOURS:
                         continue
+                    if age_hours * 3600 < DM_MIN_INCOMING_AGE_SECONDS:
+                        continue
                 except Exception:
                     pass
 
@@ -1984,6 +1999,9 @@ def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
 
         thread_key = str(thread_id)
         previous_replies = history["dm_reply_memory"].get(thread_key, [])
+        last_thread_reply_at = float(history.get("dm_thread_last_reply_at", {}).get(thread_key, 0.0) or 0.0)
+        if last_thread_reply_at and time.time() - last_thread_reply_at < DM_THREAD_REPLY_COOLDOWN_SECONDS:
+            continue
 
         reply = generate_nonrepeating_dm_reply(
             incoming_text,
@@ -2005,6 +2023,7 @@ def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
 
         sent = None
         send_error = None
+        time.sleep(random.uniform(ACTION_HUMAN_DELAY_MIN_SECONDS, ACTION_HUMAN_DELAY_MAX_SECONDS))
         try:
             sent = cl.direct_answer(int(thread_id), reply)
         except Exception as exc:
@@ -2029,6 +2048,7 @@ def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
 
         previous_replies.append(reply)
         history["dm_reply_memory"][thread_key] = previous_replies[-20:]
+        history["dm_thread_last_reply_at"][thread_key] = time.time()
 
         print(f"📤 @{username} replied to @{sender}: {reply}")
         update_account_metric(
@@ -2047,12 +2067,14 @@ def handle_direct_messages(cl, history, username, max_replies=3, debug=False):
 
 def handle_post_comments(cl, history, username):
     processed = 0
+    settings = get_account_control_settings(username)
+    per_pass_limit = max(1, int(settings.get("max_comment_replies_per_pass", MAX_COMMENT_REPLIES_PER_PASS)))
     try:
         my_medias = cl.user_medias(cl.user_id, amount=5)
         for media in my_medias:
             comments = cl.media_comments(media.id, amount=15)
             for comment in comments:
-                if processed >= 3:
+                if processed >= min(3, per_pass_limit, MAX_WRITES_PER_WORKFLOW):
                     return processed
                 if (
                     str(comment.user.pk) == str(cl.user_id)
@@ -2077,10 +2099,11 @@ def handle_post_comments(cl, history, username):
                     )
                     continue
 
-                if processed >= MAX_WRITES_PER_WORKFLOW:
+                if processed >= min(MAX_WRITES_PER_WORKFLOW, per_pass_limit):
                     return processed
                 if not wait_for_write_slot(username, "comment"):
                     return processed
+                time.sleep(random.uniform(max(2, ACTION_HUMAN_DELAY_MIN_SECONDS // 2), max(4, ACTION_HUMAN_DELAY_MAX_SECONDS // 2)))
                 cl.media_comment(
                     media.id,
                     reply,
@@ -2891,6 +2914,104 @@ def open_local_folder(path_value):
     return {"ok":True,"folder":str(resolved)}
 
 
+
+def _write_instagram_accounts_file():
+    """
+    Persist only non-secret account configuration.
+    Sessions/passwords remain outside this file.
+    """
+    accounts = []
+    for username, conf in FAN_ROSTER.items():
+        if not isinstance(conf, dict):
+            continue
+        accounts.append({
+            "username": username,
+            "enabled": bool(conf.get("enabled", True)),
+            "target_hashtags": list(conf.get("target_hashtags") or []),
+            "target_accounts": list(conf.get("competitor_accounts") or []),
+        })
+    IG_ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = IG_ACCOUNTS_FILE.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps({"accounts": accounts}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(IG_ACCOUNTS_FILE)
+
+
+def _new_instagram_account_conf(username):
+    slug = _safe_account_slug(username)
+    return {
+        "enabled": True,
+        "password_env": "",
+        "totp_env": "",
+        "session_file": f"session_{slug}.json",
+        "history_file": f"history_{slug}.json",
+        "target_hashtags": [],
+        "competitor_accounts": [],
+    }
+
+
+def _control_add_account(username):
+    username = str(username or "").strip().lstrip("@")
+    username = re.sub(r"[^A-Za-z0-9._]", "", username)
+    if not username:
+        raise ValueError("Enter a valid Instagram username.")
+    if username in CONTROL_ROSTER:
+        return {"ok": True, "username": username, "existing": True}
+
+    conf = _new_instagram_account_conf(username)
+    FAN_ROSTER[username] = conf
+    CONTROL_ROSTER[username] = conf
+
+    # New accounts are configured but completely inactive.
+    CONTROL_DISCONNECTED_ACCOUNTS.add(username)
+    CONTROL_PAUSED_ACCOUNTS.add(username)
+    AUTH_EVENT[username] = "disconnected"
+    update_account_metric(username, "status", status="Disconnected / Auto Off")
+    _write_instagram_accounts_file()
+
+    return {
+        "ok": True,
+        "username": username,
+        "existing": False,
+        "session_file": conf["session_file"],
+    }
+
+
+def _control_remove_account(username):
+    """
+    Remove an account from the configured dashboard roster.
+
+    Saved session/history/settings files are deliberately preserved so re-adding
+    the same username restores its existing local setup.
+    """
+    username = str(username or "").strip().lstrip("@")
+    if username not in CONTROL_ROSTER:
+        raise ValueError(f"Unknown account @{username}")
+
+    # Local disconnect only; do NOT invalidate the Instagram session.
+    CLIENT_CACHE.pop(username, None)
+    CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
+    CONTROL_PAUSED_ACCOUNTS.discard(username)
+    CONTROL_FORCE_RUN.discard(username)
+    NEXT_TASK_OVERRIDE.pop(username, None)
+    LAST_DM_POLL.pop(username, None)
+    AUTH_RETRY_AFTER.pop(username, None)
+    ACCOUNT_COOLDOWNS.pop(username, None)
+    AUTH_EVENT.pop(username, None)
+
+    CONTROL_ROSTER.pop(username, None)
+    FAN_ROSTER.pop(username, None)
+    _write_instagram_accounts_file()
+
+    return {
+        "ok": True,
+        "username": username,
+        "preserved_local_data": True,
+    }
+
+
 def _control_metrics_payload():
     metrics = load_analytics()
     result = {}
@@ -2905,6 +3026,11 @@ def _control_metrics_payload():
             ),
             "disconnected": username in CONTROL_DISCONNECTED_ACCOUNTS,
             "paused": username in CONTROL_PAUSED_ACCOUNTS,
+            "auto_enabled": (
+                username in CLIENT_CACHE
+                and username not in CONTROL_DISCONNECTED_ACCOUNTS
+                and username not in CONTROL_PAUSED_ACCOUNTS
+            ),
             "saved_session": session_path.exists(),
             "session_file": session_path.name,
             "queued_task": NEXT_TASK_OVERRIDE.get(username, ""),
@@ -2957,15 +3083,16 @@ def _control_quick_login(username):
     with CONTROL_LOCK:
         CLIENT_CACHE[username] = cl
         CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
+        CONTROL_PAUSED_ACCOUNTS.add(username)
         AUTH_RETRY_AFTER.pop(username, None)
         ACCOUNT_COOLDOWNS.pop(username, None)
         LAST_DM_POLL.pop(username, None)
         AUTH_EVENT[username] = "quick_login"
 
-    update_account_metric(username, "status", status="Idle")
+    update_account_metric(username, "status", status="Connected / Auto Off")
     update_account_metric(
         username, "add_history",
-        value="🔓 Quick Login: verified saved session connected."
+        value="🔓 Quick Login: session connected; background automation remains OFF until Start Automation is pressed."
     )
     return {"ok": True, "mode": "saved_session"}
 
@@ -3019,15 +3146,16 @@ def _control_password_login(username, password, verification_code=""):
     with CONTROL_LOCK:
         CLIENT_CACHE[username] = cl
         CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
+        CONTROL_PAUSED_ACCOUNTS.add(username)
         AUTH_RETRY_AFTER.pop(username, None)
         ACCOUNT_COOLDOWNS.pop(username, None)
         LAST_DM_POLL.pop(username, None)
         AUTH_EVENT[username] = "control_login"
 
-    update_account_metric(username, "status", status="Idle")
+    update_account_metric(username, "status", status="Connected / Auto Off")
     update_account_metric(
         username, "add_history",
-        value="🔐 Password Login succeeded; verified session saved for Quick Login."
+        value="🔐 Password Login succeeded; session saved and connected with background automation OFF."
     )
     return {"ok": True, "mode": "password_login"}
 
@@ -3101,29 +3229,34 @@ def _control_full_logout(username):
 
 
 def _control_pause(username, pause):
+    """
+    pause=True  -> background automation OFF, connection/session preserved.
+    pause=False -> background automation ON.
+    """
     username = str(username or "").strip().lstrip("@")
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
+    if username in CONTROL_DISCONNECTED_ACCOUNTS or username not in CLIENT_CACHE:
+        raise RuntimeError("Account is disconnected. Log in first.")
 
     if pause:
         CONTROL_PAUSED_ACCOUNTS.add(username)
-        update_account_metric(username, "status", status="Paused")
+        CONTROL_FORCE_RUN.discard(username)
+        NEXT_TASK_OVERRIDE.pop(username, None)
+        update_account_metric(username, "status", status="Connected / Auto Off")
         update_account_metric(
             username, "add_history",
-            value="⏸️ Automation paused from Control Head."
+            value="⏹️ Background automation stopped; account remains connected."
         )
     else:
         CONTROL_PAUSED_ACCOUNTS.discard(username)
-        if username in CONTROL_DISCONNECTED_ACCOUNTS:
-            update_account_metric(username, "status", status="Disconnected")
-        else:
-            update_account_metric(username, "status", status="Idle")
+        update_account_metric(username, "status", status="Connected / Auto On")
         update_account_metric(
             username, "add_history",
-            value="▶️ Automation resumed from Control Head."
+            value="▶️ Background automation started from Control Head."
         )
 
-    return {"ok": True, "paused": pause}
+    return {"ok": True, "paused": pause, "auto_enabled": not pause}
 
 
 def _control_queue_task(username, task):
@@ -3287,6 +3420,7 @@ textarea{min-height:70px;resize:vertical}
       Auto Refresh
     </label>
     <button onclick="refreshNow()">Refresh Now</button>
+    <button class="good" onclick="addInstagramAccount()">Add Account</button>
     <span id="refreshState" class="small"></span>
   </div>
 </header>
@@ -3294,7 +3428,7 @@ textarea{min-height:70px;resize:vertical}
 <div class="notice">
   <b>Testing-safe startup:</b> restarting this Python program does not automatically log any account in.
   <b>Quick Login</b> reuses the saved session. <b>Disconnect</b> keeps that session.
-  <b>Full Logout</b> deletes it.
+  <b>Full Logout</b> deletes it. Logging in leaves automation OFF until you press <b>Start Automation</b>. <b>Remove Account</b> removes the dashboard entry but preserves its local session/history for easy re-add.
 </div>
 
 <div id="grid" class="grid"></div>
@@ -3312,6 +3446,7 @@ textarea{min-height:70px;resize:vertical}
 <div id="toast" class="toast"></div>
 
 <script>
+const CONTROL_HEAD_REFRESH_SECONDS = 10;
 let latestData = {};
 let editing = false;
 let refreshBusy = false;
@@ -3345,9 +3480,10 @@ function cardHtml(user,a){
   const c=a.control || {};
   const connected=!!c.connected;
   const paused=!!c.paused;
+  const autoEnabled=!!c.auto_enabled;
   const session=!!c.saved_session;
-  const status=connected ? (paused ? "PAUSED" : "CONNECTED") : "DISCONNECTED";
-  const badgeClass=connected ? (paused ? "warn" : "ok") : "bad";
+  const status=connected ? "CONNECTED" : "DISCONNECTED";
+  const badgeClass=connected ? "ok" : "bad";
   const logs=(a.history_log || []).map(x=>`<div>${esc(x)}</div>`).join("");
   const s=c.settings || {};
   const tags=(s.target_hashtags || []).join(", ");
@@ -3362,6 +3498,7 @@ function cardHtml(user,a){
       </div>
       <div class="badges">
         <span class="badge ${badgeClass}">${status}</span>
+        <span class="badge ${autoEnabled ? "ok":"warn"}">${autoEnabled ? "AUTO ON":"AUTO OFF"}</span>
         <span class="badge ${session ? "ok":"warn"}">${session ? "SAVED SESSION":"NO SESSION"}</span>
         ${c.queued_task ? `<span class="badge warn">QUEUED: ${esc(c.queued_task)}</span>` : ""}
       </div>
@@ -3383,9 +3520,12 @@ function cardHtml(user,a){
         </button>
         <button class="danger" ${(!session && !connected) ? "disabled":""}
           onclick="fullLogout('${esc(user)}')">Full Logout</button>
-        <button class="warn" ${connected ? "":"disabled"}
-          onclick="pauseAccount('${esc(user)}',${paused ? "false":"true"})">
-          ${paused ? "Resume":"Pause"}
+        <button class="${autoEnabled ? "warn":"good"}" ${connected ? "":"disabled"}
+          onclick="pauseAccount('${esc(user)}',${autoEnabled ? "true":"false"})">
+          ${autoEnabled ? "Stop Automation":"Start Automation"}
+        </button>
+        <button class="danger" onclick="removeInstagramAccount('${esc(user)}')">
+          Remove Account
         </button>
       </div>
 
@@ -3462,11 +3602,11 @@ function cardHtml(user,a){
     <div class="section">
       <b>Manual actions</b>
       <div class="row">
-        <button ${connected && !paused ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
-        <button ${connected && !paused ? "":"disabled"} onclick="queueTask('${esc(user)}','dm_scan')">DM Scan</button>
-        <button ${connected && !paused ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
-        <button ${connected && !paused ? "":"disabled"} onclick="queueTask('${esc(user)}','networking')">Network</button>
-        <button ${connected && !paused ? "":"disabled"} onclick="queueTask('${esc(user)}','hashtags')">Hashtags</button>
+        <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
+        <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','dm_scan')">DM Scan</button>
+        <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
+        <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','networking')">Network</button>
+        <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','hashtags')">Hashtags</button>
       </div>
     </div>
 
@@ -3559,6 +3699,26 @@ async function refreshNow(force=false){
   }finally{
     refreshBusy=false;
   }
+}
+
+
+async function addInstagramAccount(){
+  const username=prompt("Instagram username to add:");
+  if(!username) return;
+  try{
+    const result=await api("add_account",{username});
+    await refreshNow(true);
+    toast(result.existing ? `@${result.username} is already configured.` : `Added @${result.username}.`);
+  }catch(e){toast(e.message,true)}
+}
+
+async function removeInstagramAccount(user){
+  if(!confirm(`Remove @${user} from the Control Head?\n\nIts saved session/history/settings will be kept locally so re-adding the same username can reuse them.`)) return;
+  try{
+    await api("remove_account",{username:user});
+    await refreshNow(true);
+    toast(`Removed @${user} from configured accounts.`);
+  }catch(e){toast(e.message,true)}
 }
 
 async function quickLogin(user){
@@ -3667,7 +3827,7 @@ document.getElementById("autoRefresh").addEventListener("change",()=>{
 
 // Poll every 5 seconds, but refreshNow() refuses to redraw while typing or
 // when Auto Refresh is switched off.
-setInterval(()=>refreshNow(false),5000);
+setInterval(()=>refreshNow(false), CONTROL_HEAD_REFRESH_SECONDS * 1000);
 refreshNow(true);
 </script>
 </body>
@@ -3691,7 +3851,13 @@ refreshNow(true);
             action = str(body.get("action", "")).strip()
             username = str(body.get("username", "")).strip().lstrip("@")
 
-            if action == "quick_login":
+            if action == "add_account":
+                result = _control_add_account(username)
+
+            elif action == "remove_account":
+                result = _control_remove_account(username)
+
+            elif action == "quick_login":
                 result = _control_quick_login(username)
 
             elif action == "password_login":
@@ -3914,6 +4080,7 @@ def main():
     CONTROL_DISCONNECTED_ACCOUNTS.clear()
     CONTROL_DISCONNECTED_ACCOUNTS.update(active_roster.keys())
     CONTROL_PAUSED_ACCOUNTS.clear()
+    CONTROL_PAUSED_ACCOUNTS.update(active_roster.keys())
     CONTROL_FORCE_RUN.clear()
     LAST_DM_POLL.clear()
 
@@ -3968,12 +4135,14 @@ def main():
             for current_user, conf in active_roster.items():
                 if current_user in CONTROL_DISCONNECTED_ACCOUNTS:
                     continue
-                if current_user in CONTROL_PAUSED_ACCOUNTS:
-                    continue
                 if current_user not in CLIENT_CACHE:
                     continue
 
                 forced = current_user in CONTROL_FORCE_RUN
+                if current_user in CONTROL_PAUSED_ACCOUNTS and not forced:
+                    continue
+                if current_user not in next_workflow_at:
+                    next_workflow_at[current_user] = now_mono + random.randint(5, 15)
                 due = now_mono >= next_workflow_at.get(
                     current_user, float("inf")
                 )
@@ -4040,7 +4209,7 @@ def main():
                     )
                 else:
                     next_workflow_at[current_user] = (
-                        time.monotonic() + 15
+                        time.monotonic() + WORKFLOW_RETRY_IDLE_SECONDS
                     )
 
                 ran_something = True
