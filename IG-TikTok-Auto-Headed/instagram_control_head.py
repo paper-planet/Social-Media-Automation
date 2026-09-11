@@ -172,6 +172,161 @@ CONTROL_PAUSED_ACCOUNTS = set()  # connected accounts with background automation
 CONTROL_FORCE_RUN = set()
 CONTROL_LOCK = threading.RLock()
 
+ACCOUNT_SAFETY_LOCK = threading.RLock()
+
+
+def _account_safety_path():
+    return DOWNLOAD_ROOT / "account_safety_state.json"
+
+
+def _load_account_safety_db():
+    try:
+        path = _account_safety_path()
+        if path.exists():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                return value
+    except Exception:
+        pass
+    return {}
+
+
+def _save_account_safety_db(value):
+    path = _account_safety_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def get_account_safety_state(username):
+    username = str(username or "").strip().lstrip("@")
+    with ACCOUNT_SAFETY_LOCK:
+        row = _load_account_safety_db().get(username, {})
+        row = row if isinstance(row, dict) else {}
+
+    until_ts = float(row.get("until_ts") or 0.0)
+    return {
+        "active": until_ts > time.time(),
+        "level": str(row.get("level") or ""),
+        "reason": str(row.get("reason") or ""),
+        "detected_at": str(row.get("detected_at") or ""),
+        "until_ts": until_ts,
+        "until": datetime.fromtimestamp(until_ts).strftime("%Y-%m-%d %H:%M") if until_ts else "",
+    }
+
+
+def apply_account_safety_backoff(username, reason, level="restricted", hours=None):
+    """
+    Honor Instagram restriction/throttle feedback by stopping writes on the
+    affected account. Saved feature checkboxes are preserved; the safety state
+    temporarily overrides them.
+    """
+    username = str(username or "").strip().lstrip("@")
+    level = str(level or "restricted").lower()
+
+    if hours is None:
+        hours = {
+            "restricted": 12,
+            "throttle": 2,
+            "verification": 4,
+        }.get(level, 2)
+
+    reason = re.sub(r"\s+", " ", str(reason or "Instagram restriction signal")).strip()[:500]
+    until_ts = time.time() + float(hours) * 3600.0
+
+    with ACCOUNT_SAFETY_LOCK:
+        db = _load_account_safety_db()
+        previous = db.get(username, {})
+        if isinstance(previous, dict):
+            until_ts = max(until_ts, float(previous.get("until_ts") or 0.0))
+        db[username] = {
+            "level": level,
+            "reason": reason,
+            "detected_at": datetime.now().isoformat(timespec="seconds"),
+            "until_ts": until_ts,
+        }
+        _save_account_safety_db(db)
+
+    until_dt = datetime.fromtimestamp(until_ts)
+    ACCOUNT_COOLDOWNS[username] = until_dt
+    CONTROL_PAUSED_ACCOUNTS.add(username)
+    CONTROL_FORCE_RUN.discard(username)
+    NEXT_TASK_OVERRIDE.pop(username, None)
+
+    update_account_metric(username, "cooldown_until", value=until_dt.strftime("%Y-%m-%d %H:%M"))
+    update_account_metric(username, "status", status="Safety Backoff")
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🛡️ Safety backoff ({level}) until {until_dt.strftime('%Y-%m-%d %H:%M')}: "
+            f"{reason[:180]}"
+        ),
+    )
+    print(
+        f"🛡️ @{username}: Safety Backoff ({level}) until "
+        f"{until_dt.strftime('%Y-%m-%d %H:%M')} — {reason}"
+    )
+    return get_account_safety_state(username)
+
+
+def classify_platform_signal(value):
+    message = re.sub(r"\s+", " ", str(value or "")).strip()
+    lower = message.lower()
+
+    restricted_terms = (
+        "we restrict certain activity",
+        "we restrict how often",
+        "action blocked",
+        "account functionality",
+        "functionality reduced",
+        "functionality is being reduced",
+        "features are limited",
+        "feature is limited",
+        "account has been restricted",
+        "account is restricted",
+        "temporarily blocked",
+        "certain activity to protect our community",
+    )
+    throttle_terms = (
+        "feedback_required",
+        "feedback required",
+        "please wait a few minutes",
+        "please wait",
+        "too many requests",
+        "rate limit",
+        "429",
+        "try again later",
+    )
+
+    if any(term in lower for term in restricted_terms):
+        return "restricted", message
+    if any(term in lower for term in throttle_terms):
+        return "throttle", message
+    return "", message
+
+
+def observe_platform_signal(username, value, action=""):
+    level, message = classify_platform_signal(value)
+    if not level:
+        return False
+    prefix = f"{action}: " if action else ""
+    apply_account_safety_backoff(username, prefix + message, level=level)
+    return True
+
+
+def account_writes_allowed(username):
+    state = get_account_safety_state(username)
+    if state["active"]:
+        return False, f"Safety Backoff until {state['until']}: {state['reason'][:120]}"
+
+    cooldown = ACCOUNT_COOLDOWNS.get(username)
+    if cooldown and datetime.now() < cooldown:
+        return False, f"Account cooldown until {cooldown.strftime('%Y-%m-%d %H:%M')}"
+
+    return True, ""
+
 RAGE_BAIT_PERSONA = """
 You are the account's fictional social-media voice: exceptionally articulate, observant, quick, dry, smug, and deliberately provocative.
 
@@ -297,6 +452,35 @@ def _normalize_string_list(value, prefix_to_strip=""):
     return out[:100]
 
 
+def _normalize_hashtag_list(value):
+    """
+    Convert Control Head hashtag input to request-safe tag names.
+
+    Examples:
+      #xauusd          -> xauusd
+      "xauusd🔥🔥"     -> xauusd
+      gold trading    -> goldtrading
+
+    Only letters, digits and underscore are sent to Instagram's tag endpoint.
+    """
+    if isinstance(value, str):
+        parts = re.split(r"[\n,]+", value)
+    elif isinstance(value, list):
+        parts = value
+    else:
+        parts = []
+
+    out = []
+    for item in parts:
+        s = str(item or "").strip().strip("\"'")
+        s = s.lstrip("#")
+        s = re.sub(r"\s+", "", s)
+        s = re.sub(r"[^A-Za-z0-9_]", "", s)
+        if s and s not in out:
+            out.append(s)
+    return out[:100]
+
+
 def _sanitize_control_settings(username, conf, raw):
     base = _default_control_settings(username, conf)
     raw = raw if isinstance(raw, dict) else {}
@@ -340,8 +524,8 @@ def _sanitize_control_settings(username, conf, raw):
         "comment_prompt": str(raw.get("comment_prompt", base["comment_prompt"]))[:4000],
         "caption_char_limit": as_int("caption_char_limit", 80, 2200),
         "reply_char_limit": as_int("reply_char_limit", 20, 1000),
-        "target_hashtags": _normalize_string_list(
-            raw.get("target_hashtags", base["target_hashtags"]), "#"
+        "target_hashtags": _normalize_hashtag_list(
+            raw.get("target_hashtags", base["target_hashtags"])
         ),
         "target_accounts": _normalize_string_list(
             raw.get("target_accounts", base["target_accounts"]), "@"
@@ -1114,6 +1298,63 @@ def _credential(conf, key):
     return ""
 
 
+def _refresh_instagram_app_profile(cl, username: str = ""):
+    """
+    Re-apply the app-version profile bundled with the installed instagrapi.
+
+    Important: load_settings() can restore stale app_version/version_code/
+    bloks_versioning_id values from an older session JSON. Calling set_app()
+    afterwards keeps the saved device/session identity while updating the
+    advertised Instagram app build to the library's current supported default.
+    """
+    label = f"@{username}" if username else "Instagram client"
+    try:
+        cl.set_app()
+        app_version = str(
+            getattr(cl, "app_version", "")
+            or (getattr(cl, "device_settings", {}) or {}).get("app_version", "")
+            or "current library default"
+        )
+        print(f"📱 {label}: Instagram app profile refreshed -> {app_version}")
+        return cl
+    except AttributeError:
+        # Very old instagrapi installations did not expose set_app().
+        raise RuntimeError(
+            "Installed instagrapi is too old for current Instagram login. "
+            "Update it with: python -m pip install -U instagrapi==2.18.19"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not refresh Instagram app profile: "
+            f"{type(exc).__name__}: {str(exc)[:180]}"
+        ) from exc
+
+
+def _is_needs_upgrade_error(exc) -> bool:
+    message = str(exc or "").lower()
+    return any(
+        token in message
+        for token in (
+            "needs_upgrade",
+            "app out of date",
+            "version of instagram is out of date",
+            "update instagram to the latest version",
+            "unsupported_version",
+            "web/unsupported_version",
+        )
+    )
+
+
+def _needs_upgrade_message(username: str = "") -> str:
+    label = f" for @{username}" if username else ""
+    return (
+        f"Instagram is rejecting the private-API username/password login{label} "
+        "with error_type=needs_upgrade even though current instagrapi 2.18.19 "
+        "is installed. This is an Instagram/private-API compatibility issue, "
+        "not proof that your local package is outdated. Use Browser Login for "
+        "this account instead of repeatedly retrying Password Login."
+    )
+
 def _manual_browser_login(username, conf, session_p):
     """Capture a browser login and try once to convert it to an instagrapi session.
 
@@ -1156,6 +1397,7 @@ def _manual_browser_login(username, conf, session_p):
         pass
 
     cl = Client()
+    _refresh_instagram_app_profile(cl, username)
     try:
         cl.login_by_sessionid(sessionid)
         cl.dump_settings(session_p)
@@ -1284,6 +1526,9 @@ def get_authenticated_client(username, conf):
             if session_p.exists():
                 cl.load_settings(session_p)
 
+            # load_settings() may have restored an obsolete Instagram build.
+            _refresh_instagram_app_profile(cl, username)
+
             verification_code = (
                 generate_2fa(totp_secret) if totp_secret else ""
             )
@@ -1319,6 +1564,29 @@ def get_authenticated_client(username, conf):
         except Exception as exc:
             message = str(exc)
             lower = message.lower()
+
+            if _is_needs_upgrade_error(exc):
+                AUTH_EVENT[username] = "needs_upgrade"
+                set_auth_cooldown(username, minutes=360)
+                update_account_metric(
+                    username,
+                    "status",
+                    status="Private API Login Blocked",
+                )
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "📱 " + _needs_upgrade_message(username)
+                        + " Automatic credential retries paused for 6 hours."
+                    ),
+                )
+                print(
+                    "📱 "
+                    + _needs_upgrade_message(username)
+                    + " Automatic credential retries paused for 6 hours."
+                )
+                return None
 
             if (
                 "429" in lower
@@ -1484,69 +1752,103 @@ def _save_shared_pacing(data):
     tmp.replace(p)
 
 
-def _reserve_shared_write_slot(username,action_type):
+def _reserve_shared_write_slot(username, action_type):
     """
-    Atomically check AND reserve a write slot across every bot process using
-    the same Instagram state root. Failed downstream writes still consume the
-    reservation, intentionally making the limiter conservative.
+    Reserve a short cross-process write slot.
+
+    Uploads receive a short in-progress lease. The long upload cooldown is
+    committed only after Instagram returns a real media id.
     """
-    fd=_acquire_shared_pacing_lock()
+    allowed, reason = account_writes_allowed(username)
+    if not allowed:
+        return False, reason
+
+    fd = _acquire_shared_pacing_lock()
     if fd is None:
-        return False,"shared pacing lock busy"
+        return False, "shared pacing lock busy"
 
     try:
-        data=_load_shared_pacing()
-        now=time.time()
-        s=get_account_control_settings(username)
-        window=int(s["write_window_seconds"])
-        max_window=int(s["max_writes_per_window"])
-        account_gap=int(s["write_min_gap_seconds"])
-        upload_gap=int(s["upload_cooldown_seconds"])
+        data = _load_shared_pacing()
+        now = time.time()
+        settings = get_account_control_settings(username)
+        window = int(settings["write_window_seconds"])
+        max_window = int(settings["max_writes_per_window"])
+        account_gap = int(settings["write_min_gap_seconds"])
+        upload_gap = int(settings["upload_cooldown_seconds"])
 
-        accounts=data.setdefault("accounts",{})
-        row=accounts.setdefault(username,{
-            "writes":[],
-            "last_write":0.0,
-            "last_upload":0.0,
+        accounts = data.setdefault("accounts", {})
+        row = accounts.setdefault(username, {
+            "writes": [],
+            "last_write": 0.0,
+            "last_upload": 0.0,
+            "pending_upload_until": 0.0,
         })
-        cutoff=now-window
-        row["writes"]=[
-            float(t) for t in row.get("writes",[])
-            if isinstance(t,(int,float)) and float(t)>=cutoff
+        row.setdefault("pending_upload_until", 0.0)
+
+        cutoff = now - window
+        row["writes"] = [
+            float(t) for t in row.get("writes", [])
+            if isinstance(t, (int, float)) and float(t) >= cutoff
         ]
 
-        if len(row["writes"])>=max_window:
-            wait=int(max(1,float(row["writes"][0])+window-now))
-            return False,f"shared rolling budget; retry in ~{wait}s"
+        if len(row["writes"]) >= max_window:
+            wait = int(max(1, float(row["writes"][0]) + window - now))
+            return False, f"shared rolling budget; retry in ~{wait}s"
 
-        last_write=float(row.get("last_write") or 0.0)
-        if now-last_write<account_gap:
-            wait=int(max(1,account_gap-(now-last_write)))
-            return False,f"shared account gap; retry in ~{wait}s"
+        last_write = float(row.get("last_write") or 0.0)
+        if now - last_write < account_gap:
+            wait = int(max(1, account_gap - (now - last_write)))
+            return False, f"shared account gap; retry in ~{wait}s"
 
-        global_last=float(data.get("global_last") or 0.0)
-        if now-global_last<GLOBAL_WRITE_MIN_GAP_SECONDS:
-            wait=int(max(1,GLOBAL_WRITE_MIN_GAP_SECONDS-(now-global_last)))
-            return False,f"shared multi-process gap; retry in ~{wait}s"
+        global_last = float(data.get("global_last") or 0.0)
+        if now - global_last < GLOBAL_WRITE_MIN_GAP_SECONDS:
+            wait = int(max(1, GLOBAL_WRITE_MIN_GAP_SECONDS - (now - global_last)))
+            return False, f"shared multi-process gap; retry in ~{wait}s"
 
-        if action_type=="upload":
-            last_upload=float(row.get("last_upload") or 0.0)
-            if now-last_upload<upload_gap:
-                wait=int(max(1,upload_gap-(now-last_upload)))
-                return False,f"shared upload cooldown; retry in ~{wait}s"
+        if action_type == "upload":
+            pending_until = float(row.get("pending_upload_until") or 0.0)
+            if pending_until > now:
+                wait = int(max(1, pending_until - now))
+                return False, f"upload attempt already in progress; retry in ~{wait}s"
 
-        # Reserve before returning so another Python process cannot take the
-        # same time slot.
+            last_upload = float(row.get("last_upload") or 0.0)
+            if now - last_upload < upload_gap:
+                wait = int(max(1, upload_gap - (now - last_upload)))
+                return False, f"shared upload cooldown; retry in ~{wait}s"
+
         row["writes"].append(now)
-        row["last_write"]=now
-        if action_type=="upload":
-            row["last_upload"]=now
-        data["global_last"]=now
+        row["last_write"] = now
+        data["global_last"] = now
+
+        if action_type == "upload":
+            # Four-minute lease. Failure clears this instead of consuming the
+            # account's full upload cooldown.
+            row["pending_upload_until"] = now + 240.0
+
         _save_shared_pacing(data)
-        return True,""
+        return True, ""
     finally:
         _release_shared_pacing_lock(fd)
 
+
+
+def _finish_shared_write_reservation(username, action_type, success):
+    if action_type != "upload":
+        return
+
+    fd = _acquire_shared_pacing_lock()
+    if fd is None:
+        return
+
+    try:
+        data = _load_shared_pacing()
+        row = data.setdefault("accounts", {}).setdefault(username, {})
+        row["pending_upload_until"] = 0.0
+        if success:
+            row["last_upload"] = time.time()
+        _save_shared_pacing(data)
+    finally:
+        _release_shared_pacing_lock(fd)
 
 def _prune_write_window(username):
     now=time.monotonic()
@@ -1594,14 +1896,25 @@ def can_write_now(username, action_type="write"):
 
 
 def wait_for_write_slot(username, action_type="write", max_wait=180):
-    start=time.monotonic()
-    last_reason=""
+    start = time.monotonic()
+    last_reason = ""
 
-    while time.monotonic()-start<max_wait:
-        ok,reason=_reserve_shared_write_slot(username,action_type)
+    while time.monotonic() - start < max_wait:
+        allowed, reason = account_writes_allowed(username)
+        if not allowed:
+            update_account_metric(
+                username, "add_history",
+                value=f"🛡️ {action_type} blocked: {reason}"
+            )
+            return False
+
+        ok, reason = _reserve_shared_write_slot(username, action_type)
         if ok:
             return True
-        last_reason=reason
+        last_reason = reason
+
+        if "Safety Backoff" in reason or "Account cooldown" in reason:
+            break
         time.sleep(2.0)
 
     update_account_metric(
@@ -1613,18 +1926,22 @@ def wait_for_write_slot(username, action_type="write", max_wait=180):
 
 
 
+
 def record_write(username, action_type="write"):
     global GLOBAL_LAST_WRITE
-    now=time.monotonic()
+    now = time.monotonic()
+
     with WRITE_LOCK:
-        times=ACCOUNT_WRITE_TIMES.setdefault(username,[])
-        times.append(now)
-        ACCOUNT_LAST_WRITE[username]=now
-        GLOBAL_LAST_WRITE=now
-        if action_type=="upload":
-            ACCOUNT_LAST_UPLOAD[username]=now
-        elif action_type=="dm":
-            ACCOUNT_LAST_DM_REPLY[username]=now
+        ACCOUNT_WRITE_TIMES.setdefault(username, []).append(now)
+        ACCOUNT_LAST_WRITE[username] = now
+        GLOBAL_LAST_WRITE = now
+        if action_type == "upload":
+            ACCOUNT_LAST_UPLOAD[username] = now
+        elif action_type == "dm":
+            ACCOUNT_LAST_DM_REPLY[username] = now
+
+    _finish_shared_write_reservation(username, action_type, True)
+
 
 
 
@@ -1768,92 +2085,185 @@ def harvest_and_amplify_networks(cl, history, config, username, actions_performe
                         )
             except (UserNotFound, PrivateError):
                 history["blocked_or_missing"].append(u_pk)
-            except FeedbackRequired:
+            except FeedbackRequired as exc:
+                apply_account_safety_backoff(
+                    username,
+                    f"Instagram FeedbackRequired while following: {exc}",
+                    level="restricted",
+                )
                 raise
             except Exception as exc:
+                observe_platform_signal(username, exc, action="follow")
                 update_account_metric(
                     username, "add_history",
-                    value=f"⚠️ Follow skipped for @{u_name}: {str(exc)[:60]}"
+                    value=f"⚠️ Follow skipped for @{u_name}: {str(exc)[:80]}"
                 )
     except FeedbackRequired:
         raise
     except Exception as exc:
+        observe_platform_signal(username, exc, action="target follow")
         update_account_metric(
             username, "add_history",
-            value=f"⚠️ Target follow error on @{active_target}: {str(exc)[:80]}"
+            value=f"⚠️ Target follow error on @{active_target}: {str(exc)[:100]}"
         )
     return actions_performed
 
 
 
 
+def verify_like_state(cl, media, username, attempts=3):
+    """
+    True = authenticated media state confirms the viewer liked the media.
+    False = media state explicitly says not liked.
+    None = this response shape exposes no viewer-like boolean.
+    """
+    media_pk = str(getattr(media, "pk", "") or "")
+    if not media_pk:
+        try:
+            media_pk = str(cl.media_pk(media.id))
+        except Exception:
+            return None
+
+    saw_boolean = False
+    for attempt in range(max(1, attempts)):
+        try:
+            info = cl.media_info_v1(media_pk)
+            values = [
+                getattr(info, "has_liked", None),
+                getattr(info, "has_viewer_liked", None),
+                getattr(info, "viewer_has_liked", None),
+            ]
+            booleans = [value for value in values if isinstance(value, bool)]
+            if booleans:
+                saw_boolean = True
+                if any(booleans):
+                    return True
+        except Exception as exc:
+            observe_platform_signal(username, exc, action="like verification")
+
+        if attempt + 1 < attempts:
+            time.sleep(2 + attempt)
+
+    return False if saw_boolean else None
+
 def interact_with_hashtags(cl, history, config, username, actions_performed):
-    s=get_account_control_settings(username,config)
-    if not s.get("enable_engage", False):
+    settings = get_account_control_settings(username, config)
+    if not settings.get("enable_engage", False):
         return actions_performed
-    tags=s["target_hashtags"] or list(config.get("target_hashtags") or [])
+
+    allowed, _ = account_writes_allowed(username)
+    if not allowed:
+        return actions_performed
+
+    tags = _normalize_hashtag_list(
+        settings["target_hashtags"] or list(config.get("target_hashtags") or [])
+    )
     if not tags:
-        update_account_metric(username,"add_history",value="⚠️ No target hashtags configured.")
+        update_account_metric(
+            username, "add_history",
+            value="⚠️ No valid target hashtags configured."
+        )
         return actions_performed
-    hashtag=random.choice(tags).lstrip("#")
-    cap=int(s["max_writes_per_workflow"])
-    update_account_metric(username,"add_history",value=f"🔍 Streaming target #{hashtag}...")
+
+    hashtag = re.sub(r"[^A-Za-z0-9_]", "", random.choice(tags).lstrip("#"))
+    if not hashtag:
+        return actions_performed
+
+    cap = int(settings["max_writes_per_workflow"])
+    history.setdefault("like_verify_failures", 0)
+    update_account_metric(username, "add_history", value=f"🔍 Streaming target #{hashtag}...")
+
     try:
-        medias=cl.hashtag_medias_recent(hashtag,amount=8)
+        medias = cl.hashtag_medias_recent(hashtag, amount=8)
+
         for media in medias:
-            if actions_performed>=cap:
+            if not get_account_control_settings(username, config).get("enable_engage", False):
+                break
+            allowed, _ = account_writes_allowed(username)
+            if not allowed or actions_performed >= cap:
                 break
             if media.id in history["liked_medias"]:
                 continue
-            user_pk=int(media.user.pk)
-            if user_pk in history["blocked_or_missing"]:
-                continue
-            try:
-                if not wait_for_write_slot(username,"like"):
-                    break
-                cl.media_like(media.id)
-                record_write(username,"like")
-                history["liked_medias"].append(media.id)
-                update_account_metric(username,"total_likes",increment=1)
-                update_account_metric(
-                    username,"add_history",
-                    value=f"❤️ Liked post from @{media.user.username}"
-                )
-                actions_performed+=1
 
-                if (
-                    actions_performed<cap
-                    and random.random()<0.30
-                    and media.id not in history["commented_medias"]
-                ):
-                    reply_text=generate_interactive_reply(
-                        "comment",media.caption_text or "",media.user.username,
-                        account_username=username,
+            try:
+                if not wait_for_write_slot(username, "like"):
+                    break
+
+                accepted = cl.media_like(media.id)
+                if not accepted:
+                    history["like_verify_failures"] += 1
+                    update_account_metric(
+                        username, "add_history",
+                        value=f"⚠️ Instagram did not accept the like request for @{media.user.username}."
                     )
-                    if reply_text and wait_for_write_slot(username,"comment"):
-                        cl.media_comment(media.id,reply_text)
-                        record_write(username,"comment")
-                        history["commented_medias"].append(media.id)
-                        update_account_metric(
-                            username,"add_history",
-                            value=f"💬 Commented on @{media.user.username}: {reply_text[:120]}"
+                    continue
+
+                record_write(username, "like")
+                # Don't repeatedly hit the same media if verification is unavailable.
+                history["liked_medias"].append(media.id)
+                verified = verify_like_state(cl, media, username)
+
+                if verified is True:
+                    history["like_verify_failures"] = 0
+                    update_account_metric(username, "total_likes", increment=1)
+                    update_account_metric(
+                        username, "add_history",
+                        value=f"❤️ Like confirmed on @{media.user.username}'s post."
+                    )
+                elif verified is False:
+                    history["like_verify_failures"] += 1
+                    update_account_metric(
+                        username, "add_history",
+                        value=(
+                            f"⚠️ Like endpoint returned success, but authenticated media state "
+                            f"did not show the like on @{media.user.username}'s post."
                         )
-                        actions_performed+=1
-            except FeedbackRequired:
+                    )
+                else:
+                    update_account_metric(
+                        username, "add_history",
+                        value=(
+                            f"♡ Like request accepted for @{media.user.username}; "
+                            "Instagram's returned media object did not expose a viewer-like flag."
+                        )
+                    )
+
+                actions_performed += 1
+
+                if history["like_verify_failures"] >= 3:
+                    apply_account_safety_backoff(
+                        username,
+                        "Three recent like actions could not be confirmed in authenticated media state.",
+                        level="verification",
+                        hours=4,
+                    )
+                    break
+
+            except FeedbackRequired as exc:
+                apply_account_safety_backoff(
+                    username,
+                    f"Instagram FeedbackRequired while liking: {exc}",
+                    level="restricted",
+                )
                 raise
             except Exception as exc:
+                observe_platform_signal(username, exc, action="like")
                 update_account_metric(
-                    username,"add_history",
-                    value=f"⚠️ Hashtag item skipped: {str(exc)[:60]}"
+                    username, "add_history",
+                    value=f"⚠️ Like skipped: {type(exc).__name__}: {str(exc)[:90]}"
                 )
+
     except FeedbackRequired:
         raise
     except Exception as exc:
+        observe_platform_signal(username, exc, action="hashtag feed")
         update_account_metric(
-            username,"add_history",
-            value=f"⚠️ Hashtag error: {str(exc)[:80]}"
+            username, "add_history",
+            value=f"⚠️ Hashtag error: {type(exc).__name__}: {str(exc)[:100]}"
         )
+
     return actions_performed
+
 
 
 
@@ -2411,16 +2821,86 @@ def verify_media_visibility(cl, uploaded_media, username, kind):
 
 
 
+def reconcile_pending_uploads(cl, history, username):
+    pending = list(history.get("pending_uploads") or [])
+    if not pending:
+        return
+
+    keep = []
+    now = time.time()
+
+    for item in pending[:20]:
+        try:
+            media_pk = str(item.get("media_pk") or "")
+            kind = str(item.get("kind") or "post")
+            folder_id = str(item.get("folder_id") or "")
+            created_ts = float(item.get("created_ts") or now)
+
+            if not media_pk:
+                continue
+
+            recent = (
+                cl.user_clips_v1(cl.user_id, amount=50)
+                if kind == "reel"
+                else cl.user_medias_v1(cl.user_id, amount=50)
+            )
+            visible = any(
+                str(getattr(media, "pk", "")) == media_pk
+                for media in (recent or [])
+            )
+
+            if visible:
+                if folder_id and folder_id not in history["posted_ids"]:
+                    history["posted_ids"].append(folder_id)
+                    update_account_metric(username, "total_posts", increment=1)
+                update_account_metric(
+                    username, "add_history",
+                    value=f"✅ Previously pending upload {media_pk} is now visible on the account."
+                )
+                continue
+
+            if now - created_ts < 24 * 3600:
+                keep.append(item)
+            else:
+                update_account_metric(
+                    username, "add_history",
+                    value=f"⚠️ Pending upload {media_pk} never surfaced after 24h; its source folder is available again."
+                )
+        except Exception as exc:
+            observe_platform_signal(username, exc, action="pending upload verification")
+            keep.append(item)
+
+    history["pending_uploads"] = keep
+
 def execute_repost_flow(cl, history, username, folder_pool):
-    if not get_account_control_settings(username).get("enable_posts", False):
+    settings = get_account_control_settings(username)
+    if not settings.get("enable_posts", False):
         return False
+
+    allowed, reason = account_writes_allowed(username)
+    if not allowed:
+        update_account_metric(username, "add_history", value=f"🛡️ Upload skipped: {reason}")
+        return False
+
+    history.setdefault("posted_ids", [])
+    history.setdefault("pending_uploads", [])
+    history.setdefault("upload_verify_failures", 0)
+    reconcile_pending_uploads(cl, history, username)
+
+    pending_folder_ids = {
+        str(item.get("folder_id") or "")
+        for item in history["pending_uploads"]
+        if isinstance(item, dict)
+    }
+
     update_account_metric(
         username, "add_history",
         value="Scanning media pool for an unused folder..."
     )
     available_pool = [
-        f for f in folder_pool
-        if f["id"] not in history["posted_ids"]
+        folder for folder in folder_pool
+        if folder["id"] not in history["posted_ids"]
+        and folder["id"] not in pending_folder_ids
     ]
     if not available_pool:
         update_account_metric(
@@ -2436,8 +2916,8 @@ def execute_repost_flow(cl, history, username, folder_pool):
 
     for candidate in available_pool:
         candidate_files = sorted(
-            f for f in candidate["path"].iterdir()
-            if f.is_file() and f.suffix.lower() in valid_exts
+            item for item in candidate["path"].iterdir()
+            if item.is_file() and item.suffix.lower() in valid_exts
         )
         if candidate_files:
             selected_folder = candidate
@@ -2448,19 +2928,14 @@ def execute_repost_flow(cl, history, username, folder_pool):
         return False
 
     text_context = ""
-    txt_files = sorted(
-        f for f in selected_folder["path"].iterdir()
-        if f.is_file() and f.suffix.lower() in {".txt", ".caption", ".md"}
-    )
-    for txt in txt_files[:3]:
+    for txt in sorted(
+        item for item in selected_folder["path"].iterdir()
+        if item.is_file() and item.suffix.lower() in {".txt", ".caption", ".md"}
+    )[:3]:
         try:
-            body = txt.read_text(
-                encoding="utf-8", errors="replace"
-            ).strip()
+            body = txt.read_text(encoding="utf-8", errors="replace").strip()
             if body:
-                text_context += (
-                    ("\n" if text_context else "") + body[:3000]
-                )
+                text_context += (("\n" if text_context else "") + body[:3000])
         except OSError:
             pass
 
@@ -2472,13 +2947,14 @@ def execute_repost_flow(cl, history, username, folder_pool):
         frame_count=settings["video_frames"],
         require_video_vision=settings["require_video_vision"],
     )
+
     if post_analysis.get("vision_required_failed"):
         update_account_metric(
-            username,"add_history",
+            username, "add_history",
             value=(
                 f"👁️ Video skipped: Require video vision is ON, but only "
-                f"{post_analysis.get('frames_analyzed',0)} frames could be analyzed "
-                f"with vision model {post_analysis.get('vision_model') or 'none'}."
+                f"{post_analysis.get('frames_analyzed', 0)} frames could be analyzed "
+                f"with {post_analysis.get('vision_model') or 'no vision model'}."
             )
         )
         return False
@@ -2488,33 +2964,17 @@ def execute_repost_flow(cl, history, username, folder_pool):
     vision_model = post_analysis["vision_model"]
 
     update_account_metric(
-        username,
-        "add_history",
-        value=f"🤖 Reposting from folder: {selected_folder['id']}"
+        username, "add_history",
+        value=f"🤖 Preparing media from folder: {selected_folder['id']}"
     )
-    if vision_model:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                f"👁️ Media watched with {vision_model}; "
-                f"frames={post_analysis.get('frames_analyzed',0)}, perspective={perspective}."
-            ),
-        )
-    else:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "👁️ No local Ollama vision model detected; using sanitized "
-                "sidecar/original-caption context only."
-            ),
-        )
-
     update_account_metric(
-        username,
-        "add_history",
-        value="🧠 Ollama is writing a media-aware first-person caption..."
+        username, "add_history",
+        value=(
+            f"👁️ Media watched with {vision_model}; frames={post_analysis.get('frames_analyzed', 0)}, "
+            f"perspective={perspective}."
+            if vision_model else
+            "👁️ No vision model detected; using sanitized text context only."
+        )
     )
 
     caption = generate_rage_bait_caption(
@@ -2524,222 +2984,191 @@ def execute_repost_flow(cl, history, username, folder_pool):
     )
     if not caption:
         update_account_metric(
-            username,
-            "add_history",
-            value="⚠️ Caption failed completeness validation; upload skipped."
+            username, "add_history",
+            value="⚠️ Caption failed validation; upload skipped."
         )
         return False
 
     hashtag_prompt = f"""
-Generate EXACTLY 5 relevant Instagram hashtags based ONLY on the actual media analysis below.
+Generate EXACTLY 5 relevant Instagram hashtags based ONLY on the media analysis below.
 
 {semantic_context}
 
 Rules:
 - exactly 5
-- searchable and genuinely related to the visible content
+- searchable and directly relevant
 - no source usernames
 - no trading/HFT unless the media itself is about trading
 - output only 5 space-separated hashtags
 """.strip()
 
     try:
-        h_res=ollama.chat(
+        response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[
-                {"role":"system","content":settings["persona_prompt"]},
-                {"role":"user","content":hashtag_prompt},
+                {"role": "system", "content": settings["persona_prompt"]},
+                {"role": "user", "content": hashtag_prompt},
             ],
-            options={"temperature":0.45,"top_p":0.9},
+            options={"temperature": 0.45, "top_p": 0.9},
         )
-        generated_tags=_clean_ollama_output(
-            h_res.get("message",{}).get("content","")
+        generated_tags = _clean_ollama_output(
+            response.get("message", {}).get("content", "")
         )
     except Exception:
-        generated_tags=""
+        generated_tags = ""
 
-    tags=[]
-    for token in generated_tags.replace("\n"," ").split():
-        token=token.strip(" ,.;:!?")
-        if not token.startswith("#") and token:
-            token="#"+token
-        if re.fullmatch(r"#[A-Za-z0-9_]+",token) and token not in tags:
+    tags = []
+    for token in generated_tags.replace("\n", " ").split():
+        token = token.strip(" ,.;:!?")
+        if token and not token.startswith("#"):
+            token = "#" + token
+        if re.fullmatch(r"#[A-Za-z0-9_]+", token) and token not in tags:
             tags.append(token)
-        if len(tags)==5:
+        if len(tags) == 5:
             break
 
-    if len(tags)<5:
-        # Generic fallbacks are only used to fill missing positions, never to
-        # replace the media-aware tags Ollama produced.
-        for tag in ["#video","#reels","#creator","#explore","#daily"]:
-            if tag not in tags:
-                tags.append(tag)
-            if len(tags)==5:
-                break
+    for fallback in ["#video", "#reels", "#creator", "#explore", "#daily"]:
+        if len(tags) >= 5:
+            break
+        if fallback not in tags:
+            tags.append(fallback)
 
-    tag_line=" ".join(tags[:5])
-    total_limit=int(settings["caption_char_limit"])
-    caption_room=max(20,total_limit-len(tag_line)-2)
-    caption=_clip_chars(caption,caption_room)
-    full_caption=f"{caption}\n\n{tag_line}".strip()
-    update_account_metric(
-        username,"add_history",
-        value=(
-            f"✍️ Media-narration caption ready "
-            f"({len(full_caption)}/{total_limit} chars, exactly 5 hashtags): "
-            f"{caption[:110]}"
-        )
-    )
+    tag_line = " ".join(tags[:5])
+    total_limit = int(settings["caption_char_limit"])
+    caption = _clip_chars(caption, max(20, total_limit - len(tag_line) - 2))
+    full_caption = f"{caption}\n\n{tag_line}".strip()
 
+    video_files = [item for item in media_files if item.suffix.lower() == ".mp4"]
+    photo_files = [
+        item for item in media_files
+        if item.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    ]
+
+    upload_slot_reserved = False
     try:
-        video_files = [
-            f for f in media_files if f.suffix.lower() == ".mp4"
-        ]
-        photo_files = [
-            f for f in media_files
-            if f.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        ]
-
-        kind = "post"
-
         if not wait_for_write_slot(username, "upload", max_wait=180):
             update_account_metric(
-                username,
-                "add_history",
-                value="⏳ Upload deferred by pacing budget."
+                username, "add_history",
+                value="⏳ Upload deferred by pacing/safety state."
             )
             return False
+        upload_slot_reserved = True
+
+        kind = "post"
 
         if len(media_files) == 1:
             target = media_files[0]
             if target.suffix.lower() == ".mp4":
                 kind = "reel"
                 thumbnail = generate_video_thumbnail(target)
-                update_account_metric(
-                    username, "add_history",
-                    value=f"🖼️ Thumbnail ready: {thumbnail.name}"
-                )
-                print(
-                    f"⬆️ @{username}: starting Reel upload: {target.name}"
-                )
+                print(f"⬆️ @{username}: starting Reel upload: {target.name}")
                 uploaded_media = _upload_reel_with_profile_preview(
                     cl, target, full_caption, thumbnail
                 )
-                print(
-                    f"✅ @{username}: clip_upload returned media id "
-                    f"{getattr(uploaded_media, 'id', None)}"
-                )
             else:
-                print(
-                    f"⬆️ @{username}: starting photo post: {target.name}"
-                )
-                uploaded_media = cl.photo_upload(
-                    target, caption=full_caption
-                )
-                print(
-                    f"✅ @{username}: photo_upload returned media id "
-                    f"{getattr(uploaded_media, 'id', None)}"
-                )
+                print(f"⬆️ @{username}: starting photo upload: {target.name}")
+                uploaded_media = cl.photo_upload(target, caption=full_caption)
 
         elif video_files:
             kind = "reel"
             target = video_files[0]
             thumbnail = generate_video_thumbnail(target)
-            update_account_metric(
-                username, "add_history",
-                value=f"🎬 Uploading Reel: {target.name}"
-            )
-            print(
-                f"⬆️ @{username}: starting Reel upload: {target.name}"
-            )
+            print(f"⬆️ @{username}: starting Reel upload: {target.name}")
             uploaded_media = _upload_reel_with_profile_preview(
                 cl, target, full_caption, thumbnail
-            )
-            print(
-                f"✅ @{username}: clip_upload returned media id "
-                f"{getattr(uploaded_media, 'id', None)}"
             )
 
         elif photo_files:
             print(
-                f"⬆️ @{username}: starting carousel post "
-                f"with {len(photo_files)} images"
+                f"⬆️ @{username}: starting carousel upload with {len(photo_files)} images"
             )
-            uploaded_media = cl.album_upload(
-                photo_files, caption=full_caption
-            )
-            print(
-                f"✅ @{username}: album_upload returned media id "
-                f"{getattr(uploaded_media, 'id', None)}"
-            )
+            uploaded_media = cl.album_upload(photo_files, caption=full_caption)
 
         else:
+            _finish_shared_write_reservation(username, "upload", False)
+            upload_slot_reserved = False
             return False
 
-        if not uploaded_media or not getattr(uploaded_media, "id", None):
-            raise RuntimeError(
-                "Instagram returned no uploaded media id"
-            )
+        media_id = str(getattr(uploaded_media, "id", "") or "")
+        if not uploaded_media or not media_id:
+            raise RuntimeError("Instagram returned no uploaded media id")
 
+        # API accepted the media: now commit the long upload cooldown.
         record_write(username, "upload")
+        upload_slot_reserved = False
 
-        visibility = verify_media_visibility(
-            cl, uploaded_media, username, kind
-        )
+        visibility = verify_media_visibility(cl, uploaded_media, username, kind)
+        media_pk = str(visibility.get("media_pk") or "")
 
-        record_recent_post(
-            username=username,
-            folder_path=selected_folder["path"],
-            caption=full_caption,
-            media_id=getattr(uploaded_media, "id", ""),
-            permalink=visibility.get("permalink", ""),
-        )
+        if visibility["profile_visible"]:
+            history["upload_verify_failures"] = 0
+            if selected_folder["id"] not in history["posted_ids"]:
+                history["posted_ids"].append(selected_folder["id"])
+                update_account_metric(username, "total_posts", increment=1)
 
-        # Avoid duplicate uploads once Instagram has already configured a real ID.
-        history["posted_ids"].append(selected_folder["id"])
+            record_recent_post(
+                username=username,
+                folder_path=selected_folder["path"],
+                caption=full_caption,
+                media_id=media_id,
+                permalink=visibility.get("permalink", ""),
+            )
+            update_account_metric(
+                username, "add_history",
+                value="✅ Upload confirmed in the account's profile/Reels collection."
+            )
+            return True
+
+        # Do not lie to the dashboard and count this as a visible post.
+        history["upload_verify_failures"] += 1
+        history["pending_uploads"].append({
+            "folder_id": selected_folder["id"],
+            "media_pk": media_pk,
+            "media_id": media_id,
+            "kind": kind,
+            "created_ts": time.time(),
+            "permalink": visibility.get("permalink", ""),
+        })
+        history["pending_uploads"] = history["pending_uploads"][-30:]
+
         update_account_metric(
-            username, "total_posts", increment=1
+            username, "add_history",
+            value=(
+                "⏳ Instagram returned a media id, but the media is not visible in "
+                "the account collection yet. Marked pending and NOT counted as a post."
+            )
         )
 
-        if visibility["private_visible"] and visibility["profile_visible"]:
-            update_account_metric(
+        if history["upload_verify_failures"] >= 2:
+            apply_account_safety_backoff(
                 username,
-                "add_history",
-                value=(
-                    "✅ Upload configured and visible in uploader collection. "
-                    "External-account visibility remains unverified."
-                ),
-            )
-        elif visibility["private_visible"]:
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "⚠️ Upload exists through authenticated media lookup but is "
-                    "not yet surfacing in uploader collection."
-                ),
-            )
-        else:
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "⚠️ Instagram returned a media id, but authenticated "
-                    "post-upload verification did not confirm it."
-                ),
+                "Two recent uploads returned media ids but did not surface in the account collection.",
+                level="verification",
+                hours=4,
             )
 
-        return True
+        return False
 
-    except FeedbackRequired:
-        raise
-    except Exception as exc:
-        update_account_metric(
+    except FeedbackRequired as exc:
+        if upload_slot_reserved:
+            _finish_shared_write_reservation(username, "upload", False)
+        apply_account_safety_backoff(
             username,
-            "add_history",
-            value=f"⚠️ Upload failed: {type(exc).__name__}: {str(exc)[:120]}"
+            f"Instagram FeedbackRequired during upload: {exc}",
+            level="restricted",
+        )
+        raise
+
+    except Exception as exc:
+        if upload_slot_reserved:
+            _finish_shared_write_reservation(username, "upload", False)
+        observe_platform_signal(username, exc, action="upload")
+        update_account_metric(
+            username, "add_history",
+            value=f"⚠️ Upload failed: {type(exc).__name__}: {str(exc)[:140]}"
         )
         return False
+
 
 
 
@@ -2858,7 +3287,9 @@ def run_profile_workflow(username, conf, folder_pool):
                 choices.append("hashtags")
 
             if choices:
-                task = random.choice(choices)
+                cycle_index = int(history.get("outward_cycle_index", 0) or 0)
+                task = choices[cycle_index % len(choices)]
+                history["outward_cycle_index"] = cycle_index + 1
                 if task == "repost":
                     execute_repost_flow(cl, history, username, folder_pool)
                 elif task == "networking":
@@ -3083,6 +3514,7 @@ def _control_metrics_payload():
             "write_window_seconds": WRITE_WINDOW_SECONDS,
             "upload_cooldown_seconds": _effective_pacing(username)["upload"],
             "settings": get_account_control_settings(username, conf),
+            "safety": get_account_safety_state(username),
         }
         result[username] = row
 
@@ -3091,6 +3523,200 @@ def _control_metrics_payload():
         "recent_posts": load_recent_posts()[:25],
     }
 
+
+def _control_browser_login(username, timeout_seconds=600):
+    """
+    Explicit browser bootstrap for accounts whose Instagram Web login works but
+    private-API password login returns needs_upgrade.
+
+    The user completes login/challenges manually in a normal Chromium window.
+    We capture the resulting Instagram sessionid cookie and make ONE
+    login_by_sessionid conversion attempt. No CAPTCHA/challenge is bypassed.
+    """
+    username = str(username or "").strip().lstrip("@")
+    conf = _control_conf(username)
+    if not conf:
+        raise ValueError(f"Unknown account @{username}")
+
+    if sync_playwright is None:
+        raise RuntimeError(
+            "Playwright is required for Browser Login. Install with: "
+            "python -m pip install playwright && python -m playwright install chromium"
+        )
+
+    session_p = DOWNLOAD_ROOT / conf["session_file"]
+    profile_dir = DOWNLOAD_ROOT / f"browser_{username.replace('.', '_')}"
+
+    update_account_metric(username, "status", status="Browser Login Open")
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🌐 Browser Login opened. Complete Instagram login and any "
+            "verification manually in Chromium. The bot will capture the "
+            "browser session automatically."
+        ),
+    )
+
+    sessionid = None
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=False,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(
+            "https://www.instagram.com/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+
+        deadline = time.time() + max(120, int(timeout_seconds))
+        last_log = 0.0
+
+        while time.time() < deadline:
+            try:
+                cookies = context.cookies("https://www.instagram.com/")
+                sessionid = next(
+                    (
+                        c.get("value")
+                        for c in cookies
+                        if c.get("name") == "sessionid" and c.get("value")
+                    ),
+                    None,
+                )
+            except Exception:
+                sessionid = None
+
+            if sessionid:
+                page.wait_for_timeout(1800)
+                break
+
+            now = time.time()
+            if now - last_log >= 20:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🌐 Waiting for manual Browser Login to complete; "
+                        "finish any Instagram challenge in Chromium."
+                    ),
+                )
+                last_log = now
+
+            page.wait_for_timeout(1200)
+
+        try:
+            context.close()
+        except Exception:
+            pass
+
+    if not sessionid:
+        update_account_metric(username, "status", status="Login Needed")
+        raise RuntimeError(
+            "Browser Login timed out before Instagram supplied a sessionid cookie."
+        )
+
+    browser_cookie_file = DOWNLOAD_ROOT / (
+        f"browser_session_{username.replace('.', '_')}.json"
+    )
+    try:
+        browser_cookie_file.write_text(
+            json.dumps({"sessionid": sessionid}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    cl = Client()
+    _refresh_instagram_app_profile(cl, username)
+
+    try:
+        # One conversion attempt only. Do not loop if Instagram rejects it.
+        cl.login_by_sessionid(sessionid)
+    except Exception as exc:
+        if _is_needs_upgrade_error(exc):
+            set_auth_cooldown(username, minutes=360)
+            update_account_metric(
+                username,
+                "status",
+                status="Browser OK / Private API Blocked",
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🌐 Browser login succeeded, but Instagram still rejected "
+                    "private-API session conversion with needs_upgrade. "
+                    "Automatic credential retries paused for 6 hours."
+                ),
+            )
+            raise RuntimeError(
+                "Browser login succeeded, but Instagram still rejected the "
+                "private-API session conversion for this account. The web "
+                "session is valid; instagrapi actions cannot be enabled until "
+                "Instagram accepts private-API access. Retries paused for 6 hours."
+            ) from exc
+
+        message = str(exc)
+        low = message.lower()
+        if "429" in low or "too many requests" in low or "please wait" in low:
+            set_auth_cooldown(username, minutes=360)
+            update_account_metric(
+                username,
+                "status",
+                status="Browser OK / API Cooldown",
+            )
+            raise RuntimeError(
+                "Browser login succeeded, but Instagram throttled the one "
+                "private-API conversion attempt. Retries paused for 6 hours."
+            ) from exc
+
+        update_account_metric(
+            username,
+            "status",
+            status="Browser OK / Conversion Failed",
+        )
+        raise RuntimeError(
+            "Browser login succeeded, but the browser session could not be "
+            f"converted into an instagrapi session: {message[:220]}"
+        ) from exc
+
+    if not verify_authenticated_identity(cl, username, session_p):
+        try:
+            cl.logout()
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Browser session converted, but Instagram authenticated a different account."
+        )
+
+    cl.dump_settings(session_p)
+    patch_obsolete_qe_expose(cl, username)
+
+    with CONTROL_LOCK:
+        CLIENT_CACHE[username] = cl
+        CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
+        CONTROL_PAUSED_ACCOUNTS.add(username)
+        AUTH_RETRY_AFTER.pop(username, None)
+        ACCOUNT_COOLDOWNS.pop(username, None)
+        LAST_DM_POLL.pop(username, None)
+        AUTH_EVENT[username] = "browser_login_saved"
+
+    update_account_metric(username, "status", status="Connected / Auto Off")
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🌐 Browser Login succeeded; browser session converted to "
+            "instagrapi and saved. Background automation remains OFF until "
+            "Start Automation is pressed."
+        ),
+    )
+
+    return {"ok": True, "mode": "browser_login"}
 
 def _control_quick_login(username):
     """
@@ -3111,6 +3737,7 @@ def _control_quick_login(username):
 
     cl = Client()
     cl.load_settings(session_p)
+    _refresh_instagram_app_profile(cl, username)
 
     # This is the first Instagram network call after the user explicitly presses
     # Quick Login.
@@ -3162,19 +3789,45 @@ def _control_password_login(username, password, verification_code=""):
     session_p = DOWNLOAD_ROOT / conf["session_file"]
     cl = Client()
 
-    # Reuse device settings if a previous session file exists, but this call is
-    # still only reached after the user explicitly presses Login.
+    # Reuse device/session identity if a previous session exists, then refresh
+    # only the Instagram app build metadata so an old JSON cannot advertise an
+    # obsolete Instagram version.
     if session_p.exists():
         try:
             cl.load_settings(session_p)
         except Exception:
             pass
 
-    cl.login(
-        username,
-        password,
-        verification_code=verification_code,
-    )
+    _refresh_instagram_app_profile(cl, username)
+
+    try:
+        cl.login(
+            username,
+            password,
+            verification_code=verification_code,
+        )
+    except Exception as exc:
+        if _is_needs_upgrade_error(exc):
+            set_auth_cooldown(username, minutes=360)
+            update_account_metric(
+                username,
+                "status",
+                status="Private API Login Blocked",
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "📱 " + _needs_upgrade_message(username)
+                    + " Password-login retries paused for 6 hours."
+                ),
+            )
+            raise RuntimeError(
+                _needs_upgrade_message(username)
+                + " Use Browser Login on the dashboard. "
+                "Password-login retries are paused for 6 hours."
+            ) from exc
+        raise
 
     if not verify_authenticated_identity(cl, username, session_p):
         try:
@@ -3273,8 +3926,8 @@ def _control_full_logout(username):
 
 def _control_pause(username, pause):
     """
-    pause=True  -> background automation OFF, connection/session preserved.
-    pause=False -> background automation ON.
+    Stop/start background automation. Instagram safety backoff cannot be manually
+    overridden until its timer expires.
     """
     username = str(username or "").strip().lstrip("@")
     if username not in CONTROL_ROSTER:
@@ -3292,6 +3945,19 @@ def _control_pause(username, pause):
             value="⏹️ Background automation stopped; account remains connected."
         )
     else:
+        state = get_account_safety_state(username)
+        if state["active"]:
+            raise RuntimeError(
+                f"Safety Backoff is active until {state['until']}. "
+                f"Reason: {state['reason'][:160]}"
+            )
+
+        cooldown = ACCOUNT_COOLDOWNS.get(username)
+        if cooldown and datetime.now() < cooldown:
+            raise RuntimeError(
+                f"Account cooldown is active until {cooldown.strftime('%Y-%m-%d %H:%M')}."
+            )
+
         CONTROL_PAUSED_ACCOUNTS.discard(username)
         update_account_metric(username, "status", status="Connected / Auto On")
         update_account_metric(
@@ -3302,6 +3968,7 @@ def _control_pause(username, pause):
     return {"ok": True, "paused": pause, "auto_enabled": not pause}
 
 
+
 def _control_queue_task(username, task):
     username = str(username or "").strip().lstrip("@")
     allowed = {"repost", "networking", "hashtags", "comments"}
@@ -3310,6 +3977,11 @@ def _control_queue_task(username, task):
         raise ValueError(f"Unknown account @{username}")
     if username in CONTROL_DISCONNECTED_ACCOUNTS or username not in CLIENT_CACHE:
         raise RuntimeError("Account is disconnected. Quick Login first.")
+    state = get_account_safety_state(username)
+    if state["active"]:
+        raise RuntimeError(
+            f"Safety Backoff is active until {state['until']}: {state['reason'][:140]}"
+        )
     if task not in allowed:
         raise ValueError(f"Unsupported task: {task}")
 
@@ -3549,6 +4221,7 @@ function cardHtml(user,a){
         <span class="badge ${badgeClass}">${status}</span>
         <span class="badge ${autoEnabled ? "ok":"warn"}">${autoEnabled ? "AUTO ON":"AUTO OFF"}</span>
         <span class="badge ${session ? "ok":"warn"}">${session ? "SAVED SESSION":"NO SESSION"}</span>
+        ${c.safety?.active ? `<span class="badge bad">SAFETY BACKOFF</span>` : ""}
         ${c.queued_task ? `<span class="badge warn">QUEUED: ${esc(c.queued_task)}</span>` : ""}
       </div>
     </div>
@@ -3559,6 +4232,7 @@ function cardHtml(user,a){
       <div class="stat"><b>${Number(a.total_likes||0)}</b><span>Likes</span></div>
     </div>
     <div class="small">Write budget: ${Number(c.write_budget_used||0)}/${Number(c.write_budget_max||0)} per rolling ${Math.round(Number(c.write_window_seconds||0)/60)} min · uploads ≥ ${Math.round(Number(c.upload_cooldown_seconds||0)/60)} min apart</div>
+    ${c.safety?.active ? `<div class="small bad">Safety Backoff until ${esc(c.safety.until||"")} · ${esc(c.safety.reason||"")}</div>` : ""}
 
     <div class="section">
       <div class="row">
@@ -3591,9 +4265,14 @@ function cardHtml(user,a){
         </div>
       </div>
       <div class="row">
-        <button onclick="passwordLogin('${esc(user)}')">Login & Save Session</button>
+        <button class="good" onclick="browserLogin('${esc(user)}')">Browser Login</button>
+        <button onclick="passwordLogin('${esc(user)}')">Password Login & Save Session</button>
       </div>
-      <div class="small">Password/2FA are not saved by the Control Head.</div>
+      <div class="small">
+        Browser Login is preferred when Instagram Web works but Password Login returns
+        <code>needs_upgrade</code>. Complete all login/challenge steps manually in Chromium.
+        The bot then makes one session conversion attempt. Password/2FA are not saved.
+      </div>
     </div>
 
 
@@ -3786,6 +4465,19 @@ async function quickLogin(user){
   }catch(e){toast(e.message,true)}
 }
 
+async function browserLogin(user){
+  try{
+    toast(`Opening Instagram Browser Login for @${user}... Complete login in the Chromium window.`);
+    await api("browser_login",{username:user});
+    editing=false;
+    await refreshNow(true);
+    toast(`@${user} browser session connected and saved.`);
+  }catch(e){
+    await refreshNow(true);
+    toast(e.message,true);
+  }
+}
+
 async function passwordLogin(user){
   const pw=document.getElementById(`pw_${user}`).value;
   const otp=document.getElementById(`otp_${user}`).value;
@@ -3923,6 +4615,9 @@ refreshNow(true);
 
             elif action == "quick_login":
                 result = _control_quick_login(username)
+
+            elif action == "browser_login":
+                result = _control_browser_login(username)
 
             elif action == "password_login":
                 result = _control_password_login(
@@ -4102,12 +4797,13 @@ def poll_all_cached_dms(active_roster, force=False, debug=False):
             if replied:
                 save_json(conf["history_file"], history)
         except FeedbackRequired as exc:
-            update_account_metric(
+            apply_account_safety_backoff(
                 username,
-                "add_history",
-                value=f"⚠️ Instagram limited DM actions: {str(exc)[:80]}"
+                f"Instagram FeedbackRequired during DM listener: {exc}",
+                level="restricted",
             )
         except Exception as exc:
+            observe_platform_signal(username, exc, action="DM listener")
             print(
                 f"⚠️ @{username} DM heartbeat exception: "
                 f"{type(exc).__name__}: {exc}"
@@ -4132,31 +4828,33 @@ def _background_account_workflow(username, conf, next_workflow_at):
     try:
         folder_pool = discover_local_media_folders()
         result = run_profile_workflow(username, conf, folder_pool)
+
     except FeedbackRequired as exc:
-        cooldown_target = datetime.now() + timedelta(hours=2)
-        ACCOUNT_COOLDOWNS[username] = cooldown_target
-        update_account_metric(username, "cooldown_until", value=cooldown_target.strftime("%H:%M"))
-        update_account_metric(username, "status", status="Rate Cooldown")
-        update_account_metric(
-            username, "add_history",
-            value=f"Instagram requested a cooldown: {str(exc)[:70]}"
+        apply_account_safety_backoff(
+            username,
+            f"Instagram FeedbackRequired during workflow: {exc}",
+            level="restricted",
         )
         result = "throttled"
+
     except Exception as exc:
+        observe_platform_signal(username, exc, action="workflow")
         update_account_metric(
             username, "add_history",
             value=f"Workflow error: {type(exc).__name__}: {str(exc)[:100]}"
         )
         result = "error"
 
-    if result == "ran":
-        delay = random.randint(WORKFLOW_SLEEP_MIN, WORKFLOW_SLEEP_MAX)
-    else:
-        delay = WORKFLOW_RETRY_IDLE_SECONDS
+    delay = (
+        random.randint(WORKFLOW_SLEEP_MIN, WORKFLOW_SLEEP_MAX)
+        if result == "ran"
+        else WORKFLOW_RETRY_IDLE_SECONDS
+    )
 
     with ACCOUNT_WORKFLOW_THREADS_LOCK:
         next_workflow_at[username] = time.monotonic() + delay
         ACCOUNT_WORKFLOW_THREADS.pop(username, None)
+
 
 
 def _start_background_account_workflow(username, conf, next_workflow_at):
@@ -4198,7 +4896,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — browser bootstrap login: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {MEDIA_ROOT}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
@@ -4223,6 +4921,15 @@ def main():
                 if current_user in CONTROL_DISCONNECTED_ACCOUNTS:
                     continue
                 if current_user not in CLIENT_CACHE:
+                    continue
+
+                safety = get_account_safety_state(current_user)
+                if safety["active"]:
+                    CONTROL_PAUSED_ACCOUNTS.add(current_user)
+                    continue
+
+                cooldown = ACCOUNT_COOLDOWNS.get(current_user)
+                if cooldown and datetime.now() < cooldown:
                     continue
 
                 forced = current_user in CONTROL_FORCE_RUN
