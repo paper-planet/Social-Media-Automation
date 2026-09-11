@@ -118,6 +118,7 @@ MAX_ACTIONS_PER_PROFILE_RUN = 30
 ACCOUNT_COOLDOWNS, NEXT_TASK_OVERRIDE = {}, {}
 AUTH_EVENT = {}  # username -> saved_session / manual_saved / manual_failed / credential_login / throttled / auth_backoff
 CLIENT_CACHE = {}  # username -> authenticated instagrapi Client for this process
+BROWSER_NATIVE_ACCOUNTS = set()  # valid Instagram Web sessions used when private API is blocked
 AUTH_RETRY_AFTER = {}  # username -> datetime; prevents rapid login loops
 
 # One-account instances can keep DMs responsive without making posting/actions frequent.
@@ -151,6 +152,17 @@ MAX_COMMENT_REPLIES_PER_PASS = max(1, int(os.environ.get("IG_MAX_COMMENT_REPLIES
 ACTION_HUMAN_DELAY_MIN_SECONDS = max(0, int(os.environ.get("IG_ACTION_HUMAN_DELAY_MIN_SECONDS", "8")))
 ACTION_HUMAN_DELAY_MAX_SECONDS = max(ACTION_HUMAN_DELAY_MIN_SECONDS, int(os.environ.get("IG_ACTION_HUMAN_DELAY_MAX_SECONDS", "18")))
 CONTROL_HEAD_REFRESH_SECONDS = max(5, int(os.environ.get("IG_CONTROL_HEAD_REFRESH_SECONDS", "10")))
+
+# Keep Browser Login open after session detection so Instagram post-login
+# prompts (e.g. "Save login info") can be completed manually.
+BROWSER_LOGIN_FINISH_SECONDS = max(
+    15,
+    min(
+        600,
+        int(os.environ.get("IG_BROWSER_LOGIN_FINISH_SECONDS", "90")),
+    ),
+)
+
 WORKFLOW_RETRY_IDLE_SECONDS = max(15, int(os.environ.get("IG_WORKFLOW_RETRY_IDLE_SECONDS", "45")))
 
 ACCOUNT_WRITE_TIMES = {}
@@ -2146,6 +2158,163 @@ def verify_like_state(cl, media, username, attempts=3):
 
     return False if saw_boolean else None
 
+def is_login_required_error(exc) -> bool:
+    message = str(exc or "").lower()
+    return isinstance(exc, LoginRequired) or any(
+        token in message
+        for token in (
+            "login_required",
+            "login required",
+            "loginrequired",
+        )
+    )
+
+
+def stop_account_for_private_login_required(
+    username: str,
+    action: str,
+    exc=None,
+    hours: int = 6,
+) -> None:
+    """
+    A write/private endpoint returning LoginRequired after browser bootstrap is
+    treated as an authentication compatibility failure, not a rate-limit retry.
+
+    Stop Auto for this account and preserve the saved browser/session files so
+    the user can retry later without repeatedly hammering Instagram.
+    """
+    username = str(username or "").strip().lstrip("@")
+    reason = (
+        f"Instagram returned LoginRequired during {action}. "
+        "The browser login is valid, but this imported session is not currently "
+        "accepted for that private/mobile API action."
+    )
+    if exc:
+        reason += f" ({type(exc).__name__}: {str(exc)[:140]})"
+
+    until = datetime.now() + timedelta(hours=max(1, int(hours)))
+    AUTH_RETRY_AFTER[username] = until
+    ACCOUNT_COOLDOWNS[username] = until
+    CONTROL_PAUSED_ACCOUNTS.add(username)
+    CONTROL_FORCE_RUN.discard(username)
+    NEXT_TASK_OVERRIDE.pop(username, None)
+    AUTH_EVENT[username] = "private_login_required"
+
+    update_account_metric(
+        username,
+        "status",
+        status="Browser OK / Private API Blocked",
+    )
+    update_account_metric(
+        username,
+        "cooldown_until",
+        value=until.strftime("%Y-%m-%d %H:%M"),
+    )
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🔐 {reason} Auto paused until "
+            f"{until.strftime('%Y-%m-%d %H:%M')}."
+        ),
+    )
+    print(f"🔐 @{username}: {reason}")
+
+
+def hashtag_media_with_browser_session_fallback(
+    cl,
+    hashtag: str,
+    amount: int,
+    username: str,
+):
+    """
+    Try authenticated private/mobile hashtag discovery first.
+
+    Browser-imported sessions can identify the account successfully but still
+    receive LoginRequired from the private hashtag endpoint. In that specific
+    case, fall back to instagrapi's GraphQL hashtag-media reader. This changes
+    discovery only; it does not bypass authentication for Likes/Follows/Posts.
+    """
+    try:
+        medias = cl.hashtag_medias_recent(hashtag, amount=amount)
+        return medias, "private"
+    except Exception as exc:
+        if not is_login_required_error(exc):
+            raise
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🌐 Private hashtag feed returned LoginRequired for #{hashtag}; "
+                "trying GraphQL discovery with the valid browser session."
+            ),
+        )
+
+        method = getattr(cl, "hashtag_medias_paginated_gql", None)
+        if method is None:
+            raise RuntimeError(
+                "This instagrapi build does not expose "
+                "hashtag_medias_paginated_gql for browser-session fallback."
+            ) from exc
+
+        result = method(hashtag, amount=amount)
+        if isinstance(result, tuple):
+            medias = result[0]
+        else:
+            medias = result
+
+        return list(medias or []), "graphql"
+
+
+def probe_browser_import_capabilities(cl, username: str, config=None) -> dict:
+    """
+    Non-destructive readiness probe after Browser Login.
+
+    Identity/private profile reads are already checked separately. This probe
+    tests hashtag discovery without performing any write action.
+    """
+    result = {
+        "timeline": False,
+        "hashtag_private": False,
+        "hashtag_graphql": False,
+    }
+
+    try:
+        cl.get_timeline_feed()
+        result["timeline"] = True
+    except Exception as exc:
+        if is_login_required_error(exc):
+            return result
+
+    tag = "instagram"
+    try:
+        settings = get_account_control_settings(username, config or {})
+        tags = _normalize_hashtag_list(settings.get("target_hashtags") or [])
+        if tags:
+            tag = tags[0]
+    except Exception:
+        pass
+
+    try:
+        cl.hashtag_medias_recent(tag, amount=1)
+        result["hashtag_private"] = True
+        return result
+    except Exception as exc:
+        if not is_login_required_error(exc):
+            return result
+
+    try:
+        method = getattr(cl, "hashtag_medias_paginated_gql", None)
+        if method is not None:
+            result_value = method(tag, amount=1)
+            medias = result_value[0] if isinstance(result_value, tuple) else result_value
+            result["hashtag_graphql"] = medias is not None
+    except Exception:
+        pass
+
+    return result
+
 def interact_with_hashtags(cl, history, config, username, actions_performed):
     settings = get_account_control_settings(username, config)
     if not settings.get("enable_engage", False):
@@ -2160,28 +2329,66 @@ def interact_with_hashtags(cl, history, config, username, actions_performed):
     )
     if not tags:
         update_account_metric(
-            username, "add_history",
-            value="⚠️ No valid target hashtags configured."
+            username,
+            "add_history",
+            value="⚠️ No valid target hashtags configured.",
         )
         return actions_performed
 
-    hashtag = re.sub(r"[^A-Za-z0-9_]", "", random.choice(tags).lstrip("#"))
+    hashtag = re.sub(
+        r"[^A-Za-z0-9_]",
+        "",
+        random.choice(tags).lstrip("#"),
+    )
     if not hashtag:
         return actions_performed
 
     cap = int(settings["max_writes_per_workflow"])
     history.setdefault("like_verify_failures", 0)
-    update_account_metric(username, "add_history", value=f"🔍 Streaming target #{hashtag}...")
+    update_account_metric(
+        username,
+        "add_history",
+        value=f"🔍 Streaming target #{hashtag}...",
+    )
 
     try:
-        medias = cl.hashtag_medias_recent(hashtag, amount=8)
+        medias, discovery_mode = hashtag_media_with_browser_session_fallback(
+            cl,
+            hashtag,
+            amount=8,
+            username=username,
+        )
+
+        if discovery_mode == "graphql":
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"🌐 #{hashtag} discovery is using GraphQL because this "
+                    "browser-imported session is not accepted by the private "
+                    "hashtag feed."
+                ),
+            )
+
+        if not medias:
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"⚠️ No media returned for #{hashtag}.",
+            )
+            return actions_performed
 
         for media in medias:
-            if not get_account_control_settings(username, config).get("enable_engage", False):
+            if not get_account_control_settings(
+                username,
+                config,
+            ).get("enable_engage", False):
                 break
+
             allowed, _ = account_writes_allowed(username)
             if not allowed or actions_performed >= cap:
                 break
+
             if media.id in history["liked_medias"]:
                 continue
 
@@ -2193,39 +2400,58 @@ def interact_with_hashtags(cl, history, config, username, actions_performed):
                 if not accepted:
                     history["like_verify_failures"] += 1
                     update_account_metric(
-                        username, "add_history",
-                        value=f"⚠️ Instagram did not accept the like request for @{media.user.username}."
+                        username,
+                        "add_history",
+                        value=(
+                            f"⚠️ Instagram did not accept the like request "
+                            f"for @{media.user.username}."
+                        ),
                     )
                     continue
 
                 record_write(username, "like")
-                # Don't repeatedly hit the same media if verification is unavailable.
                 history["liked_medias"].append(media.id)
-                verified = verify_like_state(cl, media, username)
+                verified = verify_like_state(
+                    cl,
+                    media,
+                    username,
+                )
 
                 if verified is True:
                     history["like_verify_failures"] = 0
-                    update_account_metric(username, "total_likes", increment=1)
                     update_account_metric(
-                        username, "add_history",
-                        value=f"❤️ Like confirmed on @{media.user.username}'s post."
+                        username,
+                        "total_likes",
+                        increment=1,
+                    )
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            f"❤️ Like confirmed on "
+                            f"@{media.user.username}'s post."
+                        ),
                     )
                 elif verified is False:
                     history["like_verify_failures"] += 1
                     update_account_metric(
-                        username, "add_history",
+                        username,
+                        "add_history",
                         value=(
-                            f"⚠️ Like endpoint returned success, but authenticated media state "
-                            f"did not show the like on @{media.user.username}'s post."
-                        )
+                            "⚠️ Like endpoint returned success, but authenticated "
+                            f"media state did not show the like on "
+                            f"@{media.user.username}'s post."
+                        ),
                     )
                 else:
                     update_account_metric(
-                        username, "add_history",
+                        username,
+                        "add_history",
                         value=(
-                            f"♡ Like request accepted for @{media.user.username}; "
-                            "Instagram's returned media object did not expose a viewer-like flag."
-                        )
+                            f"♡ Like request accepted for "
+                            f"@{media.user.username}; Instagram's returned media "
+                            "object did not expose a viewer-like flag."
+                        ),
                     )
 
                 actions_performed += 1
@@ -2233,12 +2459,21 @@ def interact_with_hashtags(cl, history, config, username, actions_performed):
                 if history["like_verify_failures"] >= 3:
                     apply_account_safety_backoff(
                         username,
-                        "Three recent like actions could not be confirmed in authenticated media state.",
+                        "Three recent like actions could not be confirmed "
+                        "in authenticated media state.",
                         level="verification",
                         hours=4,
                     )
                     break
 
+            except LoginRequired as exc:
+                stop_account_for_private_login_required(
+                    username,
+                    "Like",
+                    exc,
+                    hours=6,
+                )
+                break
             except FeedbackRequired as exc:
                 apply_account_safety_backoff(
                     username,
@@ -2247,22 +2482,64 @@ def interact_with_hashtags(cl, history, config, username, actions_performed):
                 )
                 raise
             except Exception as exc:
-                observe_platform_signal(username, exc, action="like")
+                if is_login_required_error(exc):
+                    stop_account_for_private_login_required(
+                        username,
+                        "Like",
+                        exc,
+                        hours=6,
+                    )
+                    break
+
+                observe_platform_signal(
+                    username,
+                    exc,
+                    action="like",
+                )
                 update_account_metric(
-                    username, "add_history",
-                    value=f"⚠️ Like skipped: {type(exc).__name__}: {str(exc)[:90]}"
+                    username,
+                    "add_history",
+                    value=(
+                        f"⚠️ Like skipped: {type(exc).__name__}: "
+                        f"{str(exc)[:90]}"
+                    ),
                 )
 
+    except LoginRequired as exc:
+        # This should normally be consumed by the GraphQL discovery fallback.
+        stop_account_for_private_login_required(
+            username,
+            "hashtag discovery",
+            exc,
+            hours=6,
+        )
     except FeedbackRequired:
         raise
     except Exception as exc:
-        observe_platform_signal(username, exc, action="hashtag feed")
-        update_account_metric(
-            username, "add_history",
-            value=f"⚠️ Hashtag error: {type(exc).__name__}: {str(exc)[:100]}"
-        )
+        if is_login_required_error(exc):
+            stop_account_for_private_login_required(
+                username,
+                "hashtag discovery",
+                exc,
+                hours=6,
+            )
+        else:
+            observe_platform_signal(
+                username,
+                exc,
+                action="hashtag feed",
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"⚠️ Hashtag error: {type(exc).__name__}: "
+                    f"{str(exc)[:100]}"
+                ),
+            )
 
     return actions_performed
+
 
 
 
@@ -3223,8 +3500,1173 @@ def patch_obsolete_qe_expose(cl, username):
     return cl
 
 
+def _browser_profile_dir(username: str) -> Path:
+    return DOWNLOAD_ROOT / f"browser_{str(username).strip().lstrip('@').replace('.', '_')}"
+
+
+def _browser_profile_saved(username: str) -> bool:
+    path = _browser_profile_dir(username)
+    return path.exists() and path.is_dir()
+
+
+def _activate_browser_native_mode(username: str, reason: str = "") -> None:
+    username = str(username or "").strip().lstrip("@")
+    with CONTROL_LOCK:
+        BROWSER_NATIVE_ACCOUNTS.add(username)
+        CLIENT_CACHE.pop(username, None)
+        CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
+        CONTROL_PAUSED_ACCOUNTS.add(username)
+        CONTROL_FORCE_RUN.discard(username)
+        AUTH_EVENT[username] = "browser_native"
+
+    update_account_metric(
+        username,
+        "status",
+        status="Browser Mode / Auto Off",
+    )
+    if reason:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"🌐 Browser Mode enabled: {reason}",
+        )
+
+
+def _deactivate_browser_native_mode(username: str) -> None:
+    BROWSER_NATIVE_ACCOUNTS.discard(
+        str(username or "").strip().lstrip("@")
+    )
+
+
+def _browser_context_logged_in(context) -> bool:
+    try:
+        cookies = context.cookies("https://www.instagram.com/")
+        return any(
+            c.get("name") == "sessionid" and c.get("value")
+            for c in cookies
+        )
+    except Exception:
+        return False
+
+
+def _browser_page_problem(page) -> str:
+    """
+    Detect login/challenge/restriction UI. Never attempts to bypass it.
+    """
+    try:
+        url = str(page.url or "").lower()
+    except Exception:
+        url = ""
+
+    if any(token in url for token in ("/accounts/login", "/challenge/", "/checkpoint/")):
+        return f"Instagram verification/login page: {url[:180]}"
+
+    phrases = (
+        "confirm it's you",
+        "help us confirm you own this account",
+        "suspicious login attempt",
+        "challenge required",
+        "try again later",
+        "we restrict certain activity",
+        "your account has been temporarily",
+        "please wait a few minutes",
+    )
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=900) or "",
+        ).lower()
+        for phrase in phrases:
+            if phrase in body:
+                return phrase
+    except Exception:
+        pass
+
+    return ""
+
+
+def _browser_check_ready(page, context, username: str) -> None:
+    if not _browser_context_logged_in(context):
+        raise RuntimeError(
+            "Saved Instagram browser profile is no longer logged in. "
+            "Use Browser Login again."
+        )
+
+    problem = _browser_page_problem(page)
+    if problem:
+        CONTROL_PAUSED_ACCOUNTS.add(username)
+        update_account_metric(
+            username,
+            "status",
+            status="Browser Verification Needed",
+        )
+        raise RuntimeError(
+            f"Instagram Web requires manual attention: {problem}. "
+            "Use Browser Login and complete the prompt manually."
+        )
+
+
+def _browser_launch(p, username: str, *, headed: bool | None = None):
+    if headed is None:
+        headed = os.environ.get(
+            "IG_BROWSER_AUTOMATION_HEADED", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+    return p.chromium.launch_persistent_context(
+        str(_browser_profile_dir(username)),
+        headless=not headed,
+        viewport={"width": 1280, "height": 900},
+    )
+
+
+def _browser_clickable_from_svg(svg):
+    for xpath in (
+        "xpath=ancestor::button[1]",
+        "xpath=ancestor::*[@role='button'][1]",
+        "xpath=ancestor::div[@role='button'][1]",
+    ):
+        try:
+            loc = svg.locator(xpath)
+            if loc.count():
+                return loc.first
+        except Exception:
+            pass
+    return svg
+
+
+def _browser_find_svg_action(scope, labels):
+    for label in labels:
+        try:
+            locs = scope.locator(f"svg[aria-label='{label}']")
+            for i in range(min(locs.count(), 8)):
+                loc = locs.nth(i)
+                if loc.is_visible(timeout=250):
+                    return loc
+        except Exception:
+            pass
+    return None
+
+
+def _browser_click_text_button(scope, pattern, timeout=5000):
+    try:
+        btn = scope.get_by_role(
+            "button",
+            name=re.compile(pattern, re.I),
+        ).first
+        if btn.count() and btn.is_visible(timeout=500):
+            btn.click(timeout=timeout)
+            return True
+    except Exception:
+        pass
+
+    try:
+        item = scope.get_by_text(
+            re.compile(pattern, re.I),
+            exact=True,
+        ).first
+        if item.count() and item.is_visible(timeout=500):
+            item.click(timeout=timeout)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _browser_collect_profile_media_links(page, username: str) -> set[str]:
+    try:
+        page.goto(
+            f"https://www.instagram.com/{username.lstrip('@')}/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.wait_for_timeout(1400)
+        hrefs = page.locator(
+            "a[href*='/p/'], a[href*='/reel/']"
+        ).evaluate_all(
+            """els => els.map(e => e.href || e.getAttribute('href') || '')
+                         .filter(Boolean)"""
+        )
+        return {
+            str(href).split("?", 1)[0]
+            for href in hrefs
+            if "/p/" in str(href) or "/reel/" in str(href)
+        }
+    except Exception:
+        return set()
+
+
+def _browser_follow_network(username, history, config, manual=False) -> int:
+    settings = get_account_control_settings(username, config)
+    if not settings.get("enable_follow", False):
+        return 0
+
+    targets = settings["target_accounts"] or list(
+        config.get("competitor_accounts") or []
+    )
+    if not targets:
+        update_account_metric(
+            username,
+            "add_history",
+            value="⚠️ Browser Follow is enabled but no target accounts are configured.",
+        )
+        return 0
+
+    target = random.choice(targets).lstrip("@")
+    source = settings.get("follow_source", "followers")
+    if source == "both":
+        source = random.choice(["followers", "following"])
+
+    limit = min(
+        int(settings.get("follow_limit", 1)),
+        int(settings.get("max_writes_per_workflow", MAX_WRITES_PER_WORKFLOW)),
+    )
+    limit = max(1, limit)
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=f"🌐 Browser Follow: @{target} {source}; target={limit}",
+    )
+
+    followed = 0
+    attempted = set()
+
+    with sync_playwright() as p:
+        context = _browser_launch(p, username)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.goto(
+                f"https://www.instagram.com/{target}/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(1300)
+            _browser_check_ready(page, context, username)
+
+            href = f"/{target}/{source}/"
+            trigger = page.locator(f"a[href='{href}']").first
+            if not trigger.count():
+                trigger = page.locator(
+                    f"a[href*='/{target}/{source}/']"
+                ).first
+            if not trigger.count():
+                _browser_click_text_button(
+                    page,
+                    rf"^{source}$",
+                )
+            else:
+                trigger.click(timeout=5000)
+
+            page.wait_for_timeout(1200)
+            _browser_check_ready(page, context, username)
+
+            dialog = page.locator("[role='dialog']").last
+            root = dialog if dialog.count() else page
+
+            idle_rounds = 0
+            while followed < limit and idle_rounds < 8:
+                buttons = root.get_by_role(
+                    "button",
+                    name=re.compile(r"^Follow$", re.I),
+                )
+                count = buttons.count()
+
+                candidate = None
+                candidate_name = ""
+
+                for i in range(min(count, 30)):
+                    button = buttons.nth(i)
+                    try:
+                        if not button.is_visible(timeout=200):
+                            continue
+                    except Exception:
+                        continue
+
+                    row = button.locator("xpath=ancestor::div[.//a][1]")
+                    hrefs = []
+                    try:
+                        hrefs = row.locator("a[href^='/']").evaluate_all(
+                            """els => els.map(e => e.getAttribute('href') || '')"""
+                        )
+                    except Exception:
+                        pass
+
+                    for candidate_href in hrefs:
+                        match = re.fullmatch(r"/([^/?#]+)/?", str(candidate_href))
+                        if match:
+                            possible = match.group(1)
+                            if possible.lower() not in {
+                                target.lower(), "accounts", "explore"
+                            }:
+                                candidate_name = possible
+                                break
+
+                    key = candidate_name or f"row_{i}"
+                    if key in attempted:
+                        continue
+                    attempted.add(key)
+                    candidate = button
+                    break
+
+                if candidate is None:
+                    idle_rounds += 1
+                    try:
+                        root.evaluate(
+                            "(el) => el.scrollBy(0, Math.max(600, el.clientHeight * 0.8))"
+                        )
+                    except Exception:
+                        try:
+                            root.locator("div").last.scroll_into_view_if_needed(
+                                timeout=1000
+                            )
+                        except Exception:
+                            pass
+                    page.wait_for_timeout(900)
+                    continue
+
+                idle_rounds = 0
+
+                if not wait_for_write_slot(username, "follow", max_wait=180):
+                    break
+
+                try:
+                    candidate.click(timeout=5000)
+                except Exception:
+                    candidate.evaluate("(el) => el.click()")
+
+                page.wait_for_timeout(900)
+
+                problem = _browser_page_problem(page)
+                if problem:
+                    apply_account_safety_backoff(
+                        username,
+                        f"Instagram Web follow restriction/challenge: {problem}",
+                        level="restricted",
+                        hours=4,
+                    )
+                    break
+
+                # Re-read visible row/button state. If the exact Follow button
+                # is gone or changed to Following/Requested, count it.
+                confirmed = False
+                try:
+                    txt = re.sub(
+                        r"\s+",
+                        " ",
+                        candidate.inner_text(timeout=500) or "",
+                    ).strip()
+                    confirmed = bool(
+                        re.fullmatch(
+                            r"(Following|Requested)",
+                            txt,
+                            re.I,
+                        )
+                    )
+                except Exception:
+                    # A detached button usually means the row rerendered.
+                    confirmed = True
+
+                if not confirmed:
+                    # Do not count ambiguous UI as success.
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            f"⚠️ Browser Follow for "
+                            f"@{candidate_name or 'candidate'} was not confirmed."
+                        ),
+                    )
+                    continue
+
+                record_write(username, "follow")
+                followed += 1
+                update_account_metric(
+                    username,
+                    "total_follows",
+                    increment=1,
+                )
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"👤 Browser Follow confirmed: "
+                        f"@{candidate_name or 'candidate'} ({followed}/{limit})"
+                    ),
+                )
+
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+    return followed
+
+
+def _browser_engage_hashtag(username, history, config) -> int:
+    settings = get_account_control_settings(username, config)
+    if not settings.get("enable_engage", False):
+        return 0
+
+    tags = _normalize_hashtag_list(
+        settings["target_hashtags"]
+        or list(config.get("target_hashtags") or [])
+    )
+    if not tags:
+        update_account_metric(
+            username,
+            "add_history",
+            value="⚠️ No valid target hashtags configured.",
+        )
+        return 0
+
+    tag = random.choice(tags).lstrip("#")
+    max_actions = max(
+        1,
+        min(
+            int(settings.get("max_writes_per_workflow", MAX_WRITES_PER_WORKFLOW)),
+            6,
+        ),
+    )
+    history.setdefault("browser_liked_urls", [])
+    history.setdefault("browser_saved_urls", [])
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=f"🌐 Browser Engage: loading #{tag}",
+    )
+
+    confirmed_likes = 0
+
+    with sync_playwright() as p:
+        context = _browser_launch(p, username)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.goto(
+                f"https://www.instagram.com/explore/tags/{tag}/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(1600)
+            _browser_check_ready(page, context, username)
+
+            hrefs = page.locator(
+                "a[href*='/p/'], a[href*='/reel/']"
+            ).evaluate_all(
+                """els => els.map(e => e.href || e.getAttribute('href') || '')
+                             .filter(Boolean)"""
+            )
+            links = []
+            for href in hrefs:
+                clean = str(href).split("?", 1)[0]
+                if clean not in links:
+                    links.append(clean)
+
+            if not links:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=f"⚠️ Browser Engage found no posts under #{tag}.",
+                )
+                return 0
+
+            for href in links[:max_actions]:
+                if href in history["browser_liked_urls"]:
+                    continue
+
+                page.goto(
+                    href,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(1100)
+                _browser_check_ready(page, context, username)
+
+                # Like
+                like_svg = _browser_find_svg_action(
+                    page,
+                    ("Like",),
+                )
+                if like_svg is not None:
+                    if not wait_for_write_slot(
+                        username,
+                        "like",
+                        max_wait=180,
+                    ):
+                        break
+
+                    _browser_clickable_from_svg(like_svg).click(
+                        timeout=5000
+                    )
+                    page.wait_for_timeout(700)
+
+                    unlike_svg = _browser_find_svg_action(
+                        page,
+                        ("Unlike",),
+                    )
+                    if unlike_svg is not None:
+                        record_write(username, "like")
+                        history["browser_liked_urls"].append(href)
+                        update_account_metric(
+                            username,
+                            "total_likes",
+                            increment=1,
+                        )
+                        confirmed_likes += 1
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value=f"❤️ Browser Like confirmed: {href}",
+                        )
+                    else:
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value=f"⚠️ Browser Like was not confirmed: {href}",
+                        )
+
+                problem = _browser_page_problem(page)
+                if problem:
+                    apply_account_safety_backoff(
+                        username,
+                        f"Instagram Web engagement restriction/challenge: {problem}",
+                        level="restricted",
+                        hours=4,
+                    )
+                    break
+
+                # Save/Favorite is part of the original engagement behavior.
+                if href not in history["browser_saved_urls"]:
+                    save_svg = _browser_find_svg_action(
+                        page,
+                        ("Save",),
+                    )
+                    if save_svg is not None:
+                        if not wait_for_write_slot(
+                            username,
+                            "save",
+                            max_wait=180,
+                        ):
+                            break
+
+                        before = ""
+                        try:
+                            before = save_svg.get_attribute("aria-label") or ""
+                        except Exception:
+                            pass
+
+                        _browser_clickable_from_svg(save_svg).click(
+                            timeout=5000
+                        )
+                        page.wait_for_timeout(700)
+
+                        after_remove = _browser_find_svg_action(
+                            page,
+                            ("Remove", "Unsave"),
+                        )
+                        current_save = _browser_find_svg_action(
+                            page,
+                            ("Save",),
+                        )
+                        confirmed_save = after_remove is not None or current_save is None
+
+                        if confirmed_save:
+                            record_write(username, "save")
+                            history["browser_saved_urls"].append(href)
+                            update_account_metric(
+                                username,
+                                "add_history",
+                                value=f"🔖 Browser Save confirmed: {href}",
+                            )
+                        else:
+                            update_account_metric(
+                                username,
+                                "add_history",
+                                value=f"⚠️ Browser Save was not confirmed: {href}",
+                            )
+
+                page.wait_for_timeout(
+                    random.randint(900, 1800)
+                )
+
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+    history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
+    history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
+    return confirmed_likes
+
+
+def _browser_prepare_post(username, history, folder_pool):
+    settings = get_account_control_settings(username)
+    history.setdefault("posted_ids", [])
+    history.setdefault("browser_pending_uploads", [])
+
+    now = time.time()
+    pending = []
+    pending_ids = set()
+    for item in history["browser_pending_uploads"]:
+        if not isinstance(item, dict):
+            continue
+        created = float(item.get("created_ts") or 0)
+        if now - created < 24 * 3600:
+            pending.append(item)
+            pending_ids.add(str(item.get("folder_id") or ""))
+    history["browser_pending_uploads"] = pending
+
+    pool = [
+        folder for folder in folder_pool
+        if folder["id"] not in history["posted_ids"]
+        and folder["id"] not in pending_ids
+    ]
+    random.shuffle(pool)
+
+    valid_exts = {".jpg", ".jpeg", ".png", ".mp4"}
+    selected = None
+    media_files = []
+
+    for folder in pool:
+        files = sorted(
+            p for p in folder["path"].iterdir()
+            if p.is_file() and p.suffix.lower() in valid_exts
+        )
+        if files:
+            selected = folder
+            media_files = files
+            break
+
+    if not selected:
+        return None
+
+    text_context = ""
+    for txt in sorted(
+        p for p in selected["path"].iterdir()
+        if p.is_file() and p.suffix.lower() in {".txt", ".caption", ".md"}
+    )[:3]:
+        try:
+            body = txt.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).strip()
+            if body:
+                text_context += (
+                    ("\n" if text_context else "")
+                    + body[:3000]
+                )
+        except OSError:
+            pass
+
+    analysis = analyze_media_for_caption(
+        media_files,
+        sidecar_text=text_context,
+        source_account=selected.get("source", ""),
+        frame_count=settings["video_frames"],
+        require_video_vision=settings["require_video_vision"],
+    )
+    if analysis.get("vision_required_failed"):
+        return None
+
+    semantic_context = analysis["context"]
+    caption = generate_rage_bait_caption(
+        semantic_context,
+        perspective=analysis["perspective"],
+        account_username=username,
+    )
+    if not caption:
+        return None
+
+    hashtag_prompt = f"""
+Generate EXACTLY 5 relevant Instagram hashtags based ONLY on this media analysis:
+
+{semantic_context}
+
+Output only 5 space-separated hashtags.
+""".strip()
+
+    try:
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": settings["persona_prompt"],
+                },
+                {
+                    "role": "user",
+                    "content": hashtag_prompt,
+                },
+            ],
+            options={"temperature": 0.45, "top_p": 0.9},
+        )
+        raw_tags = _clean_ollama_output(
+            response.get("message", {}).get("content", "")
+        )
+    except Exception:
+        raw_tags = ""
+
+    tags = []
+    for token in raw_tags.replace("\n", " ").split():
+        token = token.strip(" ,.;:!?")
+        if token and not token.startswith("#"):
+            token = "#" + token
+        if re.fullmatch(r"#[A-Za-z0-9_]+", token) and token not in tags:
+            tags.append(token)
+        if len(tags) == 5:
+            break
+
+    for fallback in (
+        "#video",
+        "#reels",
+        "#creator",
+        "#explore",
+        "#daily",
+    ):
+        if len(tags) >= 5:
+            break
+        if fallback not in tags:
+            tags.append(fallback)
+
+    tag_line = " ".join(tags[:5])
+    total_limit = int(settings["caption_char_limit"])
+    caption = _clip_chars(
+        caption,
+        max(20, total_limit - len(tag_line) - 2),
+    )
+    full_caption = f"{caption}\n\n{tag_line}".strip()
+
+    videos = [
+        p for p in media_files
+        if p.suffix.lower() == ".mp4"
+    ]
+    photos = [
+        p for p in media_files
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    ]
+
+    if videos:
+        upload_files = [videos[0]]
+    else:
+        upload_files = photos[:10]
+
+    if not upload_files:
+        return None
+
+    return {
+        "folder": selected,
+        "files": upload_files,
+        "caption": full_caption,
+    }
+
+
+def _browser_post(username, history, folder_pool) -> bool:
+    settings = get_account_control_settings(username)
+    if not settings.get("enable_posts", False):
+        return False
+
+    prepared = _browser_prepare_post(
+        username,
+        history,
+        folder_pool,
+    )
+    if not prepared:
+        update_account_metric(
+            username,
+            "add_history",
+            value="⚠️ Browser Post found no prepared media.",
+        )
+        return False
+
+    selected = prepared["folder"]
+    files = prepared["files"]
+    full_caption = prepared["caption"]
+
+    if not wait_for_write_slot(
+        username,
+        "upload",
+        max_wait=180,
+    ):
+        update_account_metric(
+            username,
+            "add_history",
+            value="⏳ Browser Post deferred by pacing/safety state.",
+        )
+        return False
+
+    with sync_playwright() as p:
+        context = _browser_launch(p, username)
+        page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            before_links = _browser_collect_profile_media_links(
+                page,
+                username,
+            )
+            _browser_check_ready(page, context, username)
+
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(1000)
+            _browser_check_ready(page, context, username)
+
+            opened = False
+            for label in ("New post", "Create"):
+                svg = _browser_find_svg_action(
+                    page,
+                    (label,),
+                )
+                if svg is not None:
+                    _browser_clickable_from_svg(svg).click(
+                        timeout=5000
+                    )
+                    opened = True
+                    break
+
+            if not opened:
+                opened = _browser_click_text_button(
+                    page,
+                    r"^Create$",
+                )
+
+            if not opened:
+                raise RuntimeError(
+                    "Instagram Web Create/Post control was not found."
+                )
+
+            page.wait_for_timeout(700)
+
+            # Current web UI can show a Create menu before the composer.
+            try:
+                menu_post = page.get_by_role(
+                    "menuitem",
+                    name=re.compile(r"^Post$", re.I),
+                ).first
+                if menu_post.count() and menu_post.is_visible(timeout=500):
+                    menu_post.click(timeout=4000)
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+            file_input = page.locator("input[type='file']").first
+            deadline = time.time() + 10
+            while time.time() < deadline and not file_input.count():
+                page.wait_for_timeout(400)
+                file_input = page.locator("input[type='file']").first
+
+            if not file_input.count():
+                raise RuntimeError(
+                    "Instagram Web post composer did not expose a file input."
+                )
+
+            file_input.set_input_files(
+                [str(path) for path in files]
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"⬆️ Browser Post attached "
+                    f"{', '.join(p.name for p in files)}"
+                ),
+            )
+
+            page.wait_for_timeout(1600)
+
+            # Instagram normally has one or two Next screens.
+            for _ in range(3):
+                if _browser_click_text_button(
+                    page,
+                    r"^Next$",
+                    timeout=5000,
+                ):
+                    page.wait_for_timeout(1000)
+                else:
+                    break
+
+            # Caption input varies across A/B layouts.
+            caption_box = None
+            for selector in (
+                "textarea[aria-label*='caption' i]",
+                "textarea[placeholder*='caption' i]",
+                "[contenteditable='true'][aria-label*='caption' i]",
+                "div[role='textbox'][contenteditable='true']",
+            ):
+                try:
+                    loc = page.locator(selector).last
+                    if loc.count() and loc.is_visible(timeout=500):
+                        caption_box = loc
+                        break
+                except Exception:
+                    pass
+
+            if caption_box is None:
+                raise RuntimeError(
+                    "Instagram Web caption editor was not found."
+                )
+
+            try:
+                caption_box.fill(full_caption)
+            except Exception:
+                caption_box.focus()
+                page.keyboard.insert_text(full_caption)
+
+            page.wait_for_timeout(500)
+
+            if not _browser_click_text_button(
+                page,
+                r"^(Share|Publish)$",
+                timeout=6000,
+            ):
+                raise RuntimeError(
+                    "Instagram Web Share button was not found."
+                )
+
+            update_account_metric(
+                username,
+                "add_history",
+                value="⬆️ Browser Post submitted; verifying profile...",
+            )
+
+            confirmed = False
+            final_link = ""
+            deadline = time.time() + 75
+
+            while time.time() < deadline:
+                page.wait_for_timeout(3000)
+
+                problem = _browser_page_problem(page)
+                if problem:
+                    raise RuntimeError(
+                        f"Instagram Web upload interrupted: {problem}"
+                    )
+
+                current = _browser_collect_profile_media_links(
+                    page,
+                    username,
+                )
+                new_links = current - before_links
+                if new_links:
+                    confirmed = True
+                    final_link = sorted(new_links)[-1]
+                    break
+
+            if confirmed:
+                record_write(username, "upload")
+                if selected["id"] not in history["posted_ids"]:
+                    history["posted_ids"].append(
+                        selected["id"]
+                    )
+                update_account_metric(
+                    username,
+                    "total_posts",
+                    increment=1,
+                )
+                record_recent_post(
+                    username=username,
+                    folder_path=selected["path"],
+                    caption=full_caption,
+                    media_id="browser",
+                    permalink=final_link,
+                )
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"✅ Browser Post confirmed on profile: "
+                        f"{final_link}"
+                    ),
+                )
+                return True
+
+            history.setdefault(
+                "browser_pending_uploads",
+                [],
+            ).append(
+                {
+                    "folder_id": selected["id"],
+                    "created_ts": time.time(),
+                    "files": [str(p) for p in files],
+                }
+            )
+            history["browser_pending_uploads"] = (
+                history["browser_pending_uploads"][-30:]
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "⏳ Browser Post was submitted but no new profile URL "
+                    "appeared in the verification window. It was not counted "
+                    "and the folder is held for 24h to reduce duplicate risk."
+                ),
+            )
+            return False
+
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
+def run_browser_profile_workflow(username, conf, folder_pool):
+    forced_task = NEXT_TASK_OVERRIDE.pop(username, None)
+
+    if username in CONTROL_PAUSED_ACCOUNTS and not forced_task:
+        update_account_metric(
+            username,
+            "status",
+            status="Browser Mode / Auto Off",
+        )
+        return "paused"
+
+    if not _browser_profile_saved(username):
+        update_account_metric(
+            username,
+            "status",
+            status="Browser Login Needed",
+        )
+        return "disconnected"
+
+    settings = get_account_control_settings(
+        username,
+        conf,
+    )
+    update_account_metric(
+        username,
+        "status",
+        status="Browser Mode / Active",
+    )
+
+    history = load_json(
+        conf["history_file"],
+        {
+            "posted_ids": [],
+            "replied_dms": [],
+            "replied_comments": [],
+            "liked_medias": [],
+            "commented_medias": [],
+            "followed_users": [],
+            "blocked_or_missing": [],
+            "competitor_pool": [],
+            "followers_next_max_id": None,
+            "following_next_max_id": None,
+            "dm_reply_memory": {},
+            "browser_liked_urls": [],
+            "browser_saved_urls": [],
+            "browser_pending_uploads": [],
+        },
+    )
+
+    try:
+        if forced_task == "networking":
+            _browser_follow_network(
+                username,
+                history,
+                conf,
+                manual=True,
+            )
+        elif forced_task == "hashtags":
+            _browser_engage_hashtag(
+                username,
+                history,
+                conf,
+            )
+        elif forced_task == "repost":
+            _browser_post(
+                username,
+                history,
+                folder_pool,
+            )
+        elif forced_task == "comments":
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "ℹ️ Browser Mode comment replies are not enabled yet; "
+                    "Follow, Engage, and Post are available."
+                ),
+            )
+        else:
+            choices = []
+            if settings.get("enable_follow", False):
+                choices.append("networking")
+            if settings.get("enable_engage", False):
+                choices.append("hashtags")
+            if settings.get("enable_posts", False) and folder_pool:
+                choices.append("repost")
+
+            if choices:
+                cycle_index = int(
+                    history.get(
+                        "browser_outward_cycle_index",
+                        0,
+                    )
+                    or 0
+                )
+                task = choices[
+                    cycle_index % len(choices)
+                ]
+                history["browser_outward_cycle_index"] = (
+                    cycle_index + 1
+                )
+
+                if task == "networking":
+                    _browser_follow_network(
+                        username,
+                        history,
+                        conf,
+                    )
+                elif task == "hashtags":
+                    _browser_engage_hashtag(
+                        username,
+                        history,
+                        conf,
+                    )
+                elif task == "repost":
+                    _browser_post(
+                        username,
+                        history,
+                        folder_pool,
+                    )
+
+    finally:
+        save_json(
+            conf["history_file"],
+            history,
+        )
+        if username in CONTROL_PAUSED_ACCOUNTS:
+            update_account_metric(
+                username,
+                "status",
+                status="Browser Mode / Auto Off",
+            )
+        else:
+            update_account_metric(
+                username,
+                "status",
+                status="Browser Mode / Auto On",
+            )
+
+    return "ran"
+
 def run_profile_workflow(username, conf, folder_pool):
     global NEXT_TASK_OVERRIDE
+
+    if username in BROWSER_NATIVE_ACCOUNTS:
+        return run_browser_profile_workflow(
+            username,
+            conf,
+            folder_pool,
+        )
 
     if username in CONTROL_DISCONNECTED_ACCOUNTS:
         update_account_metric(username, "status", status="Disconnected")
@@ -3493,18 +4935,24 @@ def _control_metrics_payload():
     for username, conf in CONTROL_ROSTER.items():
         row = dict(metrics.get(username, _new_account_metrics()))
         session_path = DOWNLOAD_ROOT / conf["session_file"]
+        browser_mode = username in BROWSER_NATIVE_ACCOUNTS
+        private_connected = (
+            username in CLIENT_CACHE
+            and username not in CONTROL_DISCONNECTED_ACCOUNTS
+        )
+        connected = private_connected or browser_mode
+
         row["control"] = {
-            "connected": (
-                username in CLIENT_CACHE
-                and username not in CONTROL_DISCONNECTED_ACCOUNTS
-            ),
-            "disconnected": username in CONTROL_DISCONNECTED_ACCOUNTS,
+            "connected": connected,
+            "disconnected": not connected,
             "paused": username in CONTROL_PAUSED_ACCOUNTS,
             "auto_enabled": (
-                username in CLIENT_CACHE
-                and username not in CONTROL_DISCONNECTED_ACCOUNTS
+                connected
                 and username not in CONTROL_PAUSED_ACCOUNTS
             ),
+            "browser_mode": browser_mode,
+            "browser_profile_saved": _browser_profile_saved(username),
+            "private_api_connected": private_connected,
             "saved_session": session_path.exists(),
             "session_file": session_path.name,
             "queued_task": NEXT_TASK_OVERRIDE.get(username, ""),
@@ -3524,14 +4972,18 @@ def _control_metrics_payload():
     }
 
 
+
 def _control_browser_login(username, timeout_seconds=600):
     """
-    Explicit browser bootstrap for accounts whose Instagram Web login works but
+    Browser bootstrap for accounts whose Instagram Web login works while
     private-API password login returns needs_upgrade.
 
-    The user completes login/challenges manually in a normal Chromium window.
-    We capture the resulting Instagram sessionid cookie and make ONE
-    login_by_sessionid conversion attempt. No CAPTCHA/challenge is bypassed.
+    The user completes all login/challenge steps manually. Once Instagram
+    supplies a session cookie, Chromium remains open for a finishing window so
+    post-login prompts such as "Save login info" can be completed before the
+    persistent browser profile is closed and flushed to disk.
+
+    No CAPTCHA/challenge is bypassed.
     """
     username = str(username or "").strip().lstrip("@")
     conf = _control_conf(username)
@@ -3553,8 +5005,7 @@ def _control_browser_login(username, timeout_seconds=600):
         "add_history",
         value=(
             "🌐 Browser Login opened. Complete Instagram login and any "
-            "verification manually in Chromium. The bot will capture the "
-            "browser session automatically."
+            "verification manually in Chromium."
         ),
     )
 
@@ -3591,7 +5042,6 @@ def _control_browser_login(username, timeout_seconds=600):
                 sessionid = None
 
             if sessionid:
-                page.wait_for_timeout(1800)
                 break
 
             now = time.time()
@@ -3608,6 +5058,70 @@ def _control_browser_login(username, timeout_seconds=600):
 
             page.wait_for_timeout(1200)
 
+        if not sessionid:
+            try:
+                context.close()
+            except Exception:
+                pass
+            update_account_metric(username, "status", status="Login Needed")
+            raise RuntimeError(
+                "Browser Login timed out before Instagram supplied a sessionid cookie."
+            )
+
+        finish_seconds = BROWSER_LOGIN_FINISH_SECONDS
+        update_account_metric(
+            username,
+            "status",
+            status="Browser Login — Finish Prompts",
+        )
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🌐 Browser session detected. Chromium will stay open for "
+                f"{finish_seconds}s so you can click Save login info / finish "
+                "post-login prompts. Do not close the window manually."
+            ),
+        )
+
+        finish_deadline = time.time() + finish_seconds
+        next_notice = time.time() + 30
+
+        while time.time() < finish_deadline:
+            try:
+                cookies = context.cookies("https://www.instagram.com/")
+                updated = next(
+                    (
+                        c.get("value")
+                        for c in cookies
+                        if c.get("name") == "sessionid" and c.get("value")
+                    ),
+                    None,
+                )
+                if updated:
+                    sessionid = updated
+            except Exception:
+                pass
+
+            if time.time() >= next_notice:
+                remaining = max(0, int(finish_deadline - time.time()))
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"🌐 Browser Login finishing window: {remaining}s "
+                        "remaining for Instagram prompts."
+                    ),
+                )
+                next_notice = time.time() + 30
+
+            page.wait_for_timeout(1000)
+
+        try:
+            page.wait_for_timeout(1200)
+        except Exception:
+            pass
+
         try:
             context.close()
         except Exception:
@@ -3616,9 +5130,10 @@ def _control_browser_login(username, timeout_seconds=600):
     if not sessionid:
         update_account_metric(username, "status", status="Login Needed")
         raise RuntimeError(
-            "Browser Login timed out before Instagram supplied a sessionid cookie."
+            "Instagram browser session disappeared before it could be saved."
         )
 
+    # Preserve a separate browser-session copy without printing the cookie.
     browser_cookie_file = DOWNLOAD_ROOT / (
         f"browser_session_{username.replace('.', '_')}.json"
     )
@@ -3630,71 +5145,165 @@ def _control_browser_login(username, timeout_seconds=600):
     except Exception:
         pass
 
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "💾 Browser profile/session saved locally. Testing whether "
+            "Instagram also accepts it for private API automation..."
+        ),
+    )
+
     cl = Client()
     _refresh_instagram_app_profile(cl, username)
 
     try:
-        # One conversion attempt only. Do not loop if Instagram rejects it.
         cl.login_by_sessionid(sessionid)
     except Exception as exc:
-        if _is_needs_upgrade_error(exc):
+        if _is_needs_upgrade_error(exc) or is_login_required_error(exc):
             set_auth_cooldown(username, minutes=360)
-            update_account_metric(
+            _activate_browser_native_mode(
                 username,
-                "status",
-                status="Browser OK / Private API Blocked",
+                "Instagram Web login is valid, but private API session conversion is blocked.",
             )
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    "🌐 Browser login succeeded, but Instagram still rejected "
-                    "private-API session conversion with needs_upgrade. "
-                    "Automatic credential retries paused for 6 hours."
+                    "💾 Browser login is saved, but Instagram rejected the "
+                    "private-API session conversion. Browser profile preserved."
                 ),
             )
-            raise RuntimeError(
-                "Browser login succeeded, but Instagram still rejected the "
-                "private-API session conversion for this account. The web "
-                "session is valid; instagrapi actions cannot be enabled until "
-                "Instagram accepts private-API access. Retries paused for 6 hours."
-            ) from exc
+            return {
+                "ok": True,
+                "mode": "browser_saved_private_blocked",
+                "browser_saved": True,
+                "private_api_ready": False,
+                "message": (
+                    "Browser login saved successfully. Instagram is still "
+                    "blocking private-API automation for this account."
+                ),
+            }
 
         message = str(exc)
         low = message.lower()
         if "429" in low or "too many requests" in low or "please wait" in low:
             set_auth_cooldown(username, minutes=360)
-            update_account_metric(
+            _activate_browser_native_mode(
                 username,
-                "status",
-                status="Browser OK / API Cooldown",
+                "Browser login saved; private API conversion is temporarily throttled.",
             )
-            raise RuntimeError(
-                "Browser login succeeded, but Instagram throttled the one "
-                "private-API conversion attempt. Retries paused for 6 hours."
-            ) from exc
+            return {
+                "ok": True,
+                "mode": "browser_saved_api_cooldown",
+                "browser_saved": True,
+                "private_api_ready": False,
+                "message": (
+                    "Browser login saved successfully. Instagram throttled the "
+                    "private-API conversion attempt; automation remains off."
+                ),
+            }
 
+        _activate_browser_native_mode(
+            username,
+            "Browser login saved; private API conversion failed.",
+        )
         update_account_metric(
             username,
-            "status",
-            status="Browser OK / Conversion Failed",
+            "add_history",
+            value=(
+                "💾 Browser session remains saved, but instagrapi conversion "
+                f"failed: {type(exc).__name__}: {message[:180]}"
+            ),
         )
-        raise RuntimeError(
-            "Browser login succeeded, but the browser session could not be "
-            f"converted into an instagrapi session: {message[:220]}"
-        ) from exc
+        return {
+            "ok": True,
+            "mode": "browser_saved_conversion_failed",
+            "browser_saved": True,
+            "private_api_ready": False,
+            "message": (
+                "Browser login saved, but it could not be converted into an "
+                "instagrapi session."
+            ),
+        }
 
     if not verify_authenticated_identity(cl, username, session_p):
         try:
             cl.logout()
         except Exception:
             pass
-        raise RuntimeError(
-            "Browser session converted, but Instagram authenticated a different account."
+        update_account_metric(
+            username,
+            "status",
+            status="Browser Saved / Identity Mismatch",
         )
+        return {
+            "ok": True,
+            "mode": "browser_saved_identity_mismatch",
+            "browser_saved": True,
+            "private_api_ready": False,
+            "message": (
+                "Browser login was saved, but the converted private session "
+                "did not verify as the configured account."
+            ),
+        }
 
     cl.dump_settings(session_p)
     patch_obsolete_qe_expose(cl, username)
+
+    capabilities = probe_browser_import_capabilities(
+        cl,
+        username,
+        conf,
+    )
+
+    if not capabilities.get("timeline"):
+        set_auth_cooldown(username, minutes=360)
+        update_account_metric(
+            username,
+            "status",
+            status="Browser Saved / Private API Blocked",
+        )
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "💾 Browser login/profile saved successfully. Identity conversion "
+                "succeeded, but Instagram still returned LoginRequired for a "
+                "core private timeline read. Browser login is preserved; "
+                "private-API automation remains OFF."
+            ),
+        )
+
+        _activate_browser_native_mode(
+            username,
+            "Browser identity is valid, but Instagram rejects the private timeline endpoint. "
+            "Follow, Engage, and Post will use Instagram Web.",
+        )
+
+        return {
+            "ok": True,
+            "mode": "browser_saved_private_blocked",
+            "browser_saved": True,
+            "private_api_ready": False,
+            "capabilities": capabilities,
+            "message": (
+                "Browser login saved. Instagram Web is usable, but private-API "
+                "automation is still blocked for this account."
+            ),
+        }
+
+    capability_note = (
+        "private hashtag feed ready"
+        if capabilities.get("hashtag_private")
+        else (
+            "private hashtag feed blocked; GraphQL hashtag discovery available"
+            if capabilities.get("hashtag_graphql")
+            else "hashtag discovery unavailable"
+        )
+    )
+
+    _deactivate_browser_native_mode(username)
 
     with CONTROL_LOCK:
         CLIENT_CACHE[username] = cl
@@ -3705,18 +5314,30 @@ def _control_browser_login(username, timeout_seconds=600):
         LAST_DM_POLL.pop(username, None)
         AUTH_EVENT[username] = "browser_login_saved"
 
-    update_account_metric(username, "status", status="Connected / Auto Off")
+    update_account_metric(
+        username,
+        "status",
+        status="Connected / Auto Off",
+    )
     update_account_metric(
         username,
         "add_history",
         value=(
-            "🌐 Browser Login succeeded; browser session converted to "
-            "instagrapi and saved. Background automation remains OFF until "
-            "Start Automation is pressed."
+            "🌐 Browser Login saved and private-API readiness passed. "
+            f"Readiness probe: {capability_note}. Background automation "
+            "remains OFF until Start Automation is pressed."
         ),
     )
 
-    return {"ok": True, "mode": "browser_login"}
+    return {
+        "ok": True,
+        "mode": "browser_login",
+        "browser_saved": True,
+        "private_api_ready": True,
+        "capabilities": capabilities,
+        "message": "Browser login saved and private API automation is ready.",
+    }
+
 
 def _control_quick_login(username):
     """
@@ -3741,7 +5362,22 @@ def _control_quick_login(username):
 
     # This is the first Instagram network call after the user explicitly presses
     # Quick Login.
-    cl.get_timeline_feed()
+    try:
+        cl.get_timeline_feed()
+    except Exception as exc:
+        if is_login_required_error(exc):
+            stop_account_for_private_login_required(
+                username,
+                "Quick Login private timeline validation",
+                exc,
+                hours=6,
+            )
+            raise RuntimeError(
+                "Saved browser-imported session is still valid for Web, but "
+                "Instagram rejected the private timeline endpoint with "
+                "LoginRequired. Quick Login cannot enable automation yet."
+            ) from exc
+        raise
 
     if not verify_authenticated_identity(cl, username, session_p):
         raise RuntimeError(
@@ -3868,6 +5504,7 @@ def _control_disconnect(username):
 
     with CONTROL_LOCK:
         CLIENT_CACHE.pop(username, None)
+        BROWSER_NATIVE_ACCOUNTS.discard(username)
         CONTROL_DISCONNECTED_ACCOUNTS.add(username)
         CONTROL_PAUSED_ACCOUNTS.discard(username)
         CONTROL_FORCE_RUN.discard(username)
@@ -3926,23 +5563,47 @@ def _control_full_logout(username):
 
 def _control_pause(username, pause):
     """
-    Stop/start background automation. Instagram safety backoff cannot be manually
-    overridden until its timer expires.
+    Stop/start background automation for either instagrapi or Browser Mode.
+    Safety backoff cannot be manually overridden until its timer expires.
     """
     username = str(username or "").strip().lstrip("@")
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
-    if username in CONTROL_DISCONNECTED_ACCOUNTS or username not in CLIENT_CACHE:
-        raise RuntimeError("Account is disconnected. Log in first.")
+
+    connected = (
+        (
+            username in CLIENT_CACHE
+            and username not in CONTROL_DISCONNECTED_ACCOUNTS
+        )
+        or username in BROWSER_NATIVE_ACCOUNTS
+    )
+    if not connected:
+        raise RuntimeError(
+            "Account is disconnected. Use Quick Login or Browser Login first."
+        )
+
+    mode_label = (
+        "Browser Mode"
+        if username in BROWSER_NATIVE_ACCOUNTS
+        else "Connected"
+    )
 
     if pause:
         CONTROL_PAUSED_ACCOUNTS.add(username)
         CONTROL_FORCE_RUN.discard(username)
         NEXT_TASK_OVERRIDE.pop(username, None)
-        update_account_metric(username, "status", status="Connected / Auto Off")
         update_account_metric(
-            username, "add_history",
-            value="⏹️ Background automation stopped; account remains connected."
+            username,
+            "status",
+            status=f"{mode_label} / Auto Off",
+        )
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"⏹️ Background automation stopped; "
+                f"{mode_label} remains connected."
+            ),
         )
     else:
         state = get_account_safety_state(username)
@@ -3955,17 +5616,31 @@ def _control_pause(username, pause):
         cooldown = ACCOUNT_COOLDOWNS.get(username)
         if cooldown and datetime.now() < cooldown:
             raise RuntimeError(
-                f"Account cooldown is active until {cooldown.strftime('%Y-%m-%d %H:%M')}."
+                f"Account cooldown is active until "
+                f"{cooldown.strftime('%Y-%m-%d %H:%M')}."
             )
 
         CONTROL_PAUSED_ACCOUNTS.discard(username)
-        update_account_metric(username, "status", status="Connected / Auto On")
         update_account_metric(
-            username, "add_history",
-            value="▶️ Background automation started from Control Head."
+            username,
+            "status",
+            status=f"{mode_label} / Auto On",
+        )
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"▶️ Background automation started in {mode_label}."
+            ),
         )
 
-    return {"ok": True, "paused": pause, "auto_enabled": not pause}
+    return {
+        "ok": True,
+        "paused": pause,
+        "auto_enabled": not pause,
+        "browser_mode": username in BROWSER_NATIVE_ACCOUNTS,
+    }
+
 
 
 
@@ -3975,12 +5650,24 @@ def _control_queue_task(username, task):
 
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
-    if username in CONTROL_DISCONNECTED_ACCOUNTS or username not in CLIENT_CACHE:
-        raise RuntimeError("Account is disconnected. Quick Login first.")
+
+    connected = (
+        (
+            username in CLIENT_CACHE
+            and username not in CONTROL_DISCONNECTED_ACCOUNTS
+        )
+        or username in BROWSER_NATIVE_ACCOUNTS
+    )
+    if not connected:
+        raise RuntimeError(
+            "Account is disconnected. Use Quick Login or Browser Login first."
+        )
+
     state = get_account_safety_state(username)
     if state["active"]:
         raise RuntimeError(
-            f"Safety Backoff is active until {state['until']}: {state['reason'][:140]}"
+            f"Safety Backoff is active until {state['until']}: "
+            f"{state['reason'][:140]}"
         )
     if task not in allowed:
         raise ValueError(f"Unsupported task: {task}")
@@ -3990,10 +5677,23 @@ def _control_queue_task(username, task):
         CONTROL_FORCE_RUN.add(username)
 
     update_account_metric(
-        username, "add_history",
-        value=f"🎛️ Queued manual task: {task}"
+        username,
+        "add_history",
+        value=(
+            f"🎛️ Queued manual task: {task}"
+            + (
+                " (Browser Mode)"
+                if username in BROWSER_NATIVE_ACCOUNTS
+                else ""
+            )
+        ),
     )
-    return {"ok": True, "task": task}
+    return {
+        "ok": True,
+        "task": task,
+        "browser_mode": username in BROWSER_NATIVE_ACCOUNTS,
+    }
+
 
 
 def _control_send_dm(username, recipient, message):
@@ -4270,8 +5970,8 @@ function cardHtml(user,a){
       </div>
       <div class="small">
         Browser Login is preferred when Instagram Web works but Password Login returns
-        <code>needs_upgrade</code>. Complete all login/challenge steps manually in Chromium.
-        The bot then makes one session conversion attempt. Password/2FA are not saved.
+        <code>needs_upgrade</code>. Complete all login/challenge steps manually in Chromium. After login is detected, Chromium stays open for 90 seconds by default so you can click Instagram's Save login info prompt.
+        The bot then makes one session conversion attempt and tests private-API readiness. If Instagram blocks the private API, the account stays connected in Browser Mode. If only the private hashtag feed is blocked, Engage falls back to GraphQL discovery; writes still require Instagram to accept the authenticated private action. Password/2FA are not saved.
       </div>
     </div>
 
@@ -4467,11 +6167,15 @@ async function quickLogin(user){
 
 async function browserLogin(user){
   try{
-    toast(`Opening Instagram Browser Login for @${user}... Complete login in the Chromium window.`);
-    await api("browser_login",{username:user});
+    toast(`Opening Instagram Browser Login for @${user}... Complete login and any Save login info prompt in Chromium.`);
+    const result = await api("browser_login",{username:user});
     editing=false;
     await refreshNow(true);
-    toast(`@${user} browser session connected and saved.`);
+    if(result && result.private_api_ready === false){
+      toast(result.message || `@${user} browser login saved; private API automation is still blocked.`, true);
+    }else{
+      toast((result && result.message) || `@${user} browser login saved and automation is ready.`);
+    }
   }catch(e){
     await refreshNow(true);
     toast(e.message,true);
@@ -4885,6 +6589,7 @@ def main():
     CONTROL_ROSTER = active_roster
 
     CLIENT_CACHE.clear()
+    BROWSER_NATIVE_ACCOUNTS.clear()
     CONTROL_DISCONNECTED_ACCOUNTS.clear()
     CONTROL_DISCONNECTED_ACCOUNTS.update(active_roster.keys())
     CONTROL_PAUSED_ACCOUNTS.clear()
@@ -4896,7 +6601,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — browser bootstrap login: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — browser native fallback: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {MEDIA_ROOT}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
@@ -4918,9 +6623,14 @@ def main():
 
             now_mono = time.monotonic()
             for current_user, conf in list(CONTROL_ROSTER.items()):
-                if current_user in CONTROL_DISCONNECTED_ACCOUNTS:
-                    continue
-                if current_user not in CLIENT_CACHE:
+                connected = (
+                    (
+                        current_user in CLIENT_CACHE
+                        and current_user not in CONTROL_DISCONNECTED_ACCOUNTS
+                    )
+                    or current_user in BROWSER_NATIVE_ACCOUNTS
+                )
+                if not connected:
                     continue
 
                 safety = get_account_safety_state(current_user)
