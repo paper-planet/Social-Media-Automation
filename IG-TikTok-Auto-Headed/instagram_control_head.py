@@ -134,6 +134,21 @@ DM_POLL_SECONDS = max(60, int(os.environ.get("IG_DM_POLL_SECONDS", "90")))
 WORKFLOW_SLEEP_MIN = max(DM_POLL_SECONDS, int(os.environ.get("IG_WORKFLOW_SLEEP_MIN", "420")))
 WORKFLOW_SLEEP_MAX = max(WORKFLOW_SLEEP_MIN, int(os.environ.get("IG_WORKFLOW_SLEEP_MAX", "1200")))
 OLLAMA_MODEL = os.environ.get("IG_OLLAMA_MODEL", "llama3.1").strip() or "llama3.1"
+
+
+BROWSER_AI_NAV_ENABLED = os.environ.get(
+    "IG_BROWSER_AI_NAV_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+BROWSER_AI_NAV_MODEL = (
+    os.environ.get("IG_BROWSER_AI_NAV_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
+)
+BROWSER_AI_NAV_TIMEOUT_SECONDS = max(
+    3, min(45, int(os.environ.get("IG_BROWSER_AI_NAV_TIMEOUT_SECONDS", "12")))
+)
+BROWSER_AI_NAV_MAX_STEPS = max(
+    1, min(5, int(os.environ.get("IG_BROWSER_AI_NAV_MAX_STEPS", "3")))
+)
+
 OLLAMA_VISION_MODEL = os.environ.get("IG_OLLAMA_VISION_MODEL", "").strip()
 VISION_MODEL_CACHE = {"checked": False, "name": ""}
 
@@ -3900,6 +3915,371 @@ def _browser_page_problem(page) -> str:
     return ""
 
 
+def _browser_saved_account_resume_visible(page, username: str) -> bool:
+    """Detect Instagram's saved-account/profile chooser for this exact account."""
+    username = str(username or "").strip().lstrip("@").lower()
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=1200) or "",
+        ).lower()
+    except Exception:
+        return False
+
+    return (
+        username in body
+        and "continue" in body
+        and (
+            "use another account" in body
+            or "use another profile" in body
+        )
+    )
+
+
+def _browser_visible_controls(page, limit: int = 32) -> list[str]:
+    """Collect visible control labels only; never collect form-field values."""
+    try:
+        items = page.locator(
+            "button, a, [role='button'], [role='menuitem']"
+        ).evaluate_all(
+            """(els) => els
+                .filter((e) => {
+                    const r = e.getBoundingClientRect();
+                    const s = window.getComputedStyle(e);
+                    return r.width > 0 && r.height > 0 &&
+                           s.visibility !== 'hidden' &&
+                           s.display !== 'none';
+                })
+                .map((e) => (
+                    e.getAttribute('aria-label') ||
+                    e.innerText ||
+                    e.textContent ||
+                    ''
+                ).trim())
+                .filter(Boolean)"""
+        )
+    except Exception:
+        return []
+
+    out = []
+    seen = set()
+    for item in items:
+        label = re.sub(r"\s+", " ", str(item or "")).strip()
+        if not label:
+            continue
+        key = label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(label[:120])
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _browser_safe_nav_snapshot(page, username: str) -> dict:
+    try:
+        url = str(page.url or "")
+    except Exception:
+        url = ""
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=1200) or "",
+        ).strip()
+    except Exception:
+        body = ""
+    return {
+        "username": str(username or "").strip().lstrip("@"),
+        "url": url[:500],
+        "page_text": body[:2200],
+        "visible_controls": _browser_visible_controls(page),
+    }
+
+
+def _browser_ai_nav_decision(page, username: str, reason: str = "") -> str:
+    """
+    Ask Ollama to choose exactly one pre-authorized, ordinary navigation action.
+    Ollama never supplies selectors, JavaScript, credentials, URLs, or arbitrary
+    clicks.
+    """
+    if not BROWSER_AI_NAV_ENABLED:
+        return "NONE"
+
+    snapshot = _browser_safe_nav_snapshot(page, username)
+    allowed = (
+        "CONTINUE_SAVED_ACCOUNT",
+        "DISMISS_NOT_NOW",
+        "CLOSE_DIALOG",
+        "GO_HOME",
+        "RELOAD",
+        "BACK",
+        "WAIT",
+        "MANUAL_REQUIRED",
+        "NONE",
+    )
+
+    prompt = f"""
+Classify this current Instagram Web page for a SAFE recovery helper.
+
+Configured account: @{snapshot['username']}
+Reason: {reason or '(none)'}
+URL: {snapshot['url']}
+
+Visible page text:
+{snapshot['page_text']}
+
+Visible controls:
+{json.dumps(snapshot['visible_controls'], ensure_ascii=False)}
+
+Return exactly ONE token:
+{", ".join(allowed)}
+
+Rules:
+- CONTINUE_SAVED_ACCOUNT only when Continue is visibly offered for the exact
+  configured saved profile/account.
+- DISMISS_NOT_NOW only for optional non-security prompts.
+- CLOSE_DIALOG only for an ordinary non-security modal.
+- GO_HOME, RELOAD, BACK, WAIT only for ordinary navigation/loading recovery.
+- MANUAL_REQUIRED for CAPTCHA, checkpoint/challenge, suspicious login,
+  password/2FA, identity verification, disabled/suspended account, rate limit,
+  restriction, or any security-sensitive page.
+- Never suggest bypassing a challenge, restriction, or security control.
+- NONE when no safe action is justified.
+
+Return the token only.
+""".strip()
+
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix=f"ig-nav-{username}",
+    )
+    try:
+        future = executor.submit(
+            ollama.chat,
+            model=BROWSER_AI_NAV_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Return one allowed action token only. "
+                        "Be conservative around account security."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            options={
+                "temperature": 0.0,
+                "top_p": 0.1,
+                "num_predict": 12,
+            },
+        )
+        response = future.result(timeout=BROWSER_AI_NAV_TIMEOUT_SECONDS)
+        raw = (
+            response.get("message", {}).get("content", "")
+            if isinstance(response, dict)
+            else getattr(getattr(response, "message", None), "content", "")
+        )
+        upper = str(raw or "").upper()
+        compact = re.sub(r"[^A-Z_]", "", upper.strip())
+        if compact in allowed:
+            return compact
+        for candidate in allowed:
+            if candidate in upper:
+                return candidate
+        return "NONE"
+    except FutureTimeoutError:
+        return "NONE"
+    except Exception:
+        return "NONE"
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+def _browser_execute_safe_nav_action(page, context, username: str, action: str) -> bool:
+    """Execute only the fixed safe-action allowlist."""
+    action = str(action or "").strip().upper()
+
+    if action == "CONTINUE_SAVED_ACCOUNT":
+        return _browser_resume_saved_account(page, context, username)
+
+    if action == "DISMISS_NOT_NOW":
+        clicked = _browser_click_text_button(
+            page,
+            r"^(Not Now|Not now)$",
+            timeout=4000,
+        )
+        if clicked:
+            page.wait_for_timeout(700)
+        return clicked
+
+    if action == "CLOSE_DIALOG":
+        clicked = _browser_click_text_button(
+            page,
+            r"^Close$",
+            timeout=3500,
+        )
+        if not clicked:
+            try:
+                svg = page.locator("svg[aria-label='Close']").first
+                if svg.count() and svg.is_visible(timeout=500):
+                    _browser_clickable_from_svg(svg).click(timeout=3500)
+                    clicked = True
+            except Exception:
+                pass
+        if clicked:
+            page.wait_for_timeout(600)
+        return clicked
+
+    if action == "GO_HOME":
+        try:
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(900)
+            return True
+        except Exception:
+            return False
+
+    if action == "RELOAD":
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(900)
+            return True
+        except Exception:
+            return False
+
+    if action == "BACK":
+        try:
+            page.go_back(wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(700)
+            return True
+        except Exception:
+            return False
+
+    if action == "WAIT":
+        try:
+            page.wait_for_timeout(1500)
+            return True
+        except Exception:
+            return False
+
+    return False
+
+
+def _browser_safe_recover_page(
+    page,
+    context,
+    username: str,
+    reason: str = "",
+    *,
+    max_steps: int | None = None,
+) -> bool:
+    """
+    Recover ordinary UI/navigation interruptions without bypassing security,
+    challenges, CAPTCHAs, restrictions, disabled-account states, or rate limits.
+    """
+    username = str(username or "").strip().lstrip("@")
+    max_steps = (
+        BROWSER_AI_NAV_MAX_STEPS
+        if max_steps is None
+        else max(1, min(5, int(max_steps)))
+    )
+
+    for step in range(1, max_steps + 1):
+        problem = _browser_page_problem(page)
+        if problem:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🛑 Adaptive browser recovery stopped for manual attention: "
+                    f"{problem}"
+                ),
+            )
+            return False
+
+        if _browser_page_authenticated(page, username):
+            return True
+
+        if _browser_saved_account_resume_visible(page, username):
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"👤 Adaptive recovery detected Instagram's saved-profile "
+                    f"Continue screen for @{username}."
+                ),
+            )
+            _browser_resume_saved_account(page, context, username)
+            if _browser_page_authenticated(page, username):
+                return True
+            page.wait_for_timeout(700)
+            continue
+
+        transient = _browser_transient_load_error(page)
+        if transient:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"🔄 Adaptive recovery: transient Instagram error "
+                    f"'{transient}', reloading."
+                ),
+            )
+            _browser_execute_safe_nav_action(
+                page, context, username, "RELOAD"
+            )
+            continue
+
+        action = _browser_ai_nav_decision(
+            page,
+            username,
+            reason=reason,
+        )
+
+        if action == "MANUAL_REQUIRED":
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🛑 Ollama classified the page as security-sensitive/manual. "
+                    "No automatic click was made."
+                ),
+            )
+            return False
+
+        if action in {"NONE", ""}:
+            return False
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🤖 Ollama browser recovery step {step}/{max_steps}: {action}"
+            ),
+        )
+
+        if not _browser_execute_safe_nav_action(
+            page,
+            context,
+            username,
+            action,
+        ):
+            return False
+
+        if _browser_page_authenticated(page, username):
+            return True
+
+    return _browser_page_authenticated(page, username)
+
 def _browser_page_authenticated(page, username: str) -> bool:
     """
     Determine whether the CURRENT live Instagram page looks authenticated.
@@ -3934,12 +4314,9 @@ def _browser_page_authenticated(page, username: str) -> bool:
     except Exception:
         body = ""
 
-    # Saved-account chooser is not authenticated yet.
-    if (
-        username.lower() in body
-        and "use another account" in body
-        and "continue" in body
-    ):
+    # Saved-account chooser is not authenticated yet. Instagram currently
+    # uses both "Use another account" and "Use another profile".
+    if _browser_saved_account_resume_visible(page, username):
         return False
 
     # Strong positive UI signals from the authenticated Instagram shell.
@@ -3986,51 +4363,24 @@ def _browser_page_authenticated(page, username: str) -> bool:
 
 def _browser_resume_saved_account(page, context, username: str) -> bool:
     """
-    Handle Instagram Web's saved-account resume screen:
-
-        <username>
-        Continue
-        Use another account
-
-    This is not a security/challenge bypass. It only selects the configured
-    saved account when Instagram explicitly presents that account on its normal
-    resume-login screen.
+    Handle Instagram's normal saved-account/profile chooser for the exact
+    configured account. Supports both "Use another account" and
+    "Use another profile".
     """
     username = str(username or "").strip().lstrip("@")
-    username_lower = username.lower()
-
-    try:
-        body = re.sub(
-            r"\s+",
-            " ",
-            page.locator("body").inner_text(timeout=1500) or "",
-        ).strip()
-    except Exception:
-        return False
-
-    body_lower = body.lower()
-
-    # Be conservative: only act on the saved-account chooser when the exact
-    # configured username AND "Use another account" are both visible.
-    if username_lower not in body_lower:
-        return False
-    if "use another account" not in body_lower:
-        return False
-    if "continue" not in body_lower:
+    if not _browser_saved_account_resume_visible(page, username):
         return False
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            f"👤 Instagram presented the saved-account resume screen for "
-            f"@{username}; selecting Continue..."
+            f"👤 Instagram presented the saved-account/profile Continue "
+            f"screen for @{username}; selecting Continue..."
         ),
     )
 
     clicked = False
-
-    # Prefer an explicit "Continue as <username>" button if Instagram uses it.
     patterns = (
         rf"^Continue as\s+@?{re.escape(username)}$",
         rf"^Continue as\s+{re.escape(username)}$",
@@ -4043,15 +4393,13 @@ def _browser_resume_saved_account(page, context, username: str) -> bool:
                 "button",
                 name=re.compile(pattern, re.I),
             ).first
-
-            if candidate.count() and candidate.is_visible(timeout=600):
+            if candidate.count() and candidate.is_visible(timeout=700):
                 candidate.click(timeout=5000)
                 clicked = True
                 break
         except Exception:
             pass
 
-    # Some Instagram layouts render Continue as a div/link instead of button.
     if not clicked:
         for pattern in patterns:
             try:
@@ -4059,8 +4407,7 @@ def _browser_resume_saved_account(page, context, username: str) -> bool:
                     re.compile(pattern, re.I),
                     exact=True,
                 ).first
-
-                if candidate.count() and candidate.is_visible(timeout=600):
+                if candidate.count() and candidate.is_visible(timeout=700):
                     candidate.click(timeout=5000)
                     clicked = True
                     break
@@ -4072,239 +4419,85 @@ def _browser_resume_saved_account(page, context, username: str) -> bool:
             username,
             "add_history",
             value=(
-                "⚠️ Saved-account resume screen detected, but the Continue "
-                "control could not be located."
+                "⚠️ Saved-profile resume screen detected, but Continue "
+                "could not be located."
             ),
         )
         return False
 
-    # Give Instagram time to exchange the saved-account state for a normal
-    # authenticated Web session.
     try:
-        page.wait_for_load_state(
-            "domcontentloaded",
-            timeout=15000,
-        )
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
     except Exception:
         pass
 
-    page.wait_for_timeout(1800)
-
-    # Instagram's SPA can show its transient error immediately after Continue.
-    if _browser_transient_load_error(page):
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🔄 Instagram showed a transient page error after Continue; "
-                "performing a normal browser reload..."
-            ),
-        )
-        try:
-            page.reload(
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            page.wait_for_timeout(1400)
-        except Exception:
-            pass
-
-    if (
-        _browser_context_logged_in(context)
-        or _browser_page_authenticated(page, username)
-    ):
-        _browser_refresh_saved_sessionid(
-            context,
-            username,
-        )
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                f"✅ Continue succeeded; live Chromium is authenticated as "
-                f"@{username}."
-            ),
-        )
-        return True
-
-    # Cookie/UI shell can appear just after the initial navigation.
-    deadline = time.time() + 8
+    deadline = time.time() + 12
     while time.time() < deadline:
-        if (
-            _browser_context_logged_in(context)
-            or _browser_page_authenticated(page, username)
-        ):
-            _browser_refresh_saved_sessionid(
-                context,
-                username,
-            )
+        page.wait_for_timeout(500)
+
+        if _browser_page_problem(page):
+            return False
+
+        if _browser_page_authenticated(page, username):
+            _browser_refresh_saved_sessionid(context, username)
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    f"✅ Continue succeeded; live Chromium is authenticated as "
-                    f"@{username}."
+                    f"✅ Continue succeeded; live Chromium reached the "
+                    f"authenticated Instagram shell for @{username}."
                 ),
             )
             return True
-        page.wait_for_timeout(500)
+
+        if not _browser_saved_account_resume_visible(page, username):
+            # Page advanced. The caller/adaptive agent can classify the new state.
+            return True
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            "⚠️ Continue was clicked, but Instagram did not create an "
-            "authenticated Web session."
+            "⚠️ Continue was clicked, but Instagram remained on the "
+            "saved-profile chooser for 12s."
         ),
     )
     return False
 
+
 def _browser_check_ready(page, context, username: str) -> None:
     """
     Validate Browser Mode against the actual live Instagram page.
-
-    For a live CDP browser, the visible page state is checked before cookie /
-    storage-state fallbacks. Saved-account Continue and transient load errors
-    are handled, but security/challenge prompts are never bypassed.
+    Ordinary navigation hurdles use the safe adaptive recovery layer.
     """
     username = str(username or "").strip().lstrip("@")
 
-    # If Instagram presents the normal saved-account chooser, resume only the
-    # exact configured account.
-    _browser_resume_saved_account(
+    if _browser_page_authenticated(page, username):
+        _browser_refresh_saved_sessionid(context, username)
+        return
+
+    recovered = _browser_safe_recover_page(
         page,
         context,
         username,
+        reason="Browser Mode authentication/readiness check",
     )
 
-    # If the actual live page already shows Instagram's authenticated shell,
-    # accept it even if sessionid visibility is lagging or absent.
-    if _browser_page_authenticated(page, username):
-        _browser_refresh_saved_sessionid(
-            context,
-            username,
-        )
+    if recovered and _browser_page_authenticated(page, username):
+        _browser_refresh_saved_sessionid(context, username)
         return
 
-    transient = _browser_transient_load_error(page)
-    if transient:
+    problem = _browser_page_problem(page)
+    if problem:
+        CONTROL_PAUSED_ACCOUNTS.add(username)
         update_account_metric(
             username,
-            "add_history",
-            value=(
-                "🔄 Instagram Web showed a transient load error "
-                f"({transient}); performing a normal browser reload..."
-            ),
+            "status",
+            status="Browser Verification Needed",
         )
-
-        recovered = False
-        for attempt in range(1, 3):
-            try:
-                page.reload(
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.wait_for_timeout(1200)
-            except Exception:
-                pass
-
-            _browser_resume_saved_account(
-                page,
-                context,
-                username,
-            )
-
-            if (
-                _browser_page_authenticated(page, username)
-                or (
-                    not _browser_transient_load_error(page)
-                    and _browser_context_logged_in(context)
-                )
-            ):
-                recovered = True
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        f"✅ Instagram Web recovered after browser reload "
-                        f"(attempt {attempt})."
-                    ),
-                )
-                break
-
-        if not recovered and _browser_transient_load_error(page):
-            raise RuntimeError(
-                "Instagram Web is still showing its transient load-error screen "
-                "after two normal browser reloads. This is not treated as proof "
-                "of logout, suspension, or an IP ban."
-            )
-
-    # Re-check after reload/resume flow.
-    _browser_resume_saved_account(
-        page,
-        context,
-        username,
-    )
-    if _browser_page_authenticated(page, username):
-        _browser_refresh_saved_sessionid(
-            context,
-            username,
+        raise RuntimeError(
+            f"Instagram Web requires manual attention: {problem}. "
+            "Complete the prompt manually in the live Chromium window."
         )
-        return
-
-    # Live browser: do not mix in old saved-state/cookie restore when the exact
-    # already-open browser is attached. Inspect what Instagram is actually
-    # showing instead.
-    live_context = id(context) in LIVE_CDP_CONTEXT_IDS
-
-    if not live_context and not _browser_context_logged_in(context):
-        restored = False
-
-        if not _browser_storage_state_available(username):
-            restored = _restore_saved_browser_session(
-                context,
-                username,
-            )
-
-        if restored:
-            try:
-                page.goto(
-                    "https://www.instagram.com/",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.wait_for_timeout(1000)
-            except Exception:
-                pass
-
-            _browser_resume_saved_account(
-                page,
-                context,
-                username,
-            )
-
-    if (
-        _browser_context_logged_in(context)
-        or _browser_page_authenticated(page, username)
-    ):
-        problem = _browser_page_problem(page)
-        if problem:
-            CONTROL_PAUSED_ACCOUNTS.add(username)
-            update_account_metric(
-                username,
-                "status",
-                status="Browser Verification Needed",
-            )
-            raise RuntimeError(
-                f"Instagram Web requires manual attention: {problem}. "
-                "Complete the prompt manually in the live Chromium window."
-            )
-
-        _browser_refresh_saved_sessionid(
-            context,
-            username,
-        )
-        return
 
     try:
         body = re.sub(
@@ -4319,16 +4512,17 @@ def _browser_check_ready(page, context, username: str) -> None:
         username,
         "add_history",
         value=(
-            "⚠️ Live Instagram page is not authenticated yet. "
+            "⚠️ Adaptive browser recovery exhausted its safe actions. "
             f"Current URL={str(page.url or '')[:160]} | "
-            f"page text={body[:180]}"
+            f"page text={body[:220]}"
         ),
     )
 
     raise RuntimeError(
-        "The live Instagram Chromium window is not authenticated yet. "
-        "Finish Browser Login in that same window before running Post/Follow/Engage."
+        "The live Instagram page is not authenticated/ready after safe "
+        "adaptive recovery. Inspect the visible Chromium window."
     )
+
 
 
 
@@ -7205,19 +7399,22 @@ def _control_browser_login_impl(username, timeout_seconds=600):
         except Exception:
             pass
 
-        # If this live browser is already at Instagram's saved-account chooser,
-        # select the configured account before waiting for a new sessionid.
+        # Recover ordinary saved-profile / optional-prompt states before
+        # waiting for manual security-sensitive login work.
         try:
-            _browser_resume_saved_account(
+            _browser_safe_recover_page(
                 page,
                 context,
                 username,
+                reason="Browser Login initial page",
+                max_steps=2,
             )
         except Exception:
             pass
 
         deadline = time.time() + max(120, int(timeout_seconds))
         last_log = 0.0
+        last_adaptive_recovery = 0.0
 
         while time.time() < deadline:
             try:
@@ -7239,9 +7436,24 @@ def _control_browser_login_impl(username, timeout_seconds=600):
                 current_url = ""
 
             try:
-                _browser_resume_saved_account(page, context, username)
+                if _browser_saved_account_resume_visible(page, username):
+                    _browser_resume_saved_account(page, context, username)
             except Exception:
                 pass
+
+            now = time.time()
+            if now - last_adaptive_recovery >= 12:
+                try:
+                    _browser_safe_recover_page(
+                        page,
+                        context,
+                        username,
+                        reason="Browser Login waiting page",
+                        max_steps=2,
+                    )
+                except Exception:
+                    pass
+                last_adaptive_recovery = now
 
             live_authenticated = _browser_page_authenticated(page, username)
             if live_authenticated:
@@ -7286,6 +7498,7 @@ def _control_browser_login_impl(username, timeout_seconds=600):
 
         finish_deadline = time.time() + finish_seconds
         next_notice = time.time() + 30
+        next_finish_recovery = time.time()
 
         while time.time() < finish_deadline:
             try:
@@ -7303,6 +7516,19 @@ def _control_browser_login_impl(username, timeout_seconds=600):
             except Exception:
                 pass
 
+            if time.time() >= next_finish_recovery:
+                try:
+                    _browser_safe_recover_page(
+                        page,
+                        context,
+                        username,
+                        reason="Browser Login finishing prompts",
+                        max_steps=2,
+                    )
+                except Exception:
+                    pass
+                next_finish_recovery = time.time() + 8
+
             if time.time() >= next_notice:
                 remaining = max(0, int(finish_deadline - time.time()))
                 update_account_metric(
@@ -7313,6 +7539,34 @@ def _control_browser_login_impl(username, timeout_seconds=600):
                 next_notice = time.time() + 30
 
             page.wait_for_timeout(1000)
+
+        try:
+            _browser_safe_recover_page(
+                page,
+                context,
+                username,
+                reason="Browser Login final verification",
+                max_steps=3,
+            )
+        except Exception:
+            pass
+
+        if not _browser_page_authenticated(page, username):
+            problem = _browser_page_problem(page)
+            if problem:
+                update_account_metric(
+                    username,
+                    "status",
+                    status="Browser Verification Needed",
+                )
+                raise RuntimeError(
+                    f"Browser Login ended on a manual/security page: {problem}"
+                )
+            raise RuntimeError(
+                "Browser Login did not finish on Instagram's authenticated "
+                "Web shell. The live Chromium window was left open so you can "
+                "inspect the remaining page."
+            )
 
         _save_browser_sessionid(username, sessionid)
         _save_full_browser_storage_state(context, username)
@@ -8827,7 +9081,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Post Pipeline Optimization: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Adaptive Browser Agent: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
