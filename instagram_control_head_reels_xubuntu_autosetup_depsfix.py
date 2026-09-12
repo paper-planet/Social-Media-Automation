@@ -547,12 +547,20 @@ BROWSER_POST_AI_TIMEOUT_SECONDS = max(
     ),
 )
 BROWSER_POST_VISION_FRAMES = max(
-    3,
+    6,
     min(
-        5,
-        int(os.environ.get("IG_BROWSER_POST_VISION_FRAMES", "3")),
+        10,
+        int(os.environ.get("IG_BROWSER_POST_VISION_FRAMES", "8")),
     ),
 )
+
+# Ollama defaults to a 4096-token context on many local installs. Multimodal
+# requests consume context for image tokens as well as prompt text, so eight
+# chronological frames plus OCR/audio can exceed that default even when the
+# textual prompt is modest. Keep a bounded, user-overridable context instead
+# of letting Ollama reject the request at ~4k tokens.
+OLLAMA_VISION_CONTEXT = max(8192, min(32768, int(os.environ.get("IG_OLLAMA_VISION_CONTEXT", "16384"))))
+OLLAMA_TEXT_CONTEXT = max(4096, min(16384, int(os.environ.get("IG_OLLAMA_TEXT_CONTEXT", "8192"))))
 
 WORKFLOW_RETRY_IDLE_SECONDS = max(15, int(os.environ.get("IG_WORKFLOW_RETRY_IDLE_SECONDS", "45")))
 
@@ -1472,6 +1480,7 @@ def _ollama_generate(
                     username,
                     temperature=0.82,
                     top_p=0.90,
+                    num_ctx=OLLAMA_TEXT_CONTEXT,
                 ),
             )
             candidate = _clean_ollama_output(
@@ -1791,6 +1800,51 @@ def _image_text_views(image_path, text_heavy=False):
         return [image_path]
 
 
+def _compact_prompt_text(value, max_chars=6000):
+    """Keep beginning/middle/end evidence while bounding local-model prompts."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    max_chars = max(500, int(max_chars or 6000))
+    if len(text) <= max_chars:
+        return text
+
+    # Preserve the opening setup and ending/outcome, plus a middle sample.
+    first = int(max_chars * 0.45)
+    middle = int(max_chars * 0.20)
+    last = max_chars - first - middle
+    mid_start = max(first, (len(text) // 2) - (middle // 2))
+    return (
+        text[:first].rstrip()
+        + " … [middle excerpt] … "
+        + text[mid_start:mid_start + middle].strip()
+        + " … [ending excerpt] … "
+        + text[-last:].lstrip()
+    )[:max_chars]
+
+
+def _strip_edge_quote_artifacts(value):
+    """Remove accidental model-formatting quotes without touching internal quotes."""
+    text = str(value or "").strip()
+    if not text:
+        return text
+
+    # Fully wrapped model output: "caption" or “caption”.
+    pairs = (("\"", "\""), ("“", "”"))
+    for left, right in pairs:
+        if text.startswith(left) and text.endswith(right) and len(text) > 2:
+            text = text[1:-1].strip()
+            break
+
+    # A common local-model artifact is one unmatched closing quote after the
+    # final sentence. Strip only when there is no matching opening edge quote.
+    if text.endswith(("\"", "”")):
+        ascii_unbalanced = text.endswith('"') and text.count('"') % 2 == 1
+        curly_unbalanced = text.endswith('”') and text.count('“') < text.count('”')
+        if ascii_unbalanced or curly_unbalanced:
+            text = text[:-1].rstrip()
+
+    return text
+
+
 def analyze_media_for_caption(
     media_files,
     sidecar_text="",
@@ -1814,7 +1868,10 @@ def analyze_media_for_caption(
 
     if video:
         try:
-            visual_files=extract_video_story_frames(video,max(12, int(frame_count or 12)))
+            # Eight well-spaced frames cover substantially more of the upload
+            # than the old 3-frame path while leaving context room for real audio.
+            sample_count=max(6, min(10, int(frame_count or 8)))
+            visual_files=extract_video_story_frames(video,sample_count)
         except Exception:
             visual_files=[]
         # For our own upload files we have the original media locally, so use it:
@@ -1859,7 +1916,11 @@ def analyze_media_for_caption(
 
     if vision_model and visual_files:
         if media_kind=="video":
-            transcript_block = audio_transcript[:10000] if audio_transcript else "(No reliable local speech transcript was recovered.)"
+            transcript_block = (
+                _compact_prompt_text(audio_transcript, 6000)
+                if audio_transcript
+                else "(No reliable local speech transcript was recovered.)"
+            )
             prompt = f"""
 These images are chronological frames sampled across ONE social-media video.
 Study ALL frames from earliest to latest and combine them with the actual local
@@ -1889,7 +1950,11 @@ Rules:
 - Do not introduce trading or another topic unless the actual media supports it.
 """.strip()
         else:
-            ocr_block = ocr_text if ocr_text else "(Local OCR found no reliable text.)"
+            ocr_block = (
+                _compact_prompt_text(ocr_text, 7000)
+                if ocr_text
+                else "(Local OCR found no reliable text.)"
+            )
             prompt = f"""
 Analyze this ONE social-media image for caption writing. The original image and any following images are enlarged/overlapping crops of the SAME image, not separate scenes.
 
@@ -1924,9 +1989,13 @@ Rules:
                     "images":[str(p) for p in visual_files],
                 }],
                 options={
-                    "temperature":0.08,
-                    "top_p":0.75,
-                    "num_predict":700 if media_kind=="image" else 500,
+                    **_ollama_hybrid_options(
+                        account_username,
+                        temperature=0.08,
+                        top_p=0.75,
+                        num_predict=700 if media_kind=="image" else 500,
+                        num_ctx=OLLAMA_VISION_CONTEXT,
+                    ),
                 },
             )
             raw=str(
@@ -1954,11 +2023,11 @@ Rules:
     if audio_transcript:
         pieces.append(
             "LOCAL AUDIO TRANSCRIPT FROM THE UPLOAD "
-            f"({audio_backend or 'local Whisper'}):\n" + audio_transcript
+            f"({audio_backend or 'local Whisper'}):\n" + _compact_prompt_text(audio_transcript, 8000)
         )
     if ocr_text:
         pieces.append(
-            "LOCAL OCR — VISIBLE TEXT IN THE UPLOADED IMAGE:\n" + ocr_text
+            "LOCAL OCR — VISIBLE TEXT IN THE UPLOADED IMAGE:\n" + _compact_prompt_text(ocr_text, 8000)
         )
     if visual_description:
         pieces.append("VISION INTERPRETATION:\n"+visual_description)
@@ -9795,6 +9864,7 @@ def _ollama_hybrid_options(
     temperature: float,
     top_p: float,
     num_predict: int | None = None,
+    num_ctx: int | None = None,
 ) -> dict:
     """
     Request partial GPU offload plus explicit CPU threads.
@@ -9822,6 +9892,8 @@ def _ollama_hybrid_options(
 
     if num_predict is not None:
         options["num_predict"] = int(num_predict)
+    if num_ctx is not None:
+        options["num_ctx"] = int(num_ctx)
 
     return options
 
@@ -15601,6 +15673,7 @@ def _browser_extract_caption_from_ai(raw: str) -> str:
             lines.append(stripped)
 
     cleaned = " ".join(lines).strip()
+    cleaned = _strip_edge_quote_artifacts(cleaned)
     return _browser_strip_caption_labels(cleaned)
 
 
@@ -15826,6 +15899,7 @@ def _browser_fallback_caption(
         max(20, total_limit - len(tag_line) - 2),
     )
 
+    caption = _strip_edge_quote_artifacts(caption)
     final_caption = _browser_strip_caption_labels(
         f"{caption}\n\n{tag_line}".strip()
     )
@@ -15866,6 +15940,7 @@ def _browser_generate_post_caption(username, selection):
             source_account=selection["folder"].get("source", ""),
             frame_count=frame_count,
             require_video_vision=settings["require_video_vision"],
+            account_username=username,
         )
     except Exception as exc:
         return _browser_fallback_caption(
@@ -15885,7 +15960,7 @@ def _browser_generate_post_caption(username, selection):
             analysis=analysis,
         )
 
-    semantic_context = str(analysis.get("context") or "").strip()
+    semantic_context = _compact_prompt_text(analysis.get("context") or "", 14000)
     perspective = str(analysis.get("perspective") or "UNKNOWN").upper()
 
     if perspective in {"POV_FIRST_PERSON", "SELFIE_VLOG"}:
@@ -15962,11 +16037,13 @@ Rules:
                 {"role": "system", "content": persona},
                 {"role": "user", "content": prompt},
             ],
-            options={
-                "temperature": 0.5,
-                "top_p": 0.85,
-                "num_predict": 220,
-            },
+            options=_ollama_hybrid_options(
+                username,
+                temperature=0.5,
+                top_p=0.85,
+                num_predict=220,
+                num_ctx=OLLAMA_TEXT_CONTEXT,
+            ),
         )
 
         raw = _clean_ollama_output(
@@ -16023,6 +16100,7 @@ Rules:
         max(20, char_limit - len(tag_line) - 2),
     )
 
+    caption = _strip_edge_quote_artifacts(caption)
     final_caption = _browser_strip_caption_labels(
         f"{caption}\n\n{tag_line}".strip()
     )
