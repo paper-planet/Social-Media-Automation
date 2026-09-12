@@ -39,7 +39,7 @@ _DEFAULT_IG_ROOT = Path.home() / ".local" / "share" / "instagram_bot" / "data"
 _DOWNLOAD_OVERRIDE = os.environ.get("IG_DATA_ROOT", "").strip()
 DOWNLOAD_ROOT = Path(_DOWNLOAD_OVERRIDE).expanduser() if _DOWNLOAD_OVERRIDE else _DEFAULT_IG_ROOT
 ANALYTICS_FILE = DOWNLOAD_ROOT / "instagram_analytics.json"
-MEDIA_ROOT = Path(os.environ.get("IG_MEDIA_ROOT", str(Path.home() / "social-media-pool"))).expanduser()
+_DEFAULT_MEDIA_ROOT = Path(os.environ.get("IG_MEDIA_ROOT", str(Path.home() / "social-media-pool"))).expanduser()
 IG_HOST = "127.0.0.1"
 IG_PORT = int(os.environ.get("IG_PORT", "8081"))
 
@@ -143,6 +143,22 @@ GLOBAL_WRITE_MIN_GAP_SECONDS = max(8, int(os.environ.get("IG_GLOBAL_WRITE_MIN_GA
 WRITE_WINDOW_SECONDS = max(60, int(os.environ.get("IG_WRITE_WINDOW_SECONDS", "1200")))
 MAX_WRITES_PER_WINDOW = max(1, int(os.environ.get("IG_MAX_WRITES_PER_WINDOW", "6")))
 MAX_WRITES_PER_WORKFLOW = max(1, int(os.environ.get("IG_MAX_WRITES_PER_WORKFLOW", "3")))
+
+BROWSER_FOLLOW_MIN_GAP_SECONDS = max(
+    4,
+    min(
+        30,
+        int(os.environ.get("IG_BROWSER_FOLLOW_MIN_GAP_SECONDS", "8")),
+    ),
+)
+BROWSER_FOLLOW_VERIFY_SECONDS = max(
+    2,
+    min(
+        15,
+        int(os.environ.get("IG_BROWSER_FOLLOW_VERIFY_SECONDS", "5")),
+    ),
+)
+BROWSER_LAST_FOLLOW_ACTION = {}
 UPLOAD_COOLDOWN_SECONDS = max(300, int(os.environ.get("IG_UPLOAD_COOLDOWN_SECONDS", "2400")))
 DM_REPLY_COOLDOWN_SECONDS = max(30, int(os.environ.get("IG_DM_REPLY_COOLDOWN_SECONDS", "120")))
 DM_MIN_INCOMING_AGE_SECONDS = max(0, int(os.environ.get("IG_DM_MIN_INCOMING_AGE_SECONDS", "90")))
@@ -399,6 +415,196 @@ def ensure_data_root():
         ANALYTICS_FILE = fallback / "instagram_analytics.json"
         fallback.mkdir(parents=True, exist_ok=True)
 
+
+def _global_control_settings_path():
+    return DOWNLOAD_ROOT / "control_head_global_settings.json"
+
+
+def load_global_control_settings():
+    try:
+        path = _global_control_settings_path()
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_global_control_settings(data):
+    ensure_data_root()
+    path = _global_control_settings_path()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def get_media_root() -> Path:
+    data = load_global_control_settings()
+    raw = str(data.get("media_root", "") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return _DEFAULT_MEDIA_ROOT
+
+
+def media_root_payload():
+    root = get_media_root()
+    try:
+        resolved = root.resolve()
+    except Exception:
+        resolved = root
+
+    exists = resolved.exists()
+    is_dir = resolved.is_dir() if exists else False
+
+    child_folders = 0
+    try:
+        if is_dir:
+            child_folders = sum(
+                1
+                for item in resolved.iterdir()
+                if item.is_dir()
+            )
+    except Exception:
+        child_folders = 0
+
+    return {
+        "path": str(resolved),
+        "exists": bool(exists),
+        "is_dir": bool(is_dir),
+        "child_folders": int(child_folders),
+        "source": (
+            "saved"
+            if str(load_global_control_settings().get("media_root", "") or "").strip()
+            else "default"
+        ),
+    }
+
+
+def _control_set_media_root(path_value):
+    raw = str(path_value or "").strip().strip('"')
+    if not raw:
+        raise ValueError("Choose or enter a media folder path.")
+
+    root = Path(raw).expanduser()
+    try:
+        resolved = root.resolve()
+    except Exception:
+        resolved = root
+
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"Media folder does not exist: {resolved}"
+        )
+    if not resolved.is_dir():
+        raise ValueError(
+            f"Media path is not a folder: {resolved}"
+        )
+
+    data = load_global_control_settings()
+    data["media_root"] = str(resolved)
+    save_global_control_settings(data)
+
+    print(
+        f"📁 Instagram media root changed from Control Head -> {resolved}",
+        flush=True,
+    )
+
+    for username in CONTROL_ROSTER:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"📁 Media folder changed to: {resolved}",
+        )
+
+    return {
+        "ok": True,
+        "media": media_root_payload(),
+    }
+
+
+def _control_choose_media_root():
+    """
+    Open a native local folder picker on the computer running the bot.
+
+    This is intentionally local-only: the dashboard listens on 127.0.0.1.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError(
+            "Native folder picker is unavailable. Paste the folder path "
+            "into Media Library instead."
+        ) from exc
+
+    current = get_media_root()
+    initial = current if current.exists() else Path.home()
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        try:
+            root.update()
+        except Exception:
+            pass
+
+        chosen = filedialog.askdirectory(
+            parent=root,
+            initialdir=str(initial),
+            title="Choose Instagram media folder",
+            mustexist=True,
+        )
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    if not chosen:
+        return {
+            "ok": True,
+            "cancelled": True,
+            "media": media_root_payload(),
+        }
+
+    result = _control_set_media_root(chosen)
+    result["cancelled"] = False
+    return result
+
+
+def _control_open_media_root():
+    root = get_media_root()
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(
+            f"Configured media folder does not exist: {root}"
+        )
+
+    resolved = root.resolve()
+
+    if os.name == "nt":
+        os.startfile(str(resolved))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(resolved)])
+    else:
+        subprocess.Popen(["xdg-open", str(resolved)])
+
+    return {
+        "ok": True,
+        "folder": str(resolved),
+    }
 
 def _control_settings_path():
     return DOWNLOAD_ROOT / "control_head_settings.json"
@@ -701,20 +907,37 @@ def save_analytics(data):
 def update_account_metric(username, key, value=None, increment=1, status=None):
     db = load_analytics()
     if username in db:
-        if status: db[username]["status"] = status
-        if key in ["total_posts", "total_follows", "total_likes"]: db[username][key] += increment
-        elif key == "cooldown_until": db[username][key] = str(value)
+        if status:
+            db[username]["status"] = status
+        if key in ["total_posts", "total_follows", "total_likes"]:
+            db[username][key] += increment
+        elif key == "cooldown_until":
+            db[username][key] = str(value)
         elif key == "add_history":
-            db[username]["history_log"].insert(0, f"[{datetime.now().strftime('%H:%M:%S')}] {value}")
+            stamp = datetime.now().strftime("%H:%M:%S")
+            message = str(value)
+            db[username]["history_log"].insert(0, f"[{stamp}] {message}")
             db[username]["history_log"] = db[username]["history_log"][:15]
+
+            # Browser Mode previously only wrote progress to the dashboard,
+            # which made long AI/upload steps look frozen in the console.
+            try:
+                print(f"[{stamp}] @{username}: {message}", flush=True)
+            except Exception:
+                pass
+
         elif key == "sync_followers":
             today = datetime.now().strftime("%Y-%m-%d")
             timeline = db[username]["growth_timeline"]
-            if timeline and timeline[-1]["date"] == today: timeline[-1]["followers"] = value
+            if timeline and timeline[-1]["date"] == today:
+                timeline[-1]["followers"] = value
             else:
                 timeline.append({"date": today, "followers": value})
-                if len(timeline) > 30: timeline.pop(0)
+                if len(timeline) > 30:
+                    timeline.pop(0)
+
     save_analytics(db)
+
 
 def load_json(filepath, default_data):
     p = DOWNLOAD_ROOT / filepath if not Path(filepath).is_absolute() else Path(filepath)
@@ -1686,19 +1909,49 @@ def get_authenticated_client(username, conf):
 
 
 def discover_local_media_folders():
+    """
+    Discover immediate child folders inside the Media Library root.
+
+    Each child folder is treated as one source/post bundle by the existing
+    uploader. Changing the Hub media folder takes effect on the next worker run.
+    """
     all_folders = []
-    if not MEDIA_ROOT.exists():
+    media_root = get_media_root()
+
+    if not media_root.exists() or not media_root.is_dir():
+        print(
+            f"⚠️ Media folder does not exist: {media_root}",
+            flush=True,
+        )
         return all_folders
+
     try:
-        for item in MEDIA_ROOT.iterdir():
+        for item in media_root.iterdir():
             if not item.is_dir():
                 continue
-            parts = item.name.split('_', 2)
-            source = parts[1] if len(parts) > 1 and parts[1] else item.name
-            all_folders.append({"id": item.name, "path": item, "source": source})
+
+            parts = item.name.split("_", 2)
+            source = (
+                parts[1]
+                if len(parts) > 1 and parts[1]
+                else item.name
+            )
+            all_folders.append(
+                {
+                    "id": item.name,
+                    "path": item,
+                    "source": source,
+                }
+            )
+
     except OSError as exc:
-        print(f"⚠️ Media folder scan failed: {exc}")
+        print(
+            f"⚠️ Media folder scan failed for {media_root}: {exc}",
+            flush=True,
+        )
+
     return all_folders
+
 
 
 
@@ -3519,6 +3772,10 @@ def _activate_browser_native_mode(username: str, reason: str = "") -> None:
         CONTROL_FORCE_RUN.discard(username)
         AUTH_EVENT[username] = "browser_native"
 
+        # Private-API auth cooldowns must not block Browser Mode. Browser Mode
+        # uses Instagram Web and has its own challenge/restriction detection.
+        ACCOUNT_COOLDOWNS.pop(username, None)
+
     update_account_metric(
         username,
         "status",
@@ -3697,9 +3954,283 @@ def _browser_collect_profile_media_links(page, username: str) -> set[str]:
         return set()
 
 
+def _browser_follow_debug_snapshot(page, username: str, label: str) -> None:
+    """
+    Save HTML + screenshot for Browser Follow selector/state debugging.
+    """
+    safe_user = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or "account"))
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(label or "follow"))
+    debug_dir = DOWNLOAD_ROOT / "browser_debug"
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = debug_dir / f"{safe_user}_{safe_label}_{stamp}"
+
+    try:
+        page.screenshot(
+            path=str(base.with_suffix(".png")),
+            full_page=True,
+        )
+    except Exception:
+        pass
+
+    try:
+        base.with_suffix(".html").write_text(
+            page.content(),
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        pass
+
+
+def _browser_wait_for_follow_gap(username: str) -> bool:
+    """
+    Short Browser-Mode Follow gap. This intentionally does not inherit the old
+    40-second instagrapi/API action gap.
+
+    Genuine safety backoff still blocks the action.
+    """
+    state = get_account_safety_state(username)
+    if state["active"]:
+        return False
+
+    deadline = time.monotonic() + 60
+
+    while time.monotonic() < deadline:
+        last = float(BROWSER_LAST_FOLLOW_ACTION.get(username, 0.0) or 0.0)
+        elapsed = time.monotonic() - last
+        remaining = BROWSER_FOLLOW_MIN_GAP_SECONDS - elapsed
+
+        if remaining <= 0:
+            return True
+
+        time.sleep(min(0.5, max(0.1, remaining)))
+
+    return False
+
+
+def _browser_candidate_row(root, candidate_name: str):
+    """
+    Re-query the live follower/following row by username after Instagram rerenders.
+    """
+    username = str(candidate_name or "").strip().lstrip("@")
+    if not username:
+        return None
+
+    selectors = (
+        f"a[href='/{username}/']",
+        f"a[href='/{username}']",
+        f"a[href*='/{username}/']",
+    )
+
+    for selector in selectors:
+        try:
+            links = root.locator(selector)
+            for i in range(min(links.count(), 8)):
+                link = links.nth(i)
+                if not link.is_visible(timeout=200):
+                    continue
+
+                # Walk upward until we reach the smallest container that also
+                # contains a button for this user.
+                for depth in range(1, 8):
+                    try:
+                        row = link.locator(
+                            f"xpath=ancestor::div[{depth}]"
+                        )
+                        if row.count() and row.locator("button").count():
+                            return row
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return None
+
+
+def _browser_row_follow_state(root, candidate_name: str) -> tuple[str, str]:
+    """
+    Return (state, detail) where state is one of:
+      following, requested, follow, ambiguous
+    """
+    row = _browser_candidate_row(root, candidate_name)
+    if row is None:
+        return "ambiguous", "candidate row not found"
+
+    texts = []
+    try:
+        buttons = row.locator("button")
+        for i in range(min(buttons.count(), 8)):
+            try:
+                value = re.sub(
+                    r"\s+",
+                    " ",
+                    buttons.nth(i).inner_text(timeout=500) or "",
+                ).strip()
+            except Exception:
+                value = ""
+            if value:
+                texts.append(value)
+
+                if re.fullmatch(r"Following", value, re.I):
+                    return "following", value
+                if re.fullmatch(r"Requested", value, re.I):
+                    return "requested", value
+
+    except Exception:
+        pass
+
+    if any(re.fullmatch(r"Follow", value, re.I) for value in texts):
+        return "follow", " | ".join(texts[:8])
+
+    return "ambiguous", " | ".join(texts[:8])
+
+
+def _browser_verify_follow_profile(
+    context,
+    candidate_name: str,
+    timeout_seconds: int = 6,
+) -> tuple[bool | None, str]:
+    """
+    Secondary verification for an ambiguous/stale followers-dialog row.
+
+    This only reads the candidate's Instagram Web profile. It does not click.
+    """
+    username = str(candidate_name or "").strip().lstrip("@")
+    if not username or username == "candidate":
+        return None, "username unavailable"
+
+    probe = None
+    deadline = time.time() + max(3, int(timeout_seconds))
+    saw_follow = False
+    last_text = ""
+
+    try:
+        probe = context.new_page()
+        probe.goto(
+            f"https://www.instagram.com/{username}/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        probe.wait_for_timeout(900)
+
+        while time.time() < deadline:
+            problem = _browser_page_problem(probe)
+            if problem:
+                return None, f"profile check interrupted: {problem}"
+
+            try:
+                buttons = probe.get_by_role(
+                    "button",
+                    name=re.compile(
+                        r"^(Follow|Following|Requested)$",
+                        re.I,
+                    ),
+                )
+                for i in range(min(buttons.count(), 8)):
+                    btn = buttons.nth(i)
+                    if not btn.is_visible(timeout=200):
+                        continue
+
+                    value = re.sub(
+                        r"\s+",
+                        " ",
+                        btn.inner_text(timeout=500) or "",
+                    ).strip()
+                    if not value:
+                        continue
+
+                    last_text = value
+
+                    if re.fullmatch(r"Following", value, re.I):
+                        return True, "Following"
+                    if re.fullmatch(r"Requested", value, re.I):
+                        return True, "Requested"
+                    if re.fullmatch(r"Follow", value, re.I):
+                        saw_follow = True
+            except Exception:
+                pass
+
+            probe.wait_for_timeout(600)
+
+        if saw_follow:
+            return False, last_text or "Follow"
+
+        return None, last_text or "relationship button not found"
+
+    except Exception as exc:
+        return None, (
+            f"profile verification error: "
+            f"{type(exc).__name__}: {str(exc)[:120]}"
+        )
+
+    finally:
+        if probe is not None:
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+
+def _browser_wait_for_follow_confirmation(
+    page,
+    context,
+    root,
+    candidate_name: str,
+) -> tuple[bool | None, str]:
+    """
+    Verify a Follow by re-querying the LIVE row instead of reading the stale
+    Locator that was clicked before Instagram rerendered.
+
+    Returns:
+      True  -> Following / Requested confirmed
+      False -> both popup and profile explicitly still show Follow
+      None  -> ambiguous; not counted as success or failure
+    """
+    deadline = time.time() + BROWSER_FOLLOW_VERIFY_SECONDS
+    last_state = "ambiguous"
+    last_detail = ""
+
+    while time.time() < deadline:
+        state, detail = _browser_row_follow_state(
+            root,
+            candidate_name,
+        )
+        last_state = state
+        last_detail = detail
+
+        if state in {"following", "requested"}:
+            return True, detail
+
+        page.wait_for_timeout(400)
+
+    profile_ok, profile_detail = _browser_verify_follow_profile(
+        context,
+        candidate_name,
+        timeout_seconds=6,
+    )
+
+    if profile_ok is True:
+        return True, f"profile:{profile_detail}"
+
+    if profile_ok is False and last_state == "follow":
+        return False, (
+            f"popup:{last_detail or 'Follow'}; "
+            f"profile:{profile_detail or 'Follow'}"
+        )
+
+    return None, (
+        f"popup:{last_detail or last_state}; "
+        f"profile:{profile_detail or 'ambiguous'}"
+    )
+
 def _browser_follow_network(username, history, config, manual=False) -> int:
     settings = get_account_control_settings(username, config)
-    if not settings.get("enable_follow", False):
+    if not manual and not settings.get("enable_follow", False):
         return 0
 
     targets = settings["target_accounts"] or list(
@@ -3720,29 +4251,42 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
 
     limit = min(
         int(settings.get("follow_limit", 1)),
-        int(settings.get("max_writes_per_workflow", MAX_WRITES_PER_WORKFLOW)),
+        int(settings.get(
+            "max_writes_per_workflow",
+            MAX_WRITES_PER_WORKFLOW,
+        )),
     )
     limit = max(1, limit)
 
     update_account_metric(
         username,
         "add_history",
-        value=f"🌐 Browser Follow: @{target} {source}; target={limit}",
+        value=(
+            f"🌐 Browser Follow: @{target} {source}; "
+            f"hard request cap={limit}; "
+            f"browser gap≈{BROWSER_FOLLOW_MIN_GAP_SECONDS}s"
+        ),
     )
 
-    followed = 0
-    attempted = set()
+    confirmed_count = 0
+    attempt_count = 0
+    attempted_users = set()
 
     with sync_playwright() as p:
-        context = _browser_launch(p, username)
+        context = _browser_launch(
+            p,
+            username,
+            headed=True if manual else None,
+        )
         page = context.pages[0] if context.pages else context.new_page()
+
         try:
             page.goto(
                 f"https://www.instagram.com/{target}/",
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
-            page.wait_for_timeout(1300)
+            page.wait_for_timeout(1200)
             _browser_check_ready(page, context, username)
 
             href = f"/{target}/{source}/"
@@ -3751,22 +4295,29 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                 trigger = page.locator(
                     f"a[href*='/{target}/{source}/']"
                 ).first
-            if not trigger.count():
-                _browser_click_text_button(
-                    page,
-                    rf"^{source}$",
-                )
-            else:
-                trigger.click(timeout=5000)
 
-            page.wait_for_timeout(1200)
+            if trigger.count():
+                trigger.click(timeout=5000)
+            elif not _browser_click_text_button(
+                page,
+                rf"^{source}$",
+            ):
+                raise RuntimeError(
+                    f"Could not open @{target}'s {source} list."
+                )
+
+            page.wait_for_timeout(1100)
             _browser_check_ready(page, context, username)
 
             dialog = page.locator("[role='dialog']").last
             root = dialog if dialog.count() else page
 
             idle_rounds = 0
-            while followed < limit and idle_rounds < 8:
+
+            # HARD CAP IS ATTEMPTS, NOT CONFIRMATIONS.
+            while attempt_count < limit and idle_rounds < 8:
+                _browser_check_ready(page, context, username)
+
                 buttons = root.get_by_role(
                     "button",
                     name=re.compile(r"^Follow$", re.I),
@@ -3776,37 +4327,57 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                 candidate = None
                 candidate_name = ""
 
-                for i in range(min(count, 30)):
+                for i in range(min(count, 40)):
                     button = buttons.nth(i)
+
                     try:
                         if not button.is_visible(timeout=200):
                             continue
                     except Exception:
                         continue
 
-                    row = button.locator("xpath=ancestor::div[.//a][1]")
+                    row = button.locator(
+                        "xpath=ancestor::div[.//a][1]"
+                    )
+
                     hrefs = []
                     try:
-                        hrefs = row.locator("a[href^='/']").evaluate_all(
-                            """els => els.map(e => e.getAttribute('href') || '')"""
+                        hrefs = row.locator(
+                            "a[href^='/']"
+                        ).evaluate_all(
+                            """els => els.map(
+                                e => e.getAttribute('href') || ''
+                            )"""
                         )
                     except Exception:
                         pass
 
                     for candidate_href in hrefs:
-                        match = re.fullmatch(r"/([^/?#]+)/?", str(candidate_href))
-                        if match:
-                            possible = match.group(1)
-                            if possible.lower() not in {
-                                target.lower(), "accounts", "explore"
-                            }:
-                                candidate_name = possible
-                                break
+                        match = re.fullmatch(
+                            r"/([^/?#]+)/?",
+                            str(candidate_href),
+                        )
+                        if not match:
+                            continue
 
-                    key = candidate_name or f"row_{i}"
-                    if key in attempted:
+                        possible = match.group(1)
+                        if possible.lower() in {
+                            target.lower(),
+                            "accounts",
+                            "explore",
+                        }:
+                            continue
+
+                        candidate_name = possible
+                        break
+
+                    if not candidate_name:
+                        candidate_name = f"candidate_{i}"
+
+                    if candidate_name in attempted_users:
                         continue
-                    attempted.add(key)
+
+                    attempted_users.add(candidate_name)
                     candidate = button
                     break
 
@@ -3814,7 +4385,8 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                     idle_rounds += 1
                     try:
                         root.evaluate(
-                            "(el) => el.scrollBy(0, Math.max(600, el.clientHeight * 0.8))"
+                            "(el) => el.scrollBy("
+                            "0, Math.max(650, el.clientHeight * 0.85))"
                         )
                     except Exception:
                         try:
@@ -3823,78 +4395,132 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                             )
                         except Exception:
                             pass
-                    page.wait_for_timeout(900)
+
+                    page.wait_for_timeout(700)
                     continue
 
                 idle_rounds = 0
 
-                if not wait_for_write_slot(username, "follow", max_wait=180):
+                if not _browser_wait_for_follow_gap(username):
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            "⏳ Browser Follow stopped by safety/pacing state."
+                        ),
+                    )
                     break
 
+                attempt_count += 1
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"👤 Browser Follow request "
+                        f"{attempt_count}/{limit} -> "
+                        f"@{candidate_name}"
+                    ),
+                )
+
                 try:
-                    candidate.click(timeout=5000)
+                    candidate.click(timeout=4000)
                 except Exception:
                     candidate.evaluate("(el) => el.click()")
 
-                page.wait_for_timeout(900)
+                BROWSER_LAST_FOLLOW_ACTION[username] = time.monotonic()
+                page.wait_for_timeout(450)
 
                 problem = _browser_page_problem(page)
                 if problem:
                     apply_account_safety_backoff(
                         username,
-                        f"Instagram Web follow restriction/challenge: {problem}",
+                        (
+                            "Instagram Web follow restriction/challenge: "
+                            f"{problem}"
+                        ),
                         level="restricted",
                         hours=4,
                     )
                     break
 
-                # Re-read visible row/button state. If the exact Follow button
-                # is gone or changed to Following/Requested, count it.
-                confirmed = False
-                try:
-                    txt = re.sub(
-                        r"\s+",
-                        " ",
-                        candidate.inner_text(timeout=500) or "",
-                    ).strip()
-                    confirmed = bool(
-                        re.fullmatch(
-                            r"(Following|Requested)",
-                            txt,
-                            re.I,
-                        )
-                    )
-                except Exception:
-                    # A detached button usually means the row rerendered.
-                    confirmed = True
+                confirmed, detail = _browser_wait_for_follow_confirmation(
+                    page,
+                    context,
+                    root,
+                    candidate_name,
+                )
 
-                if not confirmed:
-                    # Do not count ambiguous UI as success.
+                if confirmed is True:
+                    record_write(username, "follow")
+                    confirmed_count += 1
+                    update_account_metric(
+                        username,
+                        "total_follows",
+                        increment=1,
+                    )
                     update_account_metric(
                         username,
                         "add_history",
                         value=(
-                            f"⚠️ Browser Follow for "
-                            f"@{candidate_name or 'candidate'} was not confirmed."
+                            f"✅ Browser Follow confirmed: "
+                            f"@{candidate_name} "
+                            f"({confirmed_count} confirmed / "
+                            f"{attempt_count} attempted) "
+                            f"[{detail[:100]}]"
                         ),
                     )
-                    continue
 
-                record_write(username, "follow")
-                followed += 1
-                update_account_metric(
+                elif confirmed is False:
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            f"⚠️ Browser Follow explicitly not confirmed for "
+                            f"@{candidate_name}: {detail[:160]}"
+                        ),
+                    )
+
+                else:
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            f"⚠️ Browser Follow state ambiguous for "
+                            f"@{candidate_name}; not counted: "
+                            f"{detail[:160]}"
+                        ),
+                    )
+
+                # Move down slightly so Instagram loads/repositions rows.
+                try:
+                    root.evaluate("(el) => el.scrollBy(0, 90)")
+                except Exception:
+                    pass
+
+            if attempt_count and not confirmed_count:
+                _browser_follow_debug_snapshot(
+                    page,
                     username,
-                    "total_follows",
-                    increment=1,
+                    "follow_zero_confirmed",
                 )
                 update_account_metric(
                     username,
                     "add_history",
                     value=(
-                        f"👤 Browser Follow confirmed: "
-                        f"@{candidate_name or 'candidate'} ({followed}/{limit})"
+                        "🧪 Browser Follow had attempts but zero confirmations; "
+                        "saved screenshot/HTML under browser_debug."
                     ),
                 )
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"🌐 Browser Follow pass finished: "
+                    f"{attempt_count}/{limit} request(s), "
+                    f"{confirmed_count} confirmed."
+                ),
+            )
 
         finally:
             try:
@@ -3902,12 +4528,13 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
             except Exception:
                 pass
 
-    return followed
+    return confirmed_count
 
 
-def _browser_engage_hashtag(username, history, config) -> int:
+
+def _browser_engage_hashtag(username, history, config, manual=False) -> int:
     settings = get_account_control_settings(username, config)
-    if not settings.get("enable_engage", False):
+    if not manual and not settings.get("enable_engage", False):
         return 0
 
     tags = _normalize_hashtag_list(
@@ -3918,7 +4545,7 @@ def _browser_engage_hashtag(username, history, config) -> int:
         update_account_metric(
             username,
             "add_history",
-            value="⚠️ No valid target hashtags configured.",
+            value="⚠️ Browser Engage: no valid target hashtags configured.",
         )
         return 0
 
@@ -3936,14 +4563,20 @@ def _browser_engage_hashtag(username, history, config) -> int:
     update_account_metric(
         username,
         "add_history",
-        value=f"🌐 Browser Engage: loading #{tag}",
+        value=f"🌐 Browser Engage starting: #{tag}; max clips={max_actions}",
     )
 
     confirmed_likes = 0
 
     with sync_playwright() as p:
-        context = _browser_launch(p, username)
+        update_account_metric(
+            username,
+            "add_history",
+            value="🌐 Browser Engage: launching saved Chromium profile...",
+        )
+        context = _browser_launch(p, username, headed=True if manual else None)
         page = context.pages[0] if context.pages else context.new_page()
+
         try:
             page.goto(
                 f"https://www.instagram.com/explore/tags/{tag}/",
@@ -3965,6 +4598,12 @@ def _browser_engage_hashtag(username, history, config) -> int:
                 if clean not in links:
                     links.append(clean)
 
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"🌐 Browser Engage: found {len(links)} candidate post/reel link(s).",
+            )
+
             if not links:
                 update_account_metric(
                     username,
@@ -3973,9 +4612,15 @@ def _browser_engage_hashtag(username, history, config) -> int:
                 )
                 return 0
 
-            for href in links[:max_actions]:
+            for index, href in enumerate(links[:max_actions], start=1):
                 if href in history["browser_liked_urls"]:
                     continue
+
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=f"▶️ Browser Engage clip {index}/{min(len(links), max_actions)}: {href}",
+                )
 
                 page.goto(
                     href,
@@ -3985,36 +4630,25 @@ def _browser_engage_hashtag(username, history, config) -> int:
                 page.wait_for_timeout(1100)
                 _browser_check_ready(page, context, username)
 
-                # Like
-                like_svg = _browser_find_svg_action(
-                    page,
-                    ("Like",),
-                )
+                # LIKE
+                like_svg = _browser_find_svg_action(page, ("Like",))
                 if like_svg is not None:
-                    if not wait_for_write_slot(
-                        username,
-                        "like",
-                        max_wait=180,
-                    ):
+                    if not wait_for_write_slot(username, "like", max_wait=180):
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value="⏳ Browser Like stopped by pacing/safety state.",
+                        )
                         break
 
-                    _browser_clickable_from_svg(like_svg).click(
-                        timeout=5000
-                    )
+                    _browser_clickable_from_svg(like_svg).click(timeout=5000)
                     page.wait_for_timeout(700)
 
-                    unlike_svg = _browser_find_svg_action(
-                        page,
-                        ("Unlike",),
-                    )
+                    unlike_svg = _browser_find_svg_action(page, ("Unlike",))
                     if unlike_svg is not None:
                         record_write(username, "like")
                         history["browser_liked_urls"].append(href)
-                        update_account_metric(
-                            username,
-                            "total_likes",
-                            increment=1,
-                        )
+                        update_account_metric(username, "total_likes", increment=1)
                         confirmed_likes += 1
                         update_account_metric(
                             username,
@@ -4027,6 +4661,12 @@ def _browser_engage_hashtag(username, history, config) -> int:
                             "add_history",
                             value=f"⚠️ Browser Like was not confirmed: {href}",
                         )
+                else:
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=f"⚠️ Browser Engage: Like control not found on {href}",
+                    )
 
                 problem = _browser_page_problem(page)
                 if problem:
@@ -4038,40 +4678,29 @@ def _browser_engage_hashtag(username, history, config) -> int:
                     )
                     break
 
-                # Save/Favorite is part of the original engagement behavior.
+                # SAVE
                 if href not in history["browser_saved_urls"]:
-                    save_svg = _browser_find_svg_action(
-                        page,
-                        ("Save",),
-                    )
+                    save_svg = _browser_find_svg_action(page, ("Save",))
                     if save_svg is not None:
-                        if not wait_for_write_slot(
-                            username,
-                            "save",
-                            max_wait=180,
-                        ):
+                        if not wait_for_write_slot(username, "save", max_wait=180):
+                            update_account_metric(
+                                username,
+                                "add_history",
+                                value="⏳ Browser Save stopped by pacing/safety state.",
+                            )
                             break
 
-                        before = ""
-                        try:
-                            before = save_svg.get_attribute("aria-label") or ""
-                        except Exception:
-                            pass
-
-                        _browser_clickable_from_svg(save_svg).click(
-                            timeout=5000
-                        )
+                        _browser_clickable_from_svg(save_svg).click(timeout=5000)
                         page.wait_for_timeout(700)
 
                         after_remove = _browser_find_svg_action(
                             page,
                             ("Remove", "Unsave"),
                         )
-                        current_save = _browser_find_svg_action(
-                            page,
-                            ("Save",),
+                        current_save = _browser_find_svg_action(page, ("Save",))
+                        confirmed_save = (
+                            after_remove is not None or current_save is None
                         )
-                        confirmed_save = after_remove is not None or current_save is None
 
                         if confirmed_save:
                             record_write(username, "save")
@@ -4087,10 +4716,14 @@ def _browser_engage_hashtag(username, history, config) -> int:
                                 "add_history",
                                 value=f"⚠️ Browser Save was not confirmed: {href}",
                             )
+                    else:
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value=f"⚠️ Browser Engage: Save control not found on {href}",
+                        )
 
-                page.wait_for_timeout(
-                    random.randint(900, 1800)
-                )
+                page.wait_for_timeout(random.randint(900, 1800))
 
         finally:
             try:
@@ -4100,7 +4733,14 @@ def _browser_engage_hashtag(username, history, config) -> int:
 
     history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
     history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=f"🌐 Browser Engage finished; confirmed likes={confirmed_likes}.",
+    )
     return confirmed_likes
+
 
 
 def _browser_prepare_post(username, history, folder_pool):
@@ -4264,27 +4904,70 @@ Output only 5 space-separated hashtags.
     }
 
 
-def _browser_post(username, history, folder_pool) -> bool:
+def _browser_post(username, history, folder_pool, manual=False) -> bool:
     settings = get_account_control_settings(username)
-    if not settings.get("enable_posts", False):
+
+    # Manual Post is independent of the Auto Posts checkbox.
+    if not manual and not settings.get("enable_posts", False):
         return False
 
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🧰 Browser Post starting ({'manual' if manual else 'Auto'}); "
+            f"media folders discovered={len(folder_pool)}"
+        ),
+    )
+
+    if not folder_pool:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"⚠️ Browser Post: no media folders found under {get_media_root()}."
+            ),
+        )
+        return False
+
+    # Media prep may include video frame extraction + Ollama and can take minutes.
+    update_account_metric(
+        username,
+        "add_history",
+        value="🧠 Browser Post: selecting media and generating AI caption/hashtags...",
+    )
+
+    prep_started = time.time()
     prepared = _browser_prepare_post(
         username,
         history,
         folder_pool,
     )
+    prep_elapsed = int(time.time() - prep_started)
+
     if not prepared:
         update_account_metric(
             username,
             "add_history",
-            value="⚠️ Browser Post found no prepared media.",
+            value=(
+                f"⚠️ Browser Post found no prepared media after {prep_elapsed}s. "
+                "Check media root, unused-history state, and vision-model logs."
+            ),
         )
         return False
 
     selected = prepared["folder"]
     files = prepared["files"]
     full_caption = prepared["caption"]
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"✅ Browser Post prepared in {prep_elapsed}s: "
+            f"{', '.join(p.name for p in files)} from {selected['path']}"
+        ),
+    )
 
     if not wait_for_write_slot(
         username,
@@ -4299,15 +4982,35 @@ def _browser_post(username, history, folder_pool) -> bool:
         return False
 
     with sync_playwright() as p:
-        context = _browser_launch(p, username)
+        update_account_metric(
+            username,
+            "add_history",
+            value="🌐 Browser Post: launching saved Chromium profile...",
+        )
+        context = _browser_launch(
+            p,
+            username,
+            headed=True if manual else None,
+        )
         page = context.pages[0] if context.pages else context.new_page()
 
         try:
+            update_account_metric(
+                username,
+                "add_history",
+                value="🔎 Browser Post: snapshotting current profile posts before upload...",
+            )
             before_links = _browser_collect_profile_media_links(
                 page,
                 username,
             )
             _browser_check_ready(page, context, username)
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"🔎 Browser Post: baseline contains {len(before_links)} profile post/reel URL(s).",
+            )
 
             page.goto(
                 "https://www.instagram.com/",
@@ -4317,24 +5020,22 @@ def _browser_post(username, history, folder_pool) -> bool:
             page.wait_for_timeout(1000)
             _browser_check_ready(page, context, username)
 
+            update_account_metric(
+                username,
+                "add_history",
+                value="➕ Browser Post: opening Instagram Create composer...",
+            )
+
             opened = False
             for label in ("New post", "Create"):
-                svg = _browser_find_svg_action(
-                    page,
-                    (label,),
-                )
+                svg = _browser_find_svg_action(page, (label,))
                 if svg is not None:
-                    _browser_clickable_from_svg(svg).click(
-                        timeout=5000
-                    )
+                    _browser_clickable_from_svg(svg).click(timeout=5000)
                     opened = True
                     break
 
             if not opened:
-                opened = _browser_click_text_button(
-                    page,
-                    r"^Create$",
-                )
+                opened = _browser_click_text_button(page, r"^Create$")
 
             if not opened:
                 raise RuntimeError(
@@ -4343,7 +5044,6 @@ def _browser_post(username, history, folder_pool) -> bool:
 
             page.wait_for_timeout(700)
 
-            # Current web UI can show a Create menu before the composer.
             try:
                 menu_post = page.get_by_role(
                     "menuitem",
@@ -4354,6 +5054,12 @@ def _browser_post(username, history, folder_pool) -> bool:
                     page.wait_for_timeout(500)
             except Exception:
                 pass
+
+            update_account_metric(
+                username,
+                "add_history",
+                value="📎 Browser Post: waiting for Instagram file input...",
+            )
 
             file_input = page.locator("input[type='file']").first
             deadline = time.time() + 10
@@ -4380,18 +5086,27 @@ def _browser_post(username, history, folder_pool) -> bool:
 
             page.wait_for_timeout(1600)
 
-            # Instagram normally has one or two Next screens.
-            for _ in range(3):
+            for next_index in range(3):
                 if _browser_click_text_button(
                     page,
                     r"^Next$",
                     timeout=5000,
                 ):
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=f"➡️ Browser Post advanced composer step {next_index + 1}.",
+                    )
                     page.wait_for_timeout(1000)
                 else:
                     break
 
-            # Caption input varies across A/B layouts.
+            update_account_metric(
+                username,
+                "add_history",
+                value="✍️ Browser Post: locating caption editor...",
+            )
+
             caption_box = None
             for selector in (
                 "textarea[aria-label*='caption' i]",
@@ -4418,6 +5133,12 @@ def _browser_post(username, history, folder_pool) -> bool:
                 caption_box.focus()
                 page.keyboard.insert_text(full_caption)
 
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"✍️ Browser Post caption entered ({len(full_caption)} chars).",
+            )
+
             page.wait_for_timeout(500)
 
             if not _browser_click_text_button(
@@ -4432,12 +5153,13 @@ def _browser_post(username, history, folder_pool) -> bool:
             update_account_metric(
                 username,
                 "add_history",
-                value="⬆️ Browser Post submitted; verifying profile...",
+                value="⬆️ Browser Post submitted; verifying profile for up to 90s...",
             )
 
             confirmed = False
             final_link = ""
-            deadline = time.time() + 75
+            deadline = time.time() + 90
+            last_notice = 0.0
 
             while time.time() < deadline:
                 page.wait_for_timeout(3000)
@@ -4458,12 +5180,20 @@ def _browser_post(username, history, folder_pool) -> bool:
                     final_link = sorted(new_links)[-1]
                     break
 
+                if time.time() - last_notice >= 15:
+                    remaining = max(0, int(deadline - time.time()))
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=f"⏳ Browser Post verification: {remaining}s remaining; no new profile URL yet.",
+                    )
+                    last_notice = time.time()
+
             if confirmed:
                 record_write(username, "upload")
                 if selected["id"] not in history["posted_ids"]:
-                    history["posted_ids"].append(
-                        selected["id"]
-                    )
+                    history["posted_ids"].append(selected["id"])
+
                 update_account_metric(
                     username,
                     "total_posts",
@@ -4479,10 +5209,7 @@ def _browser_post(username, history, folder_pool) -> bool:
                 update_account_metric(
                     username,
                     "add_history",
-                    value=(
-                        f"✅ Browser Post confirmed on profile: "
-                        f"{final_link}"
-                    ),
+                    value=f"✅ Browser Post confirmed on profile: {final_link}",
                 )
                 return True
 
@@ -4510,6 +5237,17 @@ def _browser_post(username, history, folder_pool) -> bool:
             )
             return False
 
+        except Exception as exc:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"❌ Browser Post failed: {type(exc).__name__}: "
+                    f"{str(exc)[:220]}"
+                ),
+            )
+            raise
+
         finally:
             try:
                 context.close()
@@ -4517,7 +5255,10 @@ def _browser_post(username, history, folder_pool) -> bool:
                 pass
 
 
+
 def run_browser_profile_workflow(username, conf, folder_pool):
+    ACCOUNT_COOLDOWNS.pop(username, None)
+
     forced_task = NEXT_TASK_OVERRIDE.pop(username, None)
 
     if username in CONTROL_PAUSED_ACCOUNTS and not forced_task:
@@ -4536,14 +5277,20 @@ def run_browser_profile_workflow(username, conf, folder_pool):
         )
         return "disconnected"
 
-    settings = get_account_control_settings(
-        username,
-        conf,
-    )
+    settings = get_account_control_settings(username, conf)
     update_account_metric(
         username,
         "status",
         status="Browser Mode / Active",
+    )
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🚀 Browser Mode workflow started"
+            + (f": manual {forced_task}" if forced_task else ": Auto")
+        ),
     )
 
     history = load_json(
@@ -4574,18 +5321,23 @@ def run_browser_profile_workflow(username, conf, folder_pool):
                 conf,
                 manual=True,
             )
+
         elif forced_task == "hashtags":
             _browser_engage_hashtag(
                 username,
                 history,
                 conf,
+                manual=True,
             )
+
         elif forced_task == "repost":
             _browser_post(
                 username,
                 history,
                 folder_pool,
+                manual=True,
             )
+
         elif forced_task == "comments":
             update_account_metric(
                 username,
@@ -4595,6 +5347,7 @@ def run_browser_profile_workflow(username, conf, folder_pool):
                     "Follow, Engage, and Post are available."
                 ),
             )
+
         else:
             choices = []
             if settings.get("enable_follow", False):
@@ -4604,45 +5357,60 @@ def run_browser_profile_workflow(username, conf, folder_pool):
             if settings.get("enable_posts", False) and folder_pool:
                 choices.append("repost")
 
-            if choices:
-                cycle_index = int(
-                    history.get(
-                        "browser_outward_cycle_index",
-                        0,
-                    )
-                    or 0
+            if not choices:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value="ℹ️ Browser Mode Auto pass has no enabled outward feature.",
                 )
-                task = choices[
-                    cycle_index % len(choices)
-                ]
-                history["browser_outward_cycle_index"] = (
-                    cycle_index + 1
-                )
+                return "ran"
 
-                if task == "networking":
-                    _browser_follow_network(
-                        username,
-                        history,
-                        conf,
-                    )
-                elif task == "hashtags":
-                    _browser_engage_hashtag(
-                        username,
-                        history,
-                        conf,
-                    )
-                elif task == "repost":
-                    _browser_post(
-                        username,
-                        history,
-                        folder_pool,
-                    )
+            cycle_index = int(
+                history.get("browser_outward_cycle_index", 0) or 0
+            )
+            task = choices[cycle_index % len(choices)]
+            history["browser_outward_cycle_index"] = cycle_index + 1
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"🔄 Browser Mode Auto selected: {task}",
+            )
+
+            if task == "networking":
+                _browser_follow_network(
+                    username,
+                    history,
+                    conf,
+                    manual=False,
+                )
+            elif task == "hashtags":
+                _browser_engage_hashtag(
+                    username,
+                    history,
+                    conf,
+                    manual=False,
+                )
+            elif task == "repost":
+                _browser_post(
+                    username,
+                    history,
+                    folder_pool,
+                    manual=False,
+                )
 
     finally:
-        save_json(
-            conf["history_file"],
-            history,
+        save_json(conf["history_file"], history)
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🏁 Browser Mode workflow finished"
+                + (f": manual {forced_task}" if forced_task else ": Auto")
+            ),
         )
+
         if username in CONTROL_PAUSED_ACCOUNTS:
             update_account_metric(
                 username,
@@ -4657,6 +5425,7 @@ def run_browser_profile_workflow(username, conf, folder_pool):
             )
 
     return "ran"
+
 
 def run_profile_workflow(username, conf, folder_pool):
     global NEXT_TASK_OVERRIDE
@@ -4811,7 +5580,7 @@ def open_local_folder(path_value):
 
     # Only allow opening folders inside the configured media pool.
     try:
-        media_root_resolved=MEDIA_ROOT.resolve()
+        media_root_resolved=get_media_root().resolve()
         if media_root_resolved not in resolved.parents and resolved != media_root_resolved:
             raise ValueError("Folder is outside the configured media root.")
     except Exception:
@@ -4969,6 +5738,7 @@ def _control_metrics_payload():
     return {
         "accounts": result,
         "recent_posts": load_recent_posts()[:25],
+        "media": media_root_payload(),
     }
 
 
@@ -5278,7 +6048,7 @@ def _control_browser_login(username, timeout_seconds=600):
         _activate_browser_native_mode(
             username,
             "Browser identity is valid, but Instagram rejects the private timeline endpoint. "
-            "Follow, Engage, and Post will use Instagram Web.",
+            "Follow, Engage, and Post will use Instagram Web. Private-API auth cooldowns do not block Browser Mode. Browser Follow uses live-row/profile verification and a hard request cap.",
         )
 
         return {
@@ -5341,9 +6111,9 @@ def _control_browser_login(username, timeout_seconds=600):
 
 def _control_quick_login(username):
     """
-    Explicit one-click login using an existing saved instagrapi session.
-
-    Nothing calls this automatically at boot.
+    Quick Login prefers the saved instagrapi session. If Instagram rejects the
+    private timeline but this account has a saved Browser Login profile, restore
+    Browser Mode instead.
     """
     username = str(username or "").strip().lstrip("@")
     conf = _control_conf(username)
@@ -5351,21 +6121,55 @@ def _control_quick_login(username):
         raise ValueError(f"Unknown account @{username}")
 
     session_p = DOWNLOAD_ROOT / conf["session_file"]
+
     if not session_p.exists():
+        if _browser_profile_saved(username):
+            _activate_browser_native_mode(
+                username,
+                "Saved Instagram Web profile restored; no usable private session.",
+            )
+            return {
+                "ok": True,
+                "mode": "browser_native",
+                "browser_mode": True,
+                "private_api_ready": False,
+            }
+
         raise RuntimeError(
-            "No saved session exists for this account. Use Password Login once."
+            "No saved session exists for this account. Use Browser Login."
         )
 
     cl = Client()
     cl.load_settings(session_p)
     _refresh_instagram_app_profile(cl, username)
 
-    # This is the first Instagram network call after the user explicitly presses
-    # Quick Login.
     try:
         cl.get_timeline_feed()
     except Exception as exc:
         if is_login_required_error(exc):
+            if _browser_profile_saved(username):
+                _activate_browser_native_mode(
+                    username,
+                    (
+                        "Saved browser profile restored because Instagram "
+                        "rejected the private timeline endpoint."
+                    ),
+                )
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🌐 Quick Login: private API still returns LoginRequired; "
+                        "restored Browser Mode instead."
+                    ),
+                )
+                return {
+                    "ok": True,
+                    "mode": "browser_native",
+                    "browser_mode": True,
+                    "private_api_ready": False,
+                }
+
             stop_account_for_private_login_required(
                 username,
                 "Quick Login private timeline validation",
@@ -5373,18 +6177,23 @@ def _control_quick_login(username):
                 hours=6,
             )
             raise RuntimeError(
-                "Saved browser-imported session is still valid for Web, but "
-                "Instagram rejected the private timeline endpoint with "
-                "LoginRequired. Quick Login cannot enable automation yet."
+                "Saved session is not accepted by Instagram's private API and "
+                "no saved Browser Login profile was found."
             ) from exc
+
         raise
 
-    if not verify_authenticated_identity(cl, username, session_p):
+    if not verify_authenticated_identity(
+        cl,
+        username,
+        session_p,
+    ):
         raise RuntimeError(
             "Saved session identity does not match this roster account."
         )
 
     patch_obsolete_qe_expose(cl, username)
+    _deactivate_browser_native_mode(username)
 
     with CONTROL_LOCK:
         CLIENT_CACHE[username] = cl
@@ -5395,12 +6204,27 @@ def _control_quick_login(username):
         LAST_DM_POLL.pop(username, None)
         AUTH_EVENT[username] = "quick_login"
 
-    update_account_metric(username, "status", status="Connected / Auto Off")
     update_account_metric(
-        username, "add_history",
-        value="🔓 Quick Login: session connected; background automation remains OFF until Start Automation is pressed."
+        username,
+        "status",
+        status="Connected / Auto Off",
     )
-    return {"ok": True, "mode": "saved_session"}
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🔓 Quick Login: private API session connected; background "
+            "automation remains OFF until Start Automation is pressed."
+        ),
+    )
+
+    return {
+        "ok": True,
+        "mode": "saved_session",
+        "browser_mode": False,
+        "private_api_ready": True,
+    }
+
 
 
 def _control_password_login(username, password, verification_code=""):
@@ -5564,29 +6388,28 @@ def _control_full_logout(username):
 def _control_pause(username, pause):
     """
     Stop/start background automation for either instagrapi or Browser Mode.
-    Safety backoff cannot be manually overridden until its timer expires.
+
+    Browser Mode ignores private-API auth cooldowns because it runs through the
+    authenticated Instagram Web profile. Genuine platform safety backoffs still
+    apply to both modes.
     """
     username = str(username or "").strip().lstrip("@")
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
 
-    connected = (
-        (
-            username in CLIENT_CACHE
-            and username not in CONTROL_DISCONNECTED_ACCOUNTS
-        )
-        or username in BROWSER_NATIVE_ACCOUNTS
+    browser_mode = username in BROWSER_NATIVE_ACCOUNTS
+    private_connected = (
+        username in CLIENT_CACHE
+        and username not in CONTROL_DISCONNECTED_ACCOUNTS
     )
+    connected = private_connected or browser_mode
+
     if not connected:
         raise RuntimeError(
             "Account is disconnected. Use Quick Login or Browser Login first."
         )
 
-    mode_label = (
-        "Browser Mode"
-        if username in BROWSER_NATIVE_ACCOUNTS
-        else "Connected"
-    )
+    mode_label = "Browser Mode" if browser_mode else "Connected"
 
     if pause:
         CONTROL_PAUSED_ACCOUNTS.add(username)
@@ -5606,6 +6429,7 @@ def _control_pause(username, pause):
             ),
         )
     else:
+        # Genuine safety backoffs apply in both modes.
         state = get_account_safety_state(username)
         if state["active"]:
             raise RuntimeError(
@@ -5613,12 +6437,18 @@ def _control_pause(username, pause):
                 f"Reason: {state['reason'][:160]}"
             )
 
-        cooldown = ACCOUNT_COOLDOWNS.get(username)
-        if cooldown and datetime.now() < cooldown:
-            raise RuntimeError(
-                f"Account cooldown is active until "
-                f"{cooldown.strftime('%Y-%m-%d %H:%M')}."
-            )
+        if browser_mode:
+            # Clear only the generic/private-API cooldown. The browser workflow
+            # will independently stop if Instagram Web shows a restriction,
+            # challenge, or "try again later" message.
+            ACCOUNT_COOLDOWNS.pop(username, None)
+        else:
+            cooldown = ACCOUNT_COOLDOWNS.get(username)
+            if cooldown and datetime.now() < cooldown:
+                raise RuntimeError(
+                    f"Account cooldown is active until "
+                    f"{cooldown.strftime('%Y-%m-%d %H:%M')}."
+                )
 
         CONTROL_PAUSED_ACCOUNTS.discard(username)
         update_account_metric(
@@ -5638,8 +6468,9 @@ def _control_pause(username, pause):
         "ok": True,
         "paused": pause,
         "auto_enabled": not pause,
-        "browser_mode": username in BROWSER_NATIVE_ACCOUNTS,
+        "browser_mode": browser_mode,
     }
+
 
 
 
@@ -5651,13 +6482,13 @@ def _control_queue_task(username, task):
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
 
-    connected = (
-        (
-            username in CLIENT_CACHE
-            and username not in CONTROL_DISCONNECTED_ACCOUNTS
-        )
-        or username in BROWSER_NATIVE_ACCOUNTS
+    browser_mode = username in BROWSER_NATIVE_ACCOUNTS
+    private_connected = (
+        username in CLIENT_CACHE
+        and username not in CONTROL_DISCONNECTED_ACCOUNTS
     )
+    connected = private_connected or browser_mode
+
     if not connected:
         raise RuntimeError(
             "Account is disconnected. Use Quick Login or Browser Login first."
@@ -5669,8 +6500,13 @@ def _control_queue_task(username, task):
             f"Safety Backoff is active until {state['until']}: "
             f"{state['reason'][:140]}"
         )
+
     if task not in allowed:
         raise ValueError(f"Unsupported task: {task}")
+
+    if browser_mode:
+        # Do not let a private-API auth cooldown suppress a Web UI task.
+        ACCOUNT_COOLDOWNS.pop(username, None)
 
     with CONTROL_LOCK:
         NEXT_TASK_OVERRIDE[username] = task
@@ -5681,18 +6517,17 @@ def _control_queue_task(username, task):
         "add_history",
         value=(
             f"🎛️ Queued manual task: {task}"
-            + (
-                " (Browser Mode)"
-                if username in BROWSER_NATIVE_ACCOUNTS
-                else ""
-            )
+            + (" (Browser Mode)" if browser_mode else "")
+            + "; worker should start on the next scheduler tick (~1s)"
         ),
     )
+
     return {
         "ok": True,
         "task": task,
-        "browser_mode": username in BROWSER_NATIVE_ACCOUNTS,
+        "browser_mode": browser_mode,
     }
+
 
 
 
@@ -5844,6 +6679,38 @@ textarea{min-height:70px;resize:vertical}
   <b>Testing-safe startup:</b> restarting this Python program does not automatically log any account in.
   <b>Quick Login</b> reuses the saved session. <b>Disconnect</b> keeps that session.
   <b>Full Logout</b> deletes it. Logging in leaves automation OFF until you press <b>Start Automation</b>. <b>Remove Account</b> removes the dashboard entry but preserves its local session/history for easy re-add.
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <div class="cardhead">
+    <div>
+      <h2>📁 Media Library</h2>
+      <div class="small">
+        Select the parent folder that contains your media/post subfolders.
+        The setting is saved and used by all configured Instagram accounts.
+      </div>
+    </div>
+    <div class="badges">
+      <span id="mediaRootBadge" class="badge">Loading...</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <label>Media folder</label>
+    <input
+      id="mediaRootInput"
+      type="text"
+      placeholder="C:\Users\Thomas\social-media-pool"
+      onfocus="editing=true"
+      oninput="editing=true"
+    >
+    <div class="row">
+      <button class="good" onclick="saveMediaRoot()">Use Folder</button>
+      <button onclick="browseMediaRoot()">Browse Folder</button>
+      <button onclick="openMediaRoot()">Open Folder</button>
+    </div>
+    <div id="mediaRootStatus" class="small"></div>
+  </div>
 </div>
 
 <div id="grid" class="grid"></div>
@@ -6072,7 +6939,82 @@ async function openPostFolder(folder){
   }catch(e){toast(e.message,true)}
 }
 
+
+function renderMediaRoot(media){
+  const input=document.getElementById("mediaRootInput");
+  const badge=document.getElementById("mediaRootBadge");
+  const status=document.getElementById("mediaRootStatus");
+  if(!input || !badge || !status) return;
+
+  const m=media || {};
+  if(!editing){
+    input.value=m.path || "";
+  }
+
+  if(m.exists && m.is_dir){
+    badge.textContent="Ready";
+    badge.className="badge ok";
+    status.textContent=
+      `${m.path || ""} — ${Number(m.child_folders || 0)} immediate subfolder(s) detected.`;
+  }else{
+    badge.textContent="Missing";
+    badge.className="badge bad";
+    status.textContent=
+      `${m.path || "(not configured)"} — folder not found.`;
+  }
+}
+
+async function saveMediaRoot(){
+  const input=document.getElementById("mediaRootInput");
+  const path=input ? input.value.trim() : "";
+  if(!path){
+    toast("Enter a media folder path first.",true);
+    return;
+  }
+
+  try{
+    const result=await api("set_media_root",{path});
+    editing=false;
+    renderMediaRoot(result.media || {});
+    await refreshNow(true);
+    toast(`Media folder saved: ${(result.media && result.media.path) || path}`);
+  }catch(e){
+    toast(e.message,true);
+  }
+}
+
+async function browseMediaRoot(){
+  try{
+    toast("Opening local folder picker...");
+    const result=await api("choose_media_root",{});
+    editing=false;
+
+    if(result.cancelled){
+      await refreshNow(true);
+      toast("Folder selection cancelled.");
+      return;
+    }
+
+    renderMediaRoot(result.media || {});
+    await refreshNow(true);
+    toast(`Media folder saved: ${(result.media && result.media.path) || ""}`);
+  }catch(e){
+    toast(e.message,true);
+  }
+}
+
+async function openMediaRoot(){
+  try{
+    await api("open_media_root",{});
+    toast("Opened configured media folder.");
+  }catch(e){
+    toast(e.message,true);
+  }
+}
+
+
 function render(data){
+  renderMediaRoot((data && data.media) || {});
   latestData=(data && data.accounts) ? data.accounts : (data || {});
   const grid=document.getElementById("grid");
   grid.innerHTML=Object.entries(latestData)
@@ -6353,6 +7295,17 @@ refreshNow(true);
                     body.get("settings", {}),
                 )
 
+            elif action == "set_media_root":
+                result = _control_set_media_root(
+                    body.get("path", "")
+                )
+
+            elif action == "choose_media_root":
+                result = _control_choose_media_root()
+
+            elif action == "open_media_root":
+                result = _control_open_media_root()
+
             elif action == "open_folder":
                 result = open_local_folder(body.get("folder", ""))
 
@@ -6529,9 +7482,25 @@ ACCOUNT_WORKFLOW_THREADS_LOCK = threading.RLock()
 
 
 def _background_account_workflow(username, conf, next_workflow_at):
+    update_account_metric(
+        username,
+        "add_history",
+        value="🧵 Worker started; discovering local media folders...",
+    )
+
     try:
         folder_pool = discover_local_media_folders()
-        result = run_profile_workflow(username, conf, folder_pool)
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"🗂️ Worker discovered {len(folder_pool)} local media folder(s).",
+        )
+
+        result = run_profile_workflow(
+            username,
+            conf,
+            folder_pool,
+        )
 
     except FeedbackRequired as exc:
         apply_account_safety_backoff(
@@ -6542,10 +7511,18 @@ def _background_account_workflow(username, conf, next_workflow_at):
         result = "throttled"
 
     except Exception as exc:
-        observe_platform_signal(username, exc, action="workflow")
+        observe_platform_signal(
+            username,
+            exc,
+            action="workflow",
+        )
         update_account_metric(
-            username, "add_history",
-            value=f"Workflow error: {type(exc).__name__}: {str(exc)[:100]}"
+            username,
+            "add_history",
+            value=(
+                f"❌ Workflow error: {type(exc).__name__}: "
+                f"{str(exc)[:220]}"
+            ),
         )
         result = "error"
 
@@ -6555,9 +7532,19 @@ def _background_account_workflow(username, conf, next_workflow_at):
         else WORKFLOW_RETRY_IDLE_SECONDS
     )
 
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🧵 Worker finished with result={result}; "
+            f"next Auto eligibility in ~{delay}s."
+        ),
+    )
+
     with ACCOUNT_WORKFLOW_THREADS_LOCK:
         next_workflow_at[username] = time.monotonic() + delay
         ACCOUNT_WORKFLOW_THREADS.pop(username, None)
+
 
 
 
@@ -6601,9 +7588,9 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — browser native fallback: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Media Folder Hub: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
-    print(f"Instagram media root: {MEDIA_ROOT}")
+    print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
     print("Dashboard account cap: 3")
     print("Boot mode: DISCONNECTED / AUTO OFF")
@@ -6638,11 +7625,20 @@ def main():
                     CONTROL_PAUSED_ACCOUNTS.add(current_user)
                     continue
 
-                cooldown = ACCOUNT_COOLDOWNS.get(current_user)
-                if cooldown and datetime.now() < cooldown:
-                    continue
-
                 forced = current_user in CONTROL_FORCE_RUN
+
+                # Browser Mode manual tasks are independent of private-API auth
+                # cooldowns. Genuine safety backoff was already checked above.
+                cooldown = ACCOUNT_COOLDOWNS.get(current_user)
+                if (
+                    cooldown
+                    and datetime.now() < cooldown
+                    and not (
+                        current_user in BROWSER_NATIVE_ACCOUNTS
+                        and forced
+                    )
+                ):
+                    continue
                 auto_on = current_user not in CONTROL_PAUSED_ACCOUNTS
                 if not auto_on and not forced:
                     continue
