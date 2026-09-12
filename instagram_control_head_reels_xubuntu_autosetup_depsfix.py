@@ -392,33 +392,26 @@ MEDIA_FOLDER_CACHE_SECONDS = max(10, int(os.environ.get("IG_MEDIA_FOLDER_CACHE_S
 AUTH_RETRY_AFTER = {}  # username -> datetime; prevents rapid login loops
 
 # One-account instances can keep DMs responsive without making posting/actions frequent.
-DM_POLL_SECONDS = max(300, int(os.environ.get("IG_DM_POLL_SECONDS", "1800")))
-WORKFLOW_SLEEP_MIN = max(DM_POLL_SECONDS, int(os.environ.get("IG_WORKFLOW_SLEEP_MIN", "420")))
-WORKFLOW_SLEEP_MAX = max(WORKFLOW_SLEEP_MIN, int(os.environ.get("IG_WORKFLOW_SLEEP_MAX", "1200")))
+DM_POLL_SECONDS = max(180, int(os.environ.get("IG_DM_POLL_SECONDS", "600")))
+# Keep the control loop responsive. These are READ/idle intervals only; write pacing
+# and rolling write budgets below remain unchanged.
+WORKFLOW_SLEEP_MIN = max(90, int(os.environ.get("IG_WORKFLOW_SLEEP_MIN", "150")))
+WORKFLOW_SLEEP_MAX = max(WORKFLOW_SLEEP_MIN, int(os.environ.get("IG_WORKFLOW_SLEEP_MAX", "360")))
 
-AUTO_ACTIVE_REST_MIN_SECONDS = max(
-    120,
-    int(os.environ.get("IG_AUTO_ACTIVE_REST_MIN_SECONDS", "180")),
-)
+AUTO_ACTIVE_REST_MIN_SECONDS = max(45, int(os.environ.get("IG_AUTO_ACTIVE_REST_MIN_SECONDS", "60")))
 AUTO_ACTIVE_REST_MAX_SECONDS = max(
     AUTO_ACTIVE_REST_MIN_SECONDS,
-    int(os.environ.get("IG_AUTO_ACTIVE_REST_MAX_SECONDS", "480")),
+    int(os.environ.get("IG_AUTO_ACTIVE_REST_MAX_SECONDS", "150")),
 )
-AUTO_LONG_REST_MIN_SECONDS = max(
-    900,
-    int(os.environ.get("IG_AUTO_LONG_REST_MIN_SECONDS", "2700")),
-)
+AUTO_LONG_REST_MIN_SECONDS = max(600, int(os.environ.get("IG_AUTO_LONG_REST_MIN_SECONDS", "900")))
 AUTO_LONG_REST_MAX_SECONDS = max(
     AUTO_LONG_REST_MIN_SECONDS,
-    int(os.environ.get("IG_AUTO_LONG_REST_MAX_SECONDS", "10800")),
+    int(os.environ.get("IG_AUTO_LONG_REST_MAX_SECONDS", "2400")),
 )
-AUTO_PASSES_BEFORE_LONG_MIN = max(
-    2,
-    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MIN", "3")),
-)
+AUTO_PASSES_BEFORE_LONG_MIN = max(3, int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MIN", "6")))
 AUTO_PASSES_BEFORE_LONG_MAX = max(
     AUTO_PASSES_BEFORE_LONG_MIN,
-    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MAX", "6")),
+    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MAX", "10")),
 )
 AUTO_FOLLOW_BATCH_MIN = max(
     1,
@@ -440,37 +433,25 @@ NEXT_BROWSER_DM_CHECK = {}
 LAST_BROWSER_COMMENT_CHECK = {}
 NEXT_BROWSER_COMMENT_CHECK = {}
 
-ACTIVE_SESSION_MIN_SECONDS = max(
-    60,
-    int(os.environ.get("IG_ACTIVE_SESSION_MIN_SECONDS", "120")),
-)
+ACTIVE_SESSION_MIN_SECONDS = max(120, int(os.environ.get("IG_ACTIVE_SESSION_MIN_SECONDS", "240")))
 ACTIVE_SESSION_MAX_SECONDS = max(
     ACTIVE_SESSION_MIN_SECONDS,
-    int(os.environ.get("IG_ACTIVE_SESSION_MAX_SECONDS", "300")),
+    int(os.environ.get("IG_ACTIVE_SESSION_MAX_SECONDS", "540")),
 )
-ACTIVE_BROWSE_GAP_MIN_SECONDS = max(
-    3,
-    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MIN_SECONDS", "5")),
-)
+ACTIVE_BROWSE_GAP_MIN_SECONDS = max(2, int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MIN_SECONDS", "3")))
 ACTIVE_BROWSE_GAP_MAX_SECONDS = max(
     ACTIVE_BROWSE_GAP_MIN_SECONDS,
-    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MAX_SECONDS", "12")),
+    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MAX_SECONDS", "7")),
 )
-OVERNIGHT_REST_MIN_SECONDS = max(
-    180,
-    int(os.environ.get("IG_OVERNIGHT_REST_MIN_SECONDS", "300")),
-)
+OVERNIGHT_REST_MIN_SECONDS = max(90, int(os.environ.get("IG_OVERNIGHT_REST_MIN_SECONDS", "120")))
 OVERNIGHT_REST_MAX_SECONDS = max(
     OVERNIGHT_REST_MIN_SECONDS,
-    int(os.environ.get("IG_OVERNIGHT_REST_MAX_SECONDS", "720")),
+    int(os.environ.get("IG_OVERNIGHT_REST_MAX_SECONDS", "300")),
 )
-OVERNIGHT_LONG_REST_MIN_SECONDS = max(
-    1800,
-    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MIN_SECONDS", "3600")),
-)
+OVERNIGHT_LONG_REST_MIN_SECONDS = max(900, int(os.environ.get("IG_OVERNIGHT_LONG_REST_MIN_SECONDS", "1200")))
 OVERNIGHT_LONG_REST_MAX_SECONDS = max(
     OVERNIGHT_LONG_REST_MIN_SECONDS,
-    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MAX_SECONDS", "14400")),
+    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MAX_SECONDS", "3600")),
 )
 BROWSER_DM_CHECK_MIN_SECONDS = max(
     900,
@@ -1042,7 +1023,7 @@ def _default_control_settings(username, conf):
         "reels_audio_transcription": True,
         "whisper_model": os.environ.get("IG_WHISPER_MODEL", "small").strip() or "small",
         "pace_mode": "normal",
-        "video_frames": 8,
+        "video_frames": 12,
         "require_video_vision": True,
 
         # Independent behavior switches. There is no hidden mode routing.
@@ -1186,7 +1167,7 @@ def _sanitize_control_settings(username, conf, raw):
             raw.get("whisper_model", base["whisper_model"])
         ).strip()[:40] or "small",
         "pace_mode": pace_mode,
-        "video_frames": as_int("video_frames", 4, 12),
+        "video_frames": as_int("video_frames", 6, 16),
         "require_video_vision": bool(raw.get("require_video_vision", base["require_video_vision"])),
 
         "enable_posts": feature("enable_posts", 0),
@@ -1430,10 +1411,36 @@ def analyze_context_topic(text):
 
 
 def _clean_ollama_output(raw):
-    text = str(raw or "").strip().strip('"').strip()
-    for prefix in ("Caption:", "Reply:", "Response:", "Assistant:"):
+    """Normalize model prose and remove wrapper quotes/code fences.
+
+    Ollama models occasionally return a perfectly usable caption wrapped in one
+    quote, or leave an unmatched closing quote at the very end. Social posts
+    should never preserve those formatting artifacts.
+    """
+    text = str(raw or "").strip()
+    text = re.sub(r"^```(?:text|markdown)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text).strip()
+    for prefix in ("Caption:", "Reply:", "Response:", "Assistant:", "Comment:"):
         if text.lower().startswith(prefix.lower()):
             text = text[len(prefix):].strip()
+
+    quote_pairs = (("\"", "\""), ("'", "'"), ("“", "”"), ("‘", "’"))
+    changed = True
+    while changed and len(text) >= 2:
+        changed = False
+        for left, right in quote_pairs:
+            if text.startswith(left) and text.endswith(right):
+                text = text[len(left):len(text)-len(right)].strip()
+                changed = True
+                break
+
+    # Remove formatting-only trailing quote marks. Preserve normal apostrophes
+    # inside words, but a final quote after sentence punctuation/whitespace is
+    # almost always a model wrapper artifact in this app.
+    text = re.sub(r"(?<=[.!?…])(?:[\"”’']+)$", "", text).rstrip()
+    if text.endswith(("\"", "”")) and not text.startswith(("\"", "“")):
+        text = text[:-1].rstrip()
+
     return " ".join(text.split())
 
 
@@ -1611,7 +1618,7 @@ def _video_duration_seconds(video_path):
 
 def extract_video_story_frames(video_path, count=5):
     video_path=Path(video_path)
-    count=max(3,min(9,int(count)))
+    count=max(4,min(16,int(count)))
     root=DOWNLOAD_ROOT/"video_story_frames"
     root.mkdir(parents=True,exist_ok=True)
     stamp=f"{video_path.stat().st_size}_{video_path.stat().st_mtime_ns}"
@@ -1788,8 +1795,9 @@ def analyze_media_for_caption(
     media_files,
     sidecar_text="",
     source_account="",
-    frame_count=5,
+    frame_count=12,
     require_video_vision=True,
+    account_username=None,
 ):
     clean_text=_sanitize_post_context(sidecar_text,source_account)
     vision_model=get_ollama_vision_model()
@@ -1801,12 +1809,28 @@ def analyze_media_for_caption(
     visual_files=[]
     ocr_text=""
     text_heavy=False
+    audio_transcript=""
+    audio_backend=""
 
     if video:
         try:
-            visual_files=extract_video_story_frames(video,frame_count)
+            visual_files=extract_video_story_frames(video,max(12, int(frame_count or 12)))
         except Exception:
             visual_files=[]
+        # For our own upload files we have the original media locally, so use it:
+        # listen to the spoken content before writing the caption instead of
+        # inferring the subject from a handful of silent frames.
+        if account_username:
+            try:
+                audio_transcript, audio_backend = _transcribe_local_upload_video(
+                    Path(video), str(account_username)
+                )
+            except Exception as exc:
+                audio_transcript, audio_backend = "", ""
+                try:
+                    print(f"⚠️ Upload audio analysis unavailable: {type(exc).__name__}: {str(exc)[:140]}", flush=True)
+                except Exception:
+                    pass
     elif image:
         try:
             ocr_text=_ocr_image_text(image)
@@ -1835,25 +1859,34 @@ def analyze_media_for_caption(
 
     if vision_model and visual_files:
         if media_kind=="video":
-            prompt = """
+            transcript_block = audio_transcript[:10000] if audio_transcript else "(No reliable local speech transcript was recovered.)"
+            prompt = f"""
 These images are chronological frames sampled across ONE social-media video.
-Actually watch the sequence by comparing all frames from earliest to latest.
+Study ALL frames from earliest to latest and combine them with the actual local
+audio transcript when one is present.
+
+LOCAL AUDIO TRANSCRIPT ({audio_backend or 'unavailable'}):
+{transcript_block}
 
 Return:
 PERSPECTIVE: POV_FIRST_PERSON | SELFIE_VLOG | THIRD_PERSON | UNKNOWN
-SEQUENCE: 3-7 concise sentences explaining what happens over time, in order.
+SEQUENCE: 5-10 concise sentences explaining the progression from beginning to end.
+SPOKEN_CONTENT: summarize the important claims, jokes, instructions, dialogue, or narration actually present in the transcript.
 VISIBLE_TEXT: quote or accurately paraphrase important readable on-screen text.
 TEXT_MEANING: explain what that text is saying if it matters to the video.
+MAIN_POINT: explain what the post is really about and what a viewer is meant to notice.
+CAPTION_ANGLES: 3-5 specific intelligent angles grounded in the video.
 NARRATION_NOTES: concise first-person-friendly notes suitable for a post caption.
 
 Rules:
-- Base the answer only on visible evidence across the frames.
+- Base the answer only on the visual sequence, transcript, and supplied text.
+- Give audio/narration equal weight with visuals when the transcript is reliable.
 - Notice changes between frames, actions, movement, setting, objects, and readable text.
-- If readable text expresses an opinion/claim, identify it as an opinion/claim rather than verified fact.
+- If spoken/readable text expresses an opinion or claim, identify it as such rather than verified fact.
 - If this is POV/selfie/vlog footage, make that explicit.
 - Do not identify people by name or infer private traits.
 - Do not mention usernames, filenames, source accounts, reposting, or archive metadata.
-- Do not introduce trading or another topic unless it is visibly present.
+- Do not introduce trading or another topic unless the actual media supports it.
 """.strip()
         else:
             ocr_block = ocr_text if ocr_text else "(Local OCR found no reliable text.)"
@@ -1918,6 +1951,11 @@ Rules:
                 pass
 
     pieces=[]
+    if audio_transcript:
+        pieces.append(
+            "LOCAL AUDIO TRANSCRIPT FROM THE UPLOAD "
+            f"({audio_backend or 'local Whisper'}):\n" + audio_transcript
+        )
     if ocr_text:
         pieces.append(
             "LOCAL OCR — VISIBLE TEXT IN THE UPLOADED IMAGE:\n" + ocr_text
@@ -1941,6 +1979,8 @@ Rules:
         "frames_analyzed":len(visual_files),
         "ocr_text":ocr_text,
         "text_heavy":bool(text_heavy),
+        "audio_transcript":audio_transcript,
+        "audio_backend":audio_backend,
     }
 
 
@@ -2048,8 +2088,12 @@ Requirements:
 - Treat opinions and allegations in the image as quoted/depicted viewpoints, not verified facts.
 - Never mention source/original usernames, repost metadata, archive folders, or filenames.
 - Never inject HFT/trading or another stock topic unless the actual media analysis supports it.
-- Smart, natural, specific, and coherent.
+- Build one articulate thought from the strongest supported detail instead of merely describing what is on screen.
+- When audio is available, use what is actually being said to understand the point and outcome.
+- Prefer a concrete observation, interpretation, or reaction over generic praise.
+- Smart, natural, specific, coherent, and conversational.
 - Caption text only; hashtags are appended separately.
+- Do not wrap the answer in quotation marks.
 - Keep the caption under {char_limit} characters.
 - Complete sentences.
 """.strip()
@@ -2057,7 +2101,7 @@ Requirements:
     result=_ollama_generate(
         prompt,min_words=12,max_words=110,attempts=4,system_prompt=persona
     )
-    return _clip_chars(result,char_limit) if result else None
+    return _clean_ollama_output(_clip_chars(result,char_limit)) if result else None
 
 
 
@@ -2093,7 +2137,7 @@ Write ONE {context_type} reply to @{username}.
 MOST RECENT MESSAGE:
 {incoming_text!r}
 
-RECENT CONVERSATION:
+RELEVANT CONVERSATION / ORIGINAL POST CONTEXT:
 {conversation_context or "(none)"}
 
 ACCOUNT-SPECIFIC REPLY INSTRUCTIONS:
@@ -2107,6 +2151,8 @@ Rules:
 - Do not invent private facts.
 - Keep it under {char_limit} characters.
 - Complete sentence(s).
+- For comment replies, use the original post context when supplied so the reply is about both the comment and the post.
+- Do not wrap the answer in quotation marks.
 Output only the reply.
 """.strip()
 
@@ -3867,8 +3913,16 @@ def handle_post_comments(cl, history, username):
                     "add_history",
                     value=f"💭 Comment from @{comment.user.username}: {comment.text[:90]}"
                 )
+                post_context = ""
+                try:
+                    post_caption = str(getattr(media, "caption_text", "") or "").strip()
+                    if post_caption:
+                        post_context = "ORIGINAL POST CAPTION: " + post_caption[:1800]
+                except Exception:
+                    post_context = ""
                 reply = generate_interactive_reply(
                     "comment", comment.text, comment.user.username,
+                    conversation_context=post_context,
                     account_username=username
                 )
                 if not reply:
@@ -4275,6 +4329,7 @@ def execute_repost_flow(cl, history, username, folder_pool):
         source_account=selected_folder.get("source", ""),
         frame_count=settings["video_frames"],
         require_video_vision=settings["require_video_vision"],
+        account_username=username,
     )
 
     if post_analysis.get("vision_required_failed"):
@@ -4299,7 +4354,8 @@ def execute_repost_flow(cl, history, username, folder_pool):
     update_account_metric(
         username, "add_history",
         value=(
-            f"👁️ Media watched with {vision_model}; frames={post_analysis.get('frames_analyzed', 0)}, "
+            f"👁️ Media analyzed with {vision_model}; frames={post_analysis.get('frames_analyzed', 0)}, "
+            f"audio={'transcribed' if post_analysis.get('audio_transcript') else 'unavailable'}, "
             f"perspective={perspective}."
             if vision_model else
             "👁️ No vision model detected; using sanitized text context only."
@@ -4364,7 +4420,9 @@ Rules:
 
     tag_line = " ".join(tags[:5])
     total_limit = int(settings["caption_char_limit"])
-    caption = _clip_chars(caption, max(20, total_limit - len(tag_line) - 2))
+    caption = _clean_ollama_output(
+        _clip_chars(caption, max(20, total_limit - len(tag_line) - 2))
+    )
     full_caption = f"{caption}\n\n{tag_line}".strip()
 
     video_files = [item for item in media_files if item.suffix.lower() == ".mp4"]
@@ -7386,7 +7444,7 @@ def _next_overnight_auto_delay(username: str, result: str, *, manual_run: bool =
             return max(WORKFLOW_RETRY_IDLE_SECONDS, 300), "idle/disconnected"
         return WORKFLOW_RETRY_IDLE_SECONDS, "retry"
     if manual_run:
-        return random.randint(15, 30), "brief rest after manual action"
+        return random.randint(8, 16), "brief rest after manual action"
 
     pace_mode = _runtime_pace_mode(username)
     if pace_mode == "overnight":
@@ -8051,7 +8109,7 @@ def _browser_engage_comment_text(page, username: str) -> str:
             r"\s+",
             " ",
             scope.inner_text(timeout=900) or "",
-        ).strip()[:1200]
+        ).strip()[:3200]
     except Exception:
         visible = ""
 
@@ -8067,19 +8125,21 @@ ACCOUNT COMMENT INSTRUCTIONS:
 {extra or "(none)"}
 
 Rules:
-- Comment on the actual visible subject.
+- Comment on the actual visible subject and any visible caption/text.
+- Prefer one specific observation, question, or interpretation over generic praise.
 - Do not invent facts, identities, relationships, or locations.
 - Do not mention automation, bots, prompts, or source metadata.
 - No threats or slurs.
-- 3 to 24 words.
+- 7 to 36 words, one or two complete sentences.
+- Do not wrap the answer in quotation marks.
 - Output only the comment.
 """.strip()
 
     result = _ollama_generate(
         prompt,
-        min_words=3,
-        max_words=24,
-        attempts=2,
+        min_words=7,
+        max_words=36,
+        attempts=3,
         system_prompt=persona,
     )
     return _clip_chars(
@@ -8108,7 +8168,39 @@ def _browser_try_comment_engage(page, username: str, href: str, history: dict) -
     except Exception:
         return False
 
-    comment = _browser_engage_comment_text(page, username)
+    # When hashtag discovery lands on a Reel, use the same deep multimodal
+    # watch/listen path as the dedicated Reels workflow before commenting.
+    # Static/photo posts continue to use the richer visible post text context.
+    comment = ""
+    if "/reel/" in str(href or "").lower():
+        try:
+            settings = get_account_control_settings(username)
+            reel_context = _browser_reel_watch_context(
+                page,
+                username,
+                watch_seconds=float(settings.get("reels_comment_watch_seconds", 90)),
+                analyze_vision=True,
+                frame_count=int(settings.get("video_frames", 12)),
+            )
+            comment = _browser_prepare_reel_comment(
+                page,
+                username,
+                reel_context,
+            )
+        except Exception as exc:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "⚠️ Deep Engage comment analysis failed; falling back to "
+                    f"visible post context: {type(exc).__name__}: {str(exc)[:100]}"
+                ),
+            )
+
+    if not comment:
+        comment = _browser_engage_comment_text(page, username)
+
+    comment = _clean_ollama_output(comment)
     if not comment:
         update_account_metric(
             username,
@@ -10482,6 +10574,56 @@ def _transcribe_exact_reel_ytdlp_worker(
             except Exception:
                 pass
 
+def _transcribe_local_upload_video(video_path: Path, username: str) -> tuple[str, str]:
+    """Transcribe speech from a local upload before writing its caption.
+
+    The video already exists on disk, so this is more reliable than trying to
+    reconstruct audio after upload. Up to three minutes are analyzed by default
+    (configurable with IG_POST_AUDIO_MAX_SECONDS).
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return "", ""
+
+    video_path = Path(video_path)
+    if not video_path.exists():
+        return "", ""
+
+    out_dir = DOWNLOAD_ROOT / "upload_audio_analysis"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    token = hashlib.sha256(
+        f"{video_path.resolve()}|{video_path.stat().st_size}|{video_path.stat().st_mtime_ns}".encode(
+            "utf-8", "replace"
+        )
+    ).hexdigest()[:20]
+    wav_path = out_dir / f"{token}.wav"
+    max_seconds = max(30, min(600, int(os.environ.get("IG_POST_AUDIO_MAX_SECONDS", "180"))))
+
+    try:
+        subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(video_path), "-t", str(max_seconds),
+                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                str(wav_path),
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=max(120, max_seconds + 60),
+        )
+        if not wav_path.exists() or wav_path.stat().st_size < 5000:
+            return "", ""
+        transcript, backend = _transcribe_wav_local(username, wav_path)
+        transcript = str(transcript or "").strip()[:12000]
+        return transcript, backend
+    except Exception:
+        return "", ""
+    finally:
+        try:
+            if wav_path.exists():
+                wav_path.unlink()
+        except Exception:
+            pass
+
+
 def _start_reel_audio_transcription(
     page,
     username: str,
@@ -11048,11 +11190,13 @@ Before producing the final sentence, silently verify:
 Then output ONLY the final comment.
 
 Requirements:
-- 5 to 28 words.
-- One complete sentence.
+- 8 to 42 words.
+- One or two complete sentences.
 - Specific enough that it would not fit an unrelated reel.
-- Prefer reacting to the reel's actual attempt/result/joke/demo/progression
-  over generic praise or philosophy.
+- Use the audio transcript, visible text, progression, and outcome when available.
+- Make an actual observation, inference, question, or reaction; avoid empty praise.
+- Prefer reacting to the reel's actual attempt/result/joke/demo/progression over generic philosophy.
+- Do not wrap the answer in quotation marks.
 """.strip()
 
     update_account_metric(
@@ -11067,8 +11211,8 @@ Requirements:
     try:
         result = _ollama_generate(
             prompt,
-            min_words=5,
-            max_words=28,
+            min_words=8,
+            max_words=42,
             attempts=3,
             system_prompt=system_prompt,
             username=username,
@@ -18737,7 +18881,7 @@ function cardHtml(user,a){
         <div><label>Engage Follow-author %</label><input id="engagefollow_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_follow_percent??25)}"></div>
         <div><label>Reels write gap seconds (8-60)</label><input id="reelswritegap_${esc(user)}" type="number" min="8" max="60" value="${Number(s.reels_write_gap_seconds||8)}"></div>
         <div><label>Comment-reel max watch seconds (15-90)</label><input id="reelscommentwatch_${esc(user)}" type="number" min="15" max="90" value="${Number(s.reels_comment_watch_seconds||90)}"></div>
-        <div><label>Comment-reel vision frames (4-12)</label><input id="frames_${esc(user)}" type="number" min="4" max="12" value="${Number(s.video_frames||8)}"></div>
+        <div><label>Vision frames for posts/comments (6-16)</label><input id="frames_${esc(user)}" type="number" min="6" max="16" value="${Number(s.video_frames||12)}"></div>
         <div><label>Ollama CPU threads (1-64)</label><input id="ollamacputhreads_${esc(user)}" type="number" min="1" max="64" value="${Number(s.ollama_cpu_threads||8)}"></div>
         <div><label>Ollama GPU layers (0-99)</label><input id="ollamagpulayers_${esc(user)}" type="number" min="0" max="99" value="${Number(s.ollama_gpu_layers??20)}"></div>
         <div><label>Whisper model</label><input id="whispermodel_${esc(user)}" value="${esc(s.whisper_model||'small')}"></div>
@@ -19802,12 +19946,14 @@ def main():
     print("Boot mode: DISCONNECTED / AUTO OFF")
     print(f"Daily follow hard cap: {DAILY_FOLLOW_HARD_CAP} attempts per local day")
     print(
-        "Auto cadence: Normal single-pass; Overnight uses "
-        f"{ACTIVE_SESSION_MIN_SECONDS//60}-{ACTIVE_SESSION_MAX_SECONDS//60} min active sessions, "
+        "Auto cadence: more-active read/browse schedule; "
+        f"Normal rests ~{AUTO_ACTIVE_REST_MIN_SECONDS}-{AUTO_ACTIVE_REST_MAX_SECONDS}s with "
+        f"{AUTO_LONG_REST_MIN_SECONDS//60}-{AUTO_LONG_REST_MAX_SECONDS//60} min periodic rests every "
+        f"{AUTO_PASSES_BEFORE_LONG_MIN}-{AUTO_PASSES_BEFORE_LONG_MAX} successful passes; "
+        f"Overnight uses {ACTIVE_SESSION_MIN_SECONDS//60}-{ACTIVE_SESSION_MAX_SECONDS//60} min active sessions, "
         f"{OVERNIGHT_REST_MIN_SECONDS//60}-{OVERNIGHT_REST_MAX_SECONDS//60} min ordinary rests, "
-        f"{OVERNIGHT_LONG_REST_MIN_SECONDS//60}-{OVERNIGHT_LONG_REST_MAX_SECONDS//60} min periodic long rests; "
-        f"Auto Follow batches {AUTO_FOLLOW_BATCH_MIN}-{AUTO_FOLLOW_BATCH_MAX} visible rows max; "
-        "active-session pass count is configurable per account in the hub."
+        f"{OVERNIGHT_LONG_REST_MIN_SECONDS//60}-{OVERNIGHT_LONG_REST_MAX_SECONDS//60} min periodic long rests. "
+        "Write-rate safety budgets are unchanged."
     )
 
     server = ThreadingHTTPServer((IG_HOST, IG_PORT), DashboardAPIHandler)
