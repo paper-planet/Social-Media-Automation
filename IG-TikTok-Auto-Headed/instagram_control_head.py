@@ -7186,7 +7186,7 @@ def _browser_try_like_engage(page, username: str, href: str, history: dict) -> b
     if href in history.setdefault("browser_liked_urls", []):
         return False
 
-    like_svg = _browser_find_svg_action(page, ("Like",))
+    like_svg = _browser_find_svg_action_visible(page, ("Like",))
     if like_svg is None:
         update_account_metric(
             username,
@@ -7219,7 +7219,7 @@ def _browser_try_like_engage(page, username: str, href: str, history: dict) -> b
         )
         return False
 
-    if _browser_find_svg_action(page, ("Unlike",)) is not None:
+    if _browser_find_svg_action_visible(page, ("Unlike",)) is not None:
         record_write(username, "like")
         history["browser_liked_urls"].append(href)
         history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
@@ -7244,9 +7244,9 @@ def _browser_try_save_engage(page, username: str, href: str, history: dict) -> b
     if href in history["browser_saved_urls"]:
         update_account_metric(username,"add_history",value=f"🔖 Save already recorded; leaving reel saved: {href}")
         return True
-    save_svg=_browser_find_svg_action(page,("Save",))
+    save_svg=_browser_find_svg_action_visible(page,("Save",))
     if save_svg is None:
-        if _browser_find_svg_action(page,("Remove","Unsave")) is not None:
+        if _browser_find_svg_action_visible(page,("Remove","Unsave")) is not None:
             history["browser_saved_urls"].append(href)
             history["browser_saved_urls"]=history["browser_saved_urls"][-5000:]
             update_account_metric(username,"add_history",value=f"🔖 Reel already saved: {href}")
@@ -7262,7 +7262,7 @@ def _browser_try_save_engage(page, username: str, href: str, history: dict) -> b
     except Exception as exc:
         update_account_metric(username,"add_history",value=f"⚠️ Save click failed; continuing: {type(exc).__name__}")
         return False
-    if _browser_find_svg_action(page,("Remove","Unsave")) is not None:
+    if _browser_find_svg_action_visible(page,("Remove","Unsave")) is not None:
         record_write(username,"save")
         history["browser_saved_urls"].append(href)
         history["browser_saved_urls"]=history["browser_saved_urls"][-5000:]
@@ -7276,7 +7276,7 @@ def _browser_try_repost_engage(page, username: str, href: str, history: dict) ->
     if href in history["browser_reposted_urls"]:
         return False
 
-    repost_svg = _browser_find_svg_action(page, ("Repost",))
+    repost_svg = _browser_find_svg_action_visible(page, ("Repost",))
     if repost_svg is None:
         # Some layouts expose the control as a button with accessible text.
         try:
@@ -7340,7 +7340,7 @@ def _browser_try_repost_engage(page, username: str, href: str, history: dict) ->
         return False
 
     confirmed = (
-        _browser_find_svg_action(
+        _browser_find_svg_action_visible(
             page,
             ("Remove repost", "Undo repost", "Reposted"),
         )
@@ -7545,9 +7545,7 @@ def _browser_try_follow_author_engage(page, username: str, href: str) -> bool:
         )
         return False
 
-    scope = page.locator("article").first
-    if not scope.count():
-        scope = page.locator("main").first
+    scope = _browser_visible_reel_scope(page)
 
     try:
         follows = scope.get_by_role(
@@ -7695,6 +7693,134 @@ def _browser_collect_engage_links(
 
     return links
 
+def _browser_visible_reel_scope(page):
+    """
+    Return the currently dominant visible reel/post container.
+
+    Instagram may keep neighboring reels mounted in the DOM. This chooses the
+    visible article/section with the largest viewport intersection, preferring
+    the one closest to the viewport center.
+    """
+    best = None
+    best_score = None
+
+    for selector in (
+        "main article",
+        "article",
+        "main section",
+        "section",
+    ):
+        try:
+            locs = page.locator(selector)
+            count = min(locs.count(), 80)
+        except Exception:
+            continue
+
+        for i in range(count):
+            loc = locs.nth(i)
+
+            try:
+                data = loc.evaluate(
+                    """
+                    el => {
+                      const r = el.getBoundingClientRect();
+                      const vh = window.innerHeight || 1;
+                      const vw = window.innerWidth || 1;
+
+                      const left = Math.max(0, r.left);
+                      const right = Math.min(vw, r.right);
+                      const top = Math.max(0, r.top);
+                      const bottom = Math.min(vh, r.bottom);
+
+                      const iw = Math.max(0, right - left);
+                      const ih = Math.max(0, bottom - top);
+                      const area = iw * ih;
+
+                      if (area <= 0 || r.width <= 0 || r.height <= 0) {
+                        return null;
+                      }
+
+                      const cx = r.left + r.width / 2;
+                      const cy = r.top + r.height / 2;
+                      const centerDistance =
+                        Math.abs(cx - vw / 2) +
+                        Math.abs(cy - vh / 2);
+
+                      return {
+                        area,
+                        centerDistance,
+                        width: r.width,
+                        height: r.height
+                      };
+                    }
+                    """
+                )
+            except Exception:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            area = float(data.get("area") or 0.0)
+            center = float(data.get("centerDistance") or 999999.0)
+
+            # Favor large visible containers, then the one nearest center.
+            score = (-area, center)
+
+            if best_score is None or score < best_score:
+                best_score = score
+                best = loc
+
+    if best is not None:
+        return best
+
+    try:
+        main = page.locator("main").first
+        if main.count() and main.is_visible(timeout=200):
+            return main
+    except Exception:
+        pass
+
+    return page
+
+
+def _browser_visible_reel_permalink(page, scope=None) -> str:
+    """
+    Resolve the current visible reel permalink without navigating.
+    """
+    scope = scope or _browser_visible_reel_scope(page)
+
+    try:
+        hrefs = scope.locator("a[href*='/reel/']").evaluate_all(
+            """els => els.map(e => e.href || e.getAttribute('href') || '')
+                         .filter(Boolean)"""
+        )
+    except Exception:
+        hrefs = []
+
+    for href in hrefs:
+        clean = str(href).split("?", 1)[0].strip()
+        if "/reel/" in clean:
+            return clean
+
+    try:
+        current = str(page.url or "").split("?", 1)[0]
+    except Exception:
+        current = ""
+
+    if "/reel/" in current:
+        return current
+
+    return f"reels-demo-current:{int(time.time())}"
+
+
+def _browser_find_svg_action_visible(page, labels):
+    scope = _browser_visible_reel_scope(page)
+    found = _browser_find_svg_action(scope, labels)
+    if found is not None:
+        return found
+    return _browser_find_svg_action(page, labels)
+
 def _browser_current_visible_reel_key(page, fallback_index: int = 0) -> str:
     """
     Find the reel permalink nearest the viewport center without navigating.
@@ -7741,9 +7867,10 @@ def _browser_current_visible_reel_key(page, fallback_index: int = 0) -> str:
 
 def _browser_open_reel_comments_if_needed(page) -> bool:
     """
-    Open the visible reel's comments panel if Instagram exposes a Comment
-    action. Missing controls are non-fatal.
+    Open comments for the currently visible reel only.
     """
+    scope = _browser_visible_reel_scope(page)
+
     try:
         existing = page.locator(
             "textarea[placeholder*='comment' i], "
@@ -7755,9 +7882,15 @@ def _browser_open_reel_comments_if_needed(page) -> bool:
         pass
 
     comment_svg = _browser_find_svg_action(
-        page,
+        scope,
         ("Comment", "Comments"),
     )
+    if comment_svg is None:
+        comment_svg = _browser_find_svg_action(
+            page,
+            ("Comment", "Comments"),
+        )
+
     if comment_svg is None:
         return False
 
@@ -7778,6 +7911,7 @@ def _browser_open_reel_comments_if_needed(page) -> bool:
         )
     except Exception:
         return False
+
 
 
 def _browser_reels_scroll_next(page) -> bool:
@@ -7810,81 +7944,242 @@ def _browser_reels_scroll_next(page) -> bool:
 
 
 def _browser_reels_demo(username, history, config) -> int:
-    settings=get_account_control_settings(username,config)
-    reel_target=max(1,min(10,int(settings.get("engage_clips_per_pass",6))))
-    for k in ("browser_liked_urls","browser_saved_urls","browser_reposted_urls","browser_commented_urls"):
-        history.setdefault(k,[])
-    viewed=0
-    confirmed_actions=0
-    seen_keys=set()
-    update_account_metric(username,"add_history",value=f"🎞️ Reels Demo starting: up to {reel_target} reel(s); each reel attempts Like + Save + Repost + Follow-author + Comment.")
+    """
+    Manual one-reel demonstration.
+
+    If Chromium is already on a reel/reels page, use the reel currently on
+    screen. Otherwise open /reels/ once. Attempt all five actions exactly once
+    on that one reel and stop. Auto being OFF does not cancel this manual task.
+    """
+    for key in (
+        "browser_liked_urls",
+        "browser_saved_urls",
+        "browser_reposted_urls",
+        "browser_commented_urls",
+    ):
+        history.setdefault(key, [])
+
+    confirmed_actions = 0
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🎞️ Reels Demo starting: exactly ONE currently visible reel; "
+            "attempting Like + Save + Repost + Follow-author + Comment once."
+        ),
+    )
 
     with sync_playwright() as p:
-        context=_browser_launch(p,username,headed=True)
-        page=context.pages[0] if context.pages else context.new_page()
+        context = _browser_launch(
+            p,
+            username,
+            headed=True,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+
         try:
-            page.goto("https://www.instagram.com/reels/",wait_until="domcontentloaded",timeout=60000)
-            page.wait_for_timeout(1400)
-            _browser_check_ready(page,context,username)
+            try:
+                current_url = str(page.url or "")
+            except Exception:
+                current_url = ""
 
-            while viewed<reel_target:
-                if username in CONTROL_PAUSED_ACCOUNTS or get_account_safety_state(username)["active"]:
-                    break
-                if _browser_engage_security_problem(page,username):
-                    break
+            # Reuse the current reel instead of navigating away from it.
+            if (
+                "instagram.com/reel/" not in current_url.lower()
+                and "instagram.com/reels" not in current_url.lower()
+            ):
+                page.goto(
+                    "https://www.instagram.com/reels/",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(1400)
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value="🎞️ Reels Demo opened the Reels feed once.",
+                )
+            else:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🎞️ Reels Demo is reusing the reel already visible "
+                        "in Chromium; no navigation performed."
+                    ),
+                )
 
-                reel_key=_browser_current_visible_reel_key(page,viewed+1)
-                if reel_key in seen_keys:
-                    if not _browser_reels_scroll_next(page):
-                        break
-                    reel_key=_browser_current_visible_reel_key(page,viewed+1)
-                    if reel_key in seen_keys:
-                        break
+            _browser_check_ready(page, context, username)
 
-                seen_keys.add(reel_key)
-                viewed+=1
-                update_account_metric(username,"add_history",value=f"🎬 Reels Demo {viewed}/{reel_target}: attempting all five actions on {reel_key}")
-                page.wait_for_timeout(900)
+            # Manual action must NOT stop merely because background Auto is off.
+            safety = get_account_safety_state(username)
+            if safety["active"]:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🛑 Reels Demo stopped before actions because a real "
+                        f"safety/backoff state is active: {safety['reason'][:160]}"
+                    ),
+                )
+                return 0
 
-                if _browser_try_like_engage(page,username,reel_key,history): confirmed_actions+=1
-                if _browser_engage_security_problem(page,username): break
+            problem = _browser_engage_security_problem(
+                page,
+                username,
+            )
+            if problem:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🛑 Reels Demo stopped before actions because Instagram "
+                        f"requires manual attention: {problem}"
+                    ),
+                )
+                return 0
 
-                if _browser_try_save_engage(page,username,reel_key,history): confirmed_actions+=1
-                if _browser_engage_security_problem(page,username): break
+            scope = _browser_visible_reel_scope(page)
+            reel_key = _browser_visible_reel_permalink(
+                page,
+                scope,
+            )
 
-                if _browser_try_repost_engage(page,username,reel_key,history): confirmed_actions+=1
-                if _browser_engage_security_problem(page,username): break
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"🎬 Reels Demo 1/1: {reel_key} · "
+                    "attempting all five actions now."
+                ),
+            )
 
-                if _browser_try_follow_author_engage(page,username,reel_key): confirmed_actions+=1
-                if _browser_engage_security_problem(page,username): break
+            page.wait_for_timeout(700)
 
-                if _browser_open_reel_comments_if_needed(page):
-                    if _browser_try_comment_engage(page,username,reel_key,history): confirmed_actions+=1
-                else:
-                    update_account_metric(username,"add_history",value="↪️ Comment attempted but the visible comment control/panel was unavailable.")
-                if _browser_engage_security_problem(page,username): break
+            # 1) LIKE
+            update_account_metric(
+                username,
+                "add_history",
+                value="1️⃣ Reels Demo: attempting Like.",
+            )
+            if _browser_try_like_engage(
+                page,
+                username,
+                reel_key,
+                history,
+            ):
+                confirmed_actions += 1
 
-                try:
-                    page.keyboard.press("Escape")
-                    page.wait_for_timeout(250)
-                except Exception:
-                    pass
-                if viewed>=reel_target:
-                    break
-                update_account_metric(username,"add_history",value="↕️ Reels Demo scrolling to next reel; no refresh.")
-                if not _browser_reels_scroll_next(page):
-                    break
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # 2) SAVE
+            update_account_metric(
+                username,
+                "add_history",
+                value="2️⃣ Reels Demo: attempting Save.",
+            )
+            if _browser_try_save_engage(
+                page,
+                username,
+                reel_key,
+                history,
+            ):
+                confirmed_actions += 1
+
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # 3) REPOST
+            update_account_metric(
+                username,
+                "add_history",
+                value="3️⃣ Reels Demo: attempting Repost.",
+            )
+            if _browser_try_repost_engage(
+                page,
+                username,
+                reel_key,
+                history,
+            ):
+                confirmed_actions += 1
+
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # 4) FOLLOW AUTHOR
+            update_account_metric(
+                username,
+                "add_history",
+                value="4️⃣ Reels Demo: attempting Follow-author.",
+            )
+            if _browser_try_follow_author_engage(
+                page,
+                username,
+                reel_key,
+            ):
+                confirmed_actions += 1
+
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # 5) COMMENT
+            update_account_metric(
+                username,
+                "add_history",
+                value="5️⃣ Reels Demo: attempting Comment.",
+            )
+            if _browser_open_reel_comments_if_needed(page):
+                if _browser_try_comment_engage(
+                    page,
+                    username,
+                    reel_key,
+                    history,
+                ):
+                    confirmed_actions += 1
+            else:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "↪️ Reels Demo Comment control/panel was unavailable "
+                        "on the visible reel."
+                    ),
+                )
+
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
         finally:
             try:
-                _browser_refresh_saved_sessionid(context,username)
+                _browser_refresh_saved_sessionid(
+                    context,
+                    username,
+                )
             except Exception:
                 pass
             _browser_close_context(context)
 
-    for k in ("browser_liked_urls","browser_saved_urls","browser_reposted_urls","browser_commented_urls"):
-        history[k]=history[k][-5000:]
-    update_account_metric(username,"add_history",value=f"🎞️ Reels Demo finished: viewed {viewed}, confirmed actions={confirmed_actions}; every reel attempted all five actions.")
+    for key in (
+        "browser_liked_urls",
+        "browser_saved_urls",
+        "browser_reposted_urls",
+        "browser_commented_urls",
+    ):
+        history[key] = history[key][-5000:]
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🎞️ Reels Demo finished: viewed 1 reel, "
+            f"confirmed actions={confirmed_actions}; no second reel opened."
+        ),
+    )
+
     return confirmed_actions
+
 
 
 def _browser_engage_hashtag(username, history, config, manual=False) -> int:
@@ -11575,7 +11870,7 @@ function cardHtml(user,a){
     <div class="section">
       <b>Manual actions</b>
       <div class="row">
-        <button class="good" ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','reels_demo')">🎞️ Reels Demo</button>
+        <button class="good" ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','reels_demo')">🎞️ Reels Demo · 1 Reel</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
         <button ${connected ? "":"disabled"} onclick="clearUploadCooldown('${esc(user)}')">Clear Upload Cooldown</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
@@ -12577,7 +12872,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reels All Actions + Rest DM: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Single Reel Demo Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
