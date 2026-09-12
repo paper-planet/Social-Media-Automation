@@ -55,7 +55,7 @@ IG_ACCOUNTS_FILE = Path(
 ).expanduser()
 
 
-REELS_BUILD_ID = "auto-synergy-action-rail-v8"
+REELS_BUILD_ID = "auto-synergy-caption-label-fix-v9"
 def _safe_account_slug(username):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(username or "").strip().lstrip("@"))
     return value.strip("._-") or "instagram_account"
@@ -14614,46 +14614,89 @@ def _browser_preferred_post_hashtags(
     return result[:5]
 
 
+def _browser_strip_caption_labels(value: str) -> str:
+    """
+    Remove model-formatting labels from user-visible Instagram captions while
+    preserving the actual caption text and #hashtags.
+
+    Handles:
+      HASHTAGS:
+      Hashtags -
+      hashtags
+      CAPTION:
+      inline labels such as "... HASHTAGS: #tag1 #tag2"
+    """
+    cleaned = str(value or "")
+
+    # Remove CAPTION labels when they appear at the start of a line/string.
+    cleaned = re.sub(
+        r"(?im)^\s*CAPTION\s*(?::|-)?\s*",
+        "",
+        cleaned,
+    )
+
+    # Remove HASHTAG/HASHTAGS labels anywhere they appear before the real tags.
+    cleaned = re.sub(
+        r"(?i)(?<![#A-Za-z0-9_])HASHTAGS?\s*(?::|-)?\s*",
+        "",
+        cleaned,
+    )
+
+    # Clean up whitespace left behind without flattening the normal
+    # caption/hashtag paragraph break.
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    return cleaned.strip()
+
 def _browser_extract_caption_from_ai(raw: str) -> str:
     """
-    Accept both the requested CAPTION:/HASHTAGS: format and ordinary model
-    output so a harmless formatting miss does not force a fallback.
+    Extract only the caption prose from AI output.
+
+    Accepts labeled or ordinary output and prevents CAPTION:/HASHTAGS: labels
+    from leaking into the Instagram caption.
     """
     raw = _clean_ollama_output(raw or "").strip()
     if not raw:
         return ""
 
+    # CAPTION: may be followed by HASHTAGS: on the same line or another line.
     match = re.search(
-        r"CAPTION:\s*(.*?)(?:\n\s*HASHTAGS:|\Z)",
+        r"CAPTION\s*:\s*(.*?)(?=\s+HASHTAGS?\s*:|\Z)",
         raw,
         re.I | re.S,
     )
     if match:
-        return match.group(1).strip()
+        return _browser_strip_caption_labels(
+            match.group(1).strip()
+        )
 
-    # Remove a trailing hashtag section if the model omitted CAPTION:.
+    # If CAPTION: was omitted, split at HASHTAGS: whether inline or multiline.
     cleaned = re.split(
-        r"\n\s*HASHTAGS?\s*:",
+        r"(?i)(?<![#A-Za-z0-9_])HASHTAGS?\s*:",
         raw,
         maxsplit=1,
-        flags=re.I,
     )[0].strip()
 
-    # Also strip standalone hashtag-only tail lines.
+    # Strip standalone hashtag-only tail lines from prose extraction.
     lines = []
     for line in cleaned.splitlines():
         stripped = line.strip()
+
         if stripped and re.fullmatch(
             r"(?:#[A-Za-z0-9_]+\s*){2,}",
             stripped,
         ):
             continue
+
         if stripped:
             lines.append(stripped)
 
     cleaned = " ".join(lines).strip()
-    cleaned = re.sub(r"^CAPTION\s*:\s*", "", cleaned, flags=re.I)
-    return cleaned
+    return _browser_strip_caption_labels(cleaned)
+
 
 
 def _browser_caption_readback(locator) -> str:
@@ -14729,6 +14772,7 @@ def _browser_set_caption_verified(page, caption_box, full_caption: str) -> tuple
     Share is not allowed to continue merely because .fill() returned without an
     exception.
     """
+    full_caption = _browser_strip_caption_labels(full_caption)
     expected = re.sub(r"\s+", " ", full_caption).strip()
     expected_tags = re.findall(r"#[A-Za-z0-9_]+", full_caption)
 
@@ -14869,8 +14913,12 @@ def _browser_fallback_caption(
         max(20, total_limit - len(tag_line) - 2),
     )
 
+    final_caption = _browser_strip_caption_labels(
+        f"{caption}\n\n{tag_line}".strip()
+    )
+
     return {
-        "caption": f"{caption}\n\n{tag_line}".strip(),
+        "caption": final_caption,
         "used_fallback": True,
         "reason": str(reason or "AI unavailable"),
         "analysis": analysis,
@@ -15052,8 +15100,12 @@ Rules:
         max(20, char_limit - len(tag_line) - 2),
     )
 
+    final_caption = _browser_strip_caption_labels(
+        f"{caption}\n\n{tag_line}".strip()
+    )
+
     return {
-        "caption": f"{caption}\n\n{tag_line}".strip(),
+        "caption": final_caption,
         "used_fallback": False,
         "reason": "",
         "analysis": analysis,
@@ -18924,7 +18976,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reels + Auto Synergy Refactor: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reels + Auto Synergy Caption Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
