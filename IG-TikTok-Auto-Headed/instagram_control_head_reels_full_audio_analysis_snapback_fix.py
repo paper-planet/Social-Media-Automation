@@ -55,6 +55,7 @@ IG_ACCOUNTS_FILE = Path(
 ).expanduser()
 
 
+REELS_BUILD_ID = "skip-scroll-sponsored-topic-v4"
 def _safe_account_slug(username):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(username or "").strip().lstrip("@"))
     return value.strip("._-") or "instagram_account"
@@ -7978,37 +7979,116 @@ def _browser_reel_stable_key(page, scope=None) -> str:
     return f"reel-fp:{digest}"
 
 
-def _browser_visible_reel_is_ad(page, scope=None) -> bool:
-    """
-    Detect sponsored/advertising reels only inside the CURRENT visible Reel.
-    """
+def _browser_visible_reel_text(page, scope=None, *, limit: int = 5000) -> str:
     scope = scope or _browser_visible_reel_scope(page)
 
-    for pattern in (
-        r"^Sponsored$",
-        r"^Ad$",
-        r"^Advertisement$",
-    ):
-        try:
-            locs = scope.get_by_text(re.compile(pattern, re.I))
-            for i in range(min(locs.count(), 12)):
-                if locs.nth(i).is_visible(timeout=100):
-                    return True
-        except Exception:
-            pass
+    try:
+        raw = str(scope.inner_text(timeout=500) or "")
+    except Exception:
+        raw = ""
+
+    return re.sub(r"\s+", " ", raw).strip()[:limit]
+
+
+def _browser_sponsored_reel_allowed_topic(page, scope=None) -> str:
+    """
+    Return "finance", "coding", or "".
+
+    Sponsored reels are only eligible for engagement when the visible current
+    Reel clearly contains finance/trading/markets or coding/software/dev/AI
+    terminology. Ambiguous sponsored content is skipped.
+    """
+    scope = scope or _browser_visible_reel_scope(page)
+    visible = _browser_visible_reel_text(page, scope, limit=6000).lower()
+
+    finance_terms = (
+        "finance", "financial", "stock", "stocks", "trading", "trader",
+        "forex", "futures", "options", "investing", "investor", "market",
+        "markets", "nasdaq", "nyse", "s&p", "sp500", "bitcoin", "crypto",
+        "cryptocurrency", "xauusd", "gold", "bond", "bonds", "portfolio",
+        "earnings", "dividend", "dividends", "etf", "interest rate",
+    )
+
+    coding_terms = (
+        "code", "coding", "programmer", "programming", "developer",
+        "development", "software", "python", "javascript", "typescript",
+        "github", "api", "database", "server", "cloud", "devops", "docker",
+        "kubernetes", "linux", "algorithm", "automation", "automate",
+        "machine learning", "artificial intelligence", " ai ", "llm",
+        "ollama", "open source", "saas", "web app", "app development",
+    )
+
+    if any(term in visible for term in finance_terms):
+        return "finance"
+
+    padded = f" {visible} "
+    if any(term in padded for term in coding_terms):
+        return "coding"
+
+    return ""
+
+def _browser_visible_reel_is_ad(page, scope=None) -> bool:
+    """
+    Conservative Sponsored/ad detection for the CURRENT centered Reel only.
+
+    Do not search the whole Reel container's text for the word "Sponsored",
+    because Instagram can keep neighboring reels and unrelated UI mounted.
+    Require an exact visible marker positioned within the active video's
+    vertical region.
+    """
+    scope = scope or _browser_visible_reel_scope(page)
+    video = _browser_visible_video(page, scope)
+
+    if video is None:
+        return False
 
     try:
-        visible_text = re.sub(
-            r"\s+",
-            " ",
-            scope.inner_text(timeout=250) or "",
-        ).strip()
-        if re.search(r"(?:^|\\s)Sponsored(?:\\s|$)", visible_text, re.I):
-            return True
+        video_box = video.bounding_box(timeout=250)
     except Exception:
-        pass
+        video_box = None
+
+    if not video_box:
+        return False
+
+    top = float(video_box["y"])
+    bottom = top + float(video_box["height"])
+    margin = max(80.0, float(video_box["height"]) * 0.20)
+
+    exact_patterns = (
+        r"^Sponsored$",
+        r"^Advertisement$",
+    )
+
+    for pattern in exact_patterns:
+        try:
+            locs = scope.get_by_text(
+                re.compile(pattern, re.I),
+                exact=True,
+            )
+            count = min(locs.count(), 20)
+        except Exception:
+            continue
+
+        for i in range(count):
+            loc = locs.nth(i)
+
+            try:
+                if not loc.is_visible(timeout=120):
+                    continue
+
+                box = loc.bounding_box(timeout=180)
+                if not box:
+                    continue
+
+                cy = float(box["y"]) + float(box["height"]) / 2.0
+
+                if (top - margin) <= cy <= (bottom + margin):
+                    return True
+            except Exception:
+                continue
 
     return False
+
 
 
 def _browser_reel_identity_matches(
@@ -8414,8 +8494,22 @@ def _browser_open_reel_comments_if_needed(page) -> bool:
 
 def _browser_reels_scroll_next(page) -> bool:
     """
-    Advance the Reels feed without refresh/navigation.
+    Advance to the next Reel and VERIFY that the centered Reel identity changed.
+
+    A wheel/key event by itself is not success. Instagram sometimes absorbs
+    the event without moving the Reels feed, which caused the old skip loop to
+    re-check the same Reel repeatedly.
     """
+    before_key = _browser_reel_stable_key(
+        page,
+        _browser_visible_reel_scope(page),
+    )
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
     try:
         vh = int(
             page.evaluate(
@@ -8425,20 +8519,126 @@ def _browser_reels_scroll_next(page) -> bool:
     except Exception:
         vh = 800
 
+    # Put the mouse over the actual visible video so wheel events target the
+    # Reels feed rather than a sidebar.
     try:
-        page.mouse.wheel(
-            0,
-            int(vh * random.uniform(0.82, 1.05)),
-        )
-        page.wait_for_timeout(random.randint(900, 1500))
-        return True
+        scope = _browser_visible_reel_scope(page)
+        video = _browser_visible_video(page, scope)
+        if video is not None:
+            box = video.bounding_box(timeout=250)
+            if box:
+                page.mouse.move(
+                    float(box["x"]) + float(box["width"]) * 0.50,
+                    float(box["y"]) + float(box["height"]) * 0.50,
+                )
     except Exception:
+        pass
+
+    def changed(wait_ms=900):
+        page.wait_for_timeout(wait_ms)
         try:
-            page.keyboard.press("ArrowDown")
-            page.wait_for_timeout(random.randint(900, 1500))
-            return True
+            after_key = _browser_reel_stable_key(
+                page,
+                _browser_visible_reel_scope(page),
+            )
         except Exception:
             return False
+
+        return bool(after_key and after_key != before_key)
+
+    # Strategy 1: scroll the nearest real scrollable ancestor of the currently
+    # visible video. This is generally the most reliable path on Reels.
+    try:
+        page.evaluate(
+            """
+            () => {
+              const videos = [...document.querySelectorAll('video')];
+              const vh = window.innerHeight || 1;
+              const vw = window.innerWidth || 1;
+
+              let v = null;
+              let best = 0;
+
+              for (const candidate of videos) {
+                const r = candidate.getBoundingClientRect();
+                const left = Math.max(0, r.left);
+                const right = Math.min(vw, r.right);
+                const top = Math.max(0, r.top);
+                const bottom = Math.min(vh, r.bottom);
+                const area =
+                  Math.max(0, right-left) * Math.max(0, bottom-top);
+
+                if (area > best) {
+                  best = area;
+                  v = candidate;
+                }
+              }
+
+              if (!v) return false;
+
+              let cur = v.parentElement;
+
+              while (cur) {
+                const style = getComputedStyle(cur);
+                const overflowY = style.overflowY || '';
+                const scrollable =
+                  /(auto|scroll)/.test(overflowY) &&
+                  cur.scrollHeight > cur.clientHeight + 80;
+
+                if (scrollable) {
+                  cur.scrollBy({
+                    top: Math.max(520, cur.clientHeight * 0.92),
+                    left: 0,
+                    behavior: 'instant'
+                  });
+                  return true;
+                }
+
+                cur = cur.parentElement;
+              }
+
+              window.scrollBy({
+                top: Math.max(520, window.innerHeight * 0.92),
+                left: 0,
+                behavior: 'instant'
+              });
+              return true;
+            }
+            """
+        )
+        if changed(1100):
+            return True
+    except Exception:
+        pass
+
+    # Strategy 2: a deliberate PageDown.
+    try:
+        page.keyboard.press("PageDown")
+        if changed(1100):
+            return True
+    except Exception:
+        pass
+
+    # Strategy 3: larger wheel movement over the visible Reel.
+    try:
+        page.mouse.wheel(0, int(vh * 1.25))
+        if changed(1200):
+            return True
+    except Exception:
+        pass
+
+    # Strategy 4: ArrowDown twice for feeds that snap one card per keypress.
+    try:
+        page.keyboard.press("ArrowDown")
+        page.wait_for_timeout(300)
+        page.keyboard.press("ArrowDown")
+        if changed(1200):
+            return True
+    except Exception:
+        pass
+
+    return False
+
 
 
 def _browser_visible_video(page, scope=None):
@@ -9242,6 +9442,300 @@ def _transcribe_reel_audio_worker(
                 pass
 
 
+def _browser_current_reel_canonical_url(page, scope=None) -> str:
+    """
+    Return the exact canonical URL for the currently centered Reel.
+
+    This is used only as a fallback for audio acquisition when Instagram plays
+    the media through blob:/MediaSource and no direct HTTP video source exists.
+    """
+    scope = scope or _browser_visible_reel_scope(page)
+
+    # Strongest source: permalink inside the active Reel container.
+    try:
+        hrefs = scope.locator(
+            "a[href*='/reel/'], a[href*='/reels/']"
+        ).evaluate_all(
+            """els => els.map(e => e.href || e.getAttribute('href') || '')
+                         .filter(Boolean)"""
+        )
+    except Exception:
+        hrefs = []
+
+    candidates = list(hrefs or [])
+
+    try:
+        candidates.append(str(page.url or ""))
+    except Exception:
+        pass
+
+    for raw in candidates:
+        url = str(raw or "").strip()
+        match = re.search(
+            r"https?://(?:www\.)?instagram\.com/reels?/([^/?#]+)/?",
+            url,
+            re.I,
+        )
+
+        if match:
+            shortcode = match.group(1)
+            return f"https://www.instagram.com/reel/{shortcode}/"
+
+        match = re.search(
+            r"/reels?/([^/?#]+)/?",
+            url,
+            re.I,
+        )
+
+        if match:
+            shortcode = match.group(1)
+            return f"https://www.instagram.com/reel/{shortcode}/"
+
+    return ""
+
+
+def _browser_export_netscape_cookies(
+    page,
+    reel_url: str,
+    username: str,
+) -> Path | None:
+    """
+    Export only the browser cookies needed by yt-dlp into a temporary Netscape
+    cookie file. The file is deleted by the audio worker.
+    """
+    root = DOWNLOAD_ROOT / "reel_audio_cache"
+    root.mkdir(parents=True, exist_ok=True)
+
+    out = root / (
+        f"{_safe_account_slug(username)}_"
+        f"{int(time.time()*1000)}_cookies.txt"
+    )
+
+    try:
+        cookies = page.context.cookies(
+            [
+                "https://www.instagram.com/",
+                reel_url,
+            ]
+        )
+    except Exception:
+        cookies = []
+
+    if not cookies:
+        return None
+
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Temporary Instagram cookies for exact-Reel audio download.",
+    ]
+
+    for cookie in cookies:
+        try:
+            domain = str(cookie.get("domain") or "").strip()
+            if not domain:
+                continue
+
+            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+            path = str(cookie.get("path") or "/")
+            secure = "TRUE" if cookie.get("secure") else "FALSE"
+
+            expires = cookie.get("expires")
+            try:
+                expires = int(float(expires))
+            except Exception:
+                expires = 0
+
+            name = str(cookie.get("name") or "")
+            value = str(cookie.get("value") or "")
+
+            if not name:
+                continue
+
+            lines.append(
+                "\t".join(
+                    [
+                        domain,
+                        include_subdomains,
+                        path,
+                        secure,
+                        str(expires),
+                        name,
+                        value,
+                    ]
+                )
+            )
+        except Exception:
+            continue
+
+    if len(lines) <= 2:
+        return None
+
+    try:
+        out.write_text(
+            "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
+        return out
+    except Exception:
+        return None
+
+
+def _download_exact_reel_media_ytdlp(
+    username: str,
+    reel_url: str,
+    cookie_file: Path | None,
+) -> tuple[Path | None, str]:
+    """
+    Download media from the EXACT locked Reel URL using yt-dlp.
+
+    This is intentionally safer than selecting an arbitrary recent MP4 from
+    Instagram's network cache because the URL belongs to the Reel identity
+    already locked by the browser workflow.
+    """
+    try:
+        import yt_dlp
+    except Exception:
+        return None, (
+            "yt-dlp is not installed "
+            "(install with: python -m pip install -U yt-dlp)"
+        )
+
+    root = DOWNLOAD_ROOT / "reel_audio_cache"
+    root.mkdir(parents=True, exist_ok=True)
+
+    stem = (
+        f"{_safe_account_slug(username)}_"
+        f"{int(time.time()*1000)}_exact_reel"
+    )
+    template = str(root / f"{stem}.%(ext)s")
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        # We only need an audio-bearing file. Prefer audio-only where the
+        # extractor exposes it, otherwise use the best single-file media.
+        "format": "bestaudio/best",
+        "outtmpl": template,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+    }
+
+    if cookie_file and Path(cookie_file).exists():
+        opts["cookiefile"] = str(cookie_file)
+
+    before = set(root.glob(f"{stem}.*"))
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                reel_url,
+                download=True,
+            )
+
+            requested = []
+
+            if isinstance(info, dict):
+                filename = info.get("_filename")
+                if filename:
+                    requested.append(Path(filename))
+
+                for key in ("requested_downloads", "requested_formats"):
+                    for row in info.get(key) or []:
+                        if isinstance(row, dict):
+                            fp = row.get("filepath") or row.get("_filename")
+                            if fp:
+                                requested.append(Path(fp))
+
+        for candidate in requested:
+            if candidate.exists() and candidate.stat().st_size > 10_000:
+                return candidate, ""
+
+        after = set(root.glob(f"{stem}.*"))
+        created = sorted(
+            [
+                p
+                for p in (after - before)
+                if p.is_file() and p.stat().st_size > 10_000
+            ],
+            key=lambda p: p.stat().st_size,
+            reverse=True,
+        )
+
+        if created:
+            return created[0], ""
+
+        return None, "yt-dlp completed but produced no usable Reel media file"
+
+    except Exception as exc:
+        return None, f"yt-dlp exact-Reel download failed: {type(exc).__name__}"
+
+
+def _transcribe_exact_reel_ytdlp_worker(
+    username: str,
+    reel_url: str,
+    cookie_file: Path | None,
+) -> dict:
+    media_path = None
+    wav_path = None
+
+    try:
+        media_path, reason = _download_exact_reel_media_ytdlp(
+            username,
+            reel_url,
+            cookie_file,
+        )
+
+        if media_path is None:
+            return {
+                "transcript": "",
+                "backend": "",
+                "reason": reason,
+            }
+
+        wav_path = _extract_reel_audio_wav(media_path)
+
+        if wav_path is None:
+            return {
+                "transcript": "",
+                "backend": "",
+                "reason": (
+                    "exact Reel downloaded, but ffmpeg could not extract audio"
+                ),
+            }
+
+        transcript, backend = _transcribe_wav_local(
+            username,
+            wav_path,
+        )
+
+        if transcript:
+            return {
+                "transcript": transcript,
+                "backend": f"{backend}+yt-dlp-exact-reel",
+                "reason": "",
+            }
+
+        return {
+            "transcript": "",
+            "backend": "",
+            "reason": (
+                "exact Reel audio was extracted, but local Whisper returned "
+                "no transcript"
+            ),
+        }
+
+    finally:
+        for path in (wav_path, media_path, cookie_file):
+            if not path:
+                continue
+
+            try:
+                Path(path).unlink()
+            except Exception:
+                pass
+
 def _start_reel_audio_transcription(
     page,
     username: str,
@@ -9252,41 +9746,78 @@ def _start_reel_audio_transcription(
     if not settings.get("reels_audio_transcription", True):
         return None, None
 
+    # Fast path: Instagram directly exposes HTTP media on the current <video>.
     media_url = _browser_find_reel_media_url(page, scope)
 
-    if not media_url:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🎧 Reel audio stream URL was not exposed; deep analysis will "
-                "use visuals + visible caption/subtitles."
-            ),
-        )
-        return None, None
-
-    headers = _browser_media_request_headers(page, media_url)
     executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="reel-audio",
     )
-    future = executor.submit(
-        _transcribe_reel_audio_worker,
+
+    if media_url:
+        headers = _browser_media_request_headers(page, media_url)
+        future = executor.submit(
+            _transcribe_reel_audio_worker,
+            username,
+            media_url,
+            headers,
+        )
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🎧 Reel audio transcription started from the current visible "
+                "video's direct media URL."
+            ),
+        )
+
+        return executor, future
+
+    # Instagram commonly uses blob:/MediaSource. Instead of guessing from
+    # cached MP4s, bind the fallback to the exact visible Reel permalink.
+    reel_url = _browser_current_reel_canonical_url(
+        page,
+        scope,
+    )
+
+    if not reel_url:
+        executor.shutdown(wait=False, cancel_futures=True)
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🎧 Current Reel uses blob/MediaSource and no exact Reel "
+                "permalink could be bound; skipping audio rather than using "
+                "audio from a possibly different Reel."
+            ),
+        )
+        return None, None
+
+    cookie_file = _browser_export_netscape_cookies(
+        page,
+        reel_url,
         username,
-        media_url,
-        headers,
+    )
+
+    future = executor.submit(
+        _transcribe_exact_reel_ytdlp_worker,
+        username,
+        reel_url,
+        cookie_file,
     )
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            "🎧 Reel audio transcription started in parallel with visual "
-            "watching/analysis."
+            "🎧 Current Reel uses blob/MediaSource; started exact-Reel audio "
+            f"fallback for {reel_url}"
         ),
     )
 
     return executor, future
+
 
 
 def _finish_reel_audio_transcription(
@@ -11164,6 +11695,52 @@ def _browser_close_comment_panel_safely(
     )
     return False
 
+def _browser_reel_reorder_for_budget(
+    username: str,
+    pending: list[str],
+) -> list[str]:
+    """
+    Keep the shuffled Reel action order unless the rolling write budget becomes
+    tight.
+
+    Repost is protected from starvation:
+      * with <=2 shared write slots remaining, a pending Repost is moved first
+      * with exactly 1 slot remaining, no other pending state-changing action
+        is allowed to spend that final slot ahead of Repost
+
+    This does NOT raise, reset, or bypass the rolling budget.
+    """
+    items = list(pending or [])
+
+    if "repost" not in items:
+        return items
+
+    budget = _shared_write_budget_status(username)
+    remaining = int(budget.get("remaining") or 0)
+
+    if remaining > 2:
+        return items
+
+    items.remove("repost")
+    items.insert(0, "repost")
+    return items
+
+
+def _browser_reel_reserve_final_slot_for_repost(
+    username: str,
+    action: str,
+    pending: list[str],
+) -> bool:
+    """
+    True when action should be deferred because Repost still needs the final
+    available rolling-budget slot.
+    """
+    if action == "repost" or "repost" not in (pending or []):
+        return False
+
+    budget = _shared_write_budget_status(username)
+    return int(budget.get("remaining") or 0) <= 1
+
 def _browser_run_reel_action_cycle(
     page,
     username: str,
@@ -11211,12 +11788,20 @@ def _browser_run_reel_action_cycle(
         ),
     )
 
-    pending = list(actions)
+    pending = _browser_reel_reorder_for_budget(
+        username,
+        list(actions),
+    )
     completed = []
     confirmed = 0
     deadline = time.monotonic() + max(30, int(max_cycle_seconds))
 
     while pending and time.monotonic() < deadline:
+        pending = _browser_reel_reorder_for_budget(
+            username,
+            pending,
+        )
+
         if get_account_safety_state(username)["active"]:
             break
 
@@ -11281,6 +11866,22 @@ def _browser_run_reel_action_cycle(
                     ),
                 )
                 completed.append(action)
+                continue
+
+            if _browser_reel_reserve_final_slot_for_repost(
+                username,
+                action,
+                pending,
+            ):
+                next_pending.append(action)
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"⏸️ Reels {action.title()} deferred so the final "
+                        "available rolling-budget slot is preserved for Repost."
+                    ),
+                )
                 continue
 
             block_reason = _browser_reel_action_blocked_now(
@@ -11439,6 +12040,10 @@ def _browser_run_reel_action_cycle(
             a for a in next_pending
             if a not in completed
         ]
+        pending = _browser_reel_reorder_for_budget(
+            username,
+            pending,
+        )
 
         if not pending:
             break
@@ -11540,11 +12145,10 @@ def _browser_reel_marked_interacted(
     history: dict,
 ) -> tuple[bool, str]:
     """
-    Skip before expensive work if the visible Reel is:
-      * sponsored/ad content
-      * already visibly liked
-      * already in stable liked history
-      * already in stable commented history
+    Skip before expensive work when the visible Reel is already interacted
+    with, or when it is an unrelated sponsored reel.
+
+    Sponsored finance/coding/software/AI reels are allowed through.
     """
     history.setdefault("browser_liked_urls", [])
     history.setdefault("browser_commented_urls", [])
@@ -11552,7 +12156,13 @@ def _browser_reel_marked_interacted(
     scope = _browser_visible_reel_scope(page)
 
     if _browser_visible_reel_is_ad(page, scope):
-        return True, "a sponsored/ad reel"
+        allowed_topic = _browser_sponsored_reel_allowed_topic(
+            page,
+            scope,
+        )
+
+        if not allowed_topic:
+            return True, "an unrelated sponsored/ad reel"
 
     state = _browser_visible_reel_state(page)
 
@@ -11569,6 +12179,7 @@ def _browser_reel_marked_interacted(
 
 
 
+
 def _browser_advance_past_interacted_reels(
     page,
     username: str,
@@ -11577,9 +12188,17 @@ def _browser_advance_past_interacted_reels(
     max_skips: int = 8,
 ) -> str:
     """
-    Advance until a fresh non-ad Reel is centered.
+    Advance until a fresh eligible Reel is centered.
 
-    This happens before vision/audio analysis.
+    Skips:
+      * already-liked/commented reels
+      * unrelated sponsored reels
+
+    Allows:
+      * sponsored finance/trading/markets
+      * sponsored coding/software/developer/AI
+
+    A skip only counts after the centered stable Reel identity actually changes.
     """
     last_key = ""
 
@@ -11587,6 +12206,23 @@ def _browser_advance_past_interacted_reels(
         scope = _browser_visible_reel_scope(page)
         reel_key = _browser_reel_stable_key(page, scope)
         last_key = reel_key
+
+        is_ad = _browser_visible_reel_is_ad(page, scope)
+        ad_topic = (
+            _browser_sponsored_reel_allowed_topic(page, scope)
+            if is_ad
+            else ""
+        )
+
+        if is_ad and ad_topic:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"💼 Sponsored Reel allowed because visible content is "
+                    f"{ad_topic}-related: {reel_key}"
+                ),
+            )
 
         should_skip, reason = _browser_reel_marked_interacted(
             page,
@@ -11600,7 +12236,7 @@ def _browser_advance_past_interacted_reels(
                     username,
                     "add_history",
                     value=(
-                        f"✅ Reels found a fresh non-ad reel after skipping "
+                        f"✅ Reels found an eligible reel after skipping "
                         f"{idx} reel(s): {reel_key}"
                     ),
                 )
@@ -11620,27 +12256,93 @@ def _browser_advance_past_interacted_reels(
                 username,
                 "add_history",
                 value=(
-                    f"↪️ Reels skip limit reached ({max_skips}); no fresh reel "
-                    "was found in this short scan."
+                    f"↪️ Reels skip limit reached ({max_skips}); no eligible "
+                    "reel was found in this short scan."
                 ),
             )
             return reel_key
+
+        before_key = reel_key
 
         if not _browser_reels_scroll_next(page):
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    "↪️ Reels could not advance while skipping an interacted/"
-                    "sponsored reel."
+                    "⚠️ Reels could not advance: all scroll/key strategies "
+                    f"left the same centered reel ({before_key})."
                 ),
             )
             return reel_key
 
-        page.wait_for_timeout(900)
+        page.wait_for_timeout(350)
+
+        after_key = _browser_reel_stable_key(
+            page,
+            _browser_visible_reel_scope(page),
+        )
+
+        if after_key == before_key:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "⚠️ Reels advance reported success but stable identity did "
+                    f"not change; stopping skip loop at {before_key}."
+                ),
+            )
+            return reel_key
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"↕️ Reels advanced successfully: {before_key} → {after_key}"
+            ),
+        )
 
     return last_key
 
+
+
+def _browser_reel_binding_snapshot(page) -> tuple[str, str]:
+    try:
+        url = str(page.url or "")
+    except Exception:
+        url = ""
+
+    key = _browser_reel_stable_key(
+        page,
+        _browser_visible_reel_scope(page),
+    )
+
+    return url, key
+
+
+def _browser_reel_binding_matches(
+    page,
+    expected_url_page,
+    expected_key: str,
+) -> tuple[bool, str, str]:
+    """
+    Verify the same Playwright Page object and same centered Reel are still
+    active. URL may change within the same Reels feed, so identity is decisive;
+    the URL is returned for diagnostics.
+    """
+    try:
+        current_url = str(page.url or "")
+    except Exception:
+        current_url = ""
+
+    current_key = _browser_reel_stable_key(
+        page,
+        _browser_visible_reel_scope(page),
+    )
+
+    same_page = page is expected_url_page
+    same_reel = current_key == expected_key
+
+    return bool(same_page and same_reel), current_url, current_key
 
 def _browser_run_one_reel(
     page,
@@ -11694,10 +12396,28 @@ def _browser_run_one_reel(
         return 0
 
     locked_reel_key = reel_key
+    locked_page = page
+    locked_url, locked_key_check = _browser_reel_binding_snapshot(page)
+
+    if locked_key_check != locked_reel_key:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Reels binding changed while establishing the pass; "
+                f"expected={locked_reel_key} current={locked_key_check}. "
+                "Skipping this reel."
+            ),
+        )
+        return 0
+
     update_account_metric(
         username,
         "add_history",
-        value=f"🔒 Reels identity locked for this pass: {locked_reel_key}",
+        value=(
+            f"🔒 Reels bound to ONE tab/reel for this pass: "
+            f"url={locked_url[:220]} · id={locked_reel_key}"
+        ),
     )
 
     prepared_comment = ""
@@ -11731,21 +12451,32 @@ def _browser_run_one_reel(
         if _browser_engage_security_problem(page, username):
             return 0
 
-        same_reel, current_key = _browser_reel_identity_matches(
+        binding_ok, current_url, current_key = _browser_reel_binding_matches(
             page,
+            locked_page,
             locked_reel_key,
         )
-        if not same_reel:
+        if not binding_ok:
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    "🛑 Reel changed during deep analysis; discarding analysis "
-                    f"instead of commenting on the wrong reel. "
-                    f"expected={locked_reel_key} current={current_key}"
+                    "🛑 Tab/Reel changed during deep analysis; discarding "
+                    "analysis instead of commenting on the wrong content. "
+                    f"expected={locked_reel_key} current={current_key} "
+                    f"url={current_url[:220]}"
                 ),
             )
             return 0
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"✅ Deep-analysis binding verified before comment generation: "
+                f"url={current_url[:220]} · id={current_key}"
+            ),
+        )
 
         prepared_comment = _browser_prepare_reel_comment(
             page,
@@ -11777,6 +12508,34 @@ def _browser_run_one_reel(
         if _browser_engage_security_problem(page, username):
             return 0
 
+    binding_ok, pre_action_url, pre_action_key = _browser_reel_binding_matches(
+        page,
+        locked_page,
+        locked_reel_key,
+    )
+
+    if not binding_ok:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Tab/Reel changed while AI was generating the comment; "
+                "discarding the generated comment and taking no actions. "
+                f"expected={locked_reel_key} current={pre_action_key} "
+                f"url={pre_action_url[:220]}"
+            ),
+        )
+        return 0
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"✅ Comment/action binding verified: "
+            f"url={pre_action_url[:220]} · id={pre_action_key}"
+        ),
+    )
+
     confirmed, _ = _browser_run_reel_action_cycle(
         page,
         username,
@@ -11793,30 +12552,109 @@ def _browser_run_one_reel(
 
 def _browser_pick_active_instagram_page(context):
     """
-    Pick the most recently created Instagram page in a connected live Chromium
-    context. This avoids attaching automation to an older Instagram tab when
-    multiple pages have accumulated.
+    Choose ONE Instagram working tab for Reels automation.
+
+    Priority:
+      1. focused Instagram tab
+      2. visible Instagram tab
+      3. oldest Instagram tab (normally the original login/main tab)
+
+    All other Instagram tabs in this dedicated bot Chromium context are closed
+    so Reels analysis/actions cannot silently happen in a stale background tab.
+    Non-Instagram tabs are left alone.
     """
     pages = list(getattr(context, "pages", []) or [])
 
     if not pages:
-        return context.new_page()
+        page = context.new_page()
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        return page
 
     instagram_pages = []
 
-    for page in pages:
+    for index, page in enumerate(pages):
         try:
             url = str(page.url or "").lower()
         except Exception:
             url = ""
 
-        if "instagram.com" in url:
-            instagram_pages.append(page)
+        if "instagram.com" not in url:
+            continue
 
-    if instagram_pages:
-        return instagram_pages[-1]
+        focused = False
+        visible = False
 
-    return pages[-1]
+        try:
+            focused = bool(page.evaluate("() => document.hasFocus()"))
+        except Exception:
+            pass
+
+        try:
+            visible = (
+                str(
+                    page.evaluate("() => document.visibilityState")
+                    or ""
+                ).lower()
+                == "visible"
+            )
+        except Exception:
+            pass
+
+        instagram_pages.append(
+            {
+                "page": page,
+                "index": index,
+                "focused": focused,
+                "visible": visible,
+                "url": url,
+            }
+        )
+
+    if not instagram_pages:
+        page = pages[0]
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        return page
+
+    focused_rows = [r for r in instagram_pages if r["focused"]]
+    visible_rows = [r for r in instagram_pages if r["visible"]]
+
+    if focused_rows:
+        chosen = focused_rows[0]
+    elif visible_rows:
+        # Prefer the oldest visible Instagram page, which is normally the
+        # original login tab rather than a stale Reel tab opened later.
+        chosen = sorted(visible_rows, key=lambda r: r["index"])[0]
+    else:
+        chosen = sorted(instagram_pages, key=lambda r: r["index"])[0]
+
+    page = chosen["page"]
+
+    # Close stale extra Instagram tabs only. The dedicated browser profile is
+    # owned by this automation, and multiple IG tabs caused cross-reel analysis.
+    for row in instagram_pages:
+        other = row["page"]
+
+        if other is page:
+            continue
+
+        try:
+            other.close()
+        except Exception:
+            pass
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    return page
+
 
 def _browser_auto_reels(username, history, config) -> int:
     """
@@ -11849,6 +12687,29 @@ def _browser_auto_reels(username, history, config) -> int:
         page = _browser_pick_active_instagram_page(context)
 
         try:
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+            try:
+                ig_tab_count = sum(
+                    1
+                    for p in context.pages
+                    if "instagram.com" in str(p.url or "").lower()
+                )
+            except Exception:
+                ig_tab_count = -1
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🧭 Reels working-tab lock active: "
+                    f"Instagram tabs remaining={ig_tab_count}; "
+                    f"working URL={str(page.url or '')[:220]}"
+                ),
+            )
             try:
                 current_url = str(page.url or "").lower()
             except Exception:
@@ -11968,6 +12829,29 @@ def _browser_reels_demo(username, history, config) -> int:
         page = _browser_pick_active_instagram_page(context)
 
         try:
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+            try:
+                ig_tab_count = sum(
+                    1
+                    for p in context.pages
+                    if "instagram.com" in str(p.url or "").lower()
+                )
+            except Exception:
+                ig_tab_count = -1
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🧭 Reels working-tab lock active: "
+                    f"Instagram tabs remaining={ig_tab_count}; "
+                    f"working URL={str(page.url or '')[:220]}"
+                ),
+            )
             try:
                 current_url = str(page.url or "").lower()
             except Exception:
@@ -16784,7 +17668,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Stable Reel Identity + Ads + Audio Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reel Skip/Scroll + Sponsored Topic Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
