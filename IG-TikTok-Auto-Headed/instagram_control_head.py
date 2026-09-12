@@ -7865,52 +7865,365 @@ def _browser_current_visible_reel_key(page, fallback_index: int = 0) -> str:
     return f"reels-demo:{int(fallback_index)}:{int(time.time())}"
 
 
-def _browser_open_reel_comments_if_needed(page) -> bool:
+def _browser_visible_action_controls(page):
     """
-    Open comments for the currently visible reel only.
+    Return compact diagnostics for visible reel action controls.
+
+    Used only for logging when Instagram changes the Reels DOM.
     """
+    rows = []
+
+    selectors = (
+        "button",
+        "[role='button']",
+        "svg[aria-label]",
+        "[aria-label]",
+    )
+
+    seen = set()
+
+    for selector in selectors:
+        try:
+            locs = page.locator(selector)
+            count = min(locs.count(), 220)
+        except Exception:
+            continue
+
+        for i in range(count):
+            loc = locs.nth(i)
+
+            try:
+                if not loc.is_visible(timeout=80):
+                    continue
+
+                box = loc.bounding_box(timeout=120)
+                if not box:
+                    continue
+
+                vh = float(
+                    page.evaluate("() => window.innerHeight || 800")
+                )
+                vw = float(
+                    page.evaluate("() => window.innerWidth || 1200")
+                )
+
+                if (
+                    box["x"] + box["width"] <= 0
+                    or box["y"] + box["height"] <= 0
+                    or box["x"] >= vw
+                    or box["y"] >= vh
+                ):
+                    continue
+
+                aria = str(
+                    loc.get_attribute("aria-label") or ""
+                ).strip()
+                title = str(
+                    loc.get_attribute("title") or ""
+                ).strip()
+
+                try:
+                    txt = re.sub(
+                        r"\s+",
+                        " ",
+                        loc.inner_text(timeout=120) or "",
+                    ).strip()
+                except Exception:
+                    txt = ""
+
+                try:
+                    svg_labels = loc.locator(
+                        "svg[aria-label]"
+                    ).evaluate_all(
+                        """els => els.map(e => e.getAttribute('aria-label') || '')
+                                     .filter(Boolean)"""
+                    )
+                except Exception:
+                    svg_labels = []
+
+                label = " | ".join(
+                    part
+                    for part in (
+                        aria,
+                        title,
+                        txt[:70],
+                        ",".join(svg_labels[:4]),
+                    )
+                    if part
+                )
+
+                if not label:
+                    continue
+
+                key = label.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                rows.append(
+                    {
+                        "label": label[:140],
+                        "x": round(float(box["x"])),
+                        "y": round(float(box["y"])),
+                    }
+                )
+            except Exception:
+                continue
+
+    return rows[:40]
+
+
+def _browser_find_visible_reel_action_control(
+    page,
+    labels,
+):
+    """
+    Find an on-screen action control for the CURRENT visible reel.
+
+    Instagram often keeps adjacent reels mounted. This ranks only visible
+    controls by distance to the current visible reel's action area and rejects
+    off-screen/hidden elements.
+    """
+    wanted = tuple(
+        str(label or "").strip().lower()
+        for label in labels
+        if str(label or "").strip()
+    )
+
+    if not wanted:
+        return None
+
     scope = _browser_visible_reel_scope(page)
 
-    try:
-        existing = page.locator(
-            "textarea[placeholder*='comment' i], "
-            "textarea[aria-label*='comment' i]"
-        ).first
-        if existing.count() and existing.is_visible(timeout=200):
-            return True
-    except Exception:
-        pass
+    candidates = []
 
-    comment_svg = _browser_find_svg_action(
-        scope,
-        ("Comment", "Comments"),
+    # First search the visible reel container itself.
+    search_roots = [scope, page]
+
+    selectors = (
+        "button",
+        "[role='button']",
+        "[aria-label]",
+        "svg[aria-label]",
     )
-    if comment_svg is None:
-        comment_svg = _browser_find_svg_action(
-            page,
-            ("Comment", "Comments"),
-        )
-
-    if comment_svg is None:
-        return False
 
     try:
-        _browser_clickable_from_svg(comment_svg).click(timeout=3500)
-        page.wait_for_timeout(500)
+        reel_box = scope.bounding_box(timeout=300)
     except Exception:
-        return False
+        reel_box = None
 
-    try:
-        box = page.locator(
-            "textarea[placeholder*='comment' i], "
-            "textarea[aria-label*='comment' i]"
-        ).first
-        return bool(
-            box.count()
-            and box.is_visible(timeout=400)
-        )
-    except Exception:
-        return False
+    for root_rank, root in enumerate(search_roots):
+        for selector in selectors:
+            try:
+                locs = root.locator(selector)
+                count = min(locs.count(), 180)
+            except Exception:
+                continue
+
+            for i in range(count):
+                loc = locs.nth(i)
+
+                try:
+                    if not loc.is_visible(timeout=100):
+                        continue
+
+                    box = loc.bounding_box(timeout=160)
+                    if not box:
+                        continue
+
+                    aria = str(
+                        loc.get_attribute("aria-label") or ""
+                    ).strip()
+                    title = str(
+                        loc.get_attribute("title") or ""
+                    ).strip()
+
+                    try:
+                        txt = re.sub(
+                            r"\s+",
+                            " ",
+                            loc.inner_text(timeout=120) or "",
+                        ).strip()
+                    except Exception:
+                        txt = ""
+
+                    try:
+                        descendant_labels = loc.locator(
+                            "svg[aria-label]"
+                        ).evaluate_all(
+                            """els => els.map(e => e.getAttribute('aria-label') || '')
+                                         .filter(Boolean)"""
+                        )
+                    except Exception:
+                        descendant_labels = []
+
+                    haystack = " ".join(
+                        [
+                            aria,
+                            title,
+                            txt,
+                            " ".join(descendant_labels),
+                        ]
+                    ).lower()
+
+                    if not any(
+                        re.search(
+                            rf"(^|[^a-z]){re.escape(label)}([^a-z]|$)",
+                            haystack,
+                        )
+                        for label in wanted
+                    ):
+                        continue
+
+                    # Convert SVG itself to its clickable ancestor.
+                    clickable = loc
+                    try:
+                        tag = str(
+                            loc.evaluate("(el) => el.tagName.toLowerCase()")
+                        ).lower()
+                    except Exception:
+                        tag = ""
+
+                    if tag == "svg":
+                        clickable = _browser_clickable_from_svg(loc)
+                        try:
+                            box = clickable.bounding_box(timeout=160) or box
+                        except Exception:
+                            pass
+
+                    # Prefer controls within/near the selected visible reel.
+                    if reel_box:
+                        reel_cx = reel_box["x"] + reel_box["width"] / 2.0
+                        reel_cy = reel_box["y"] + reel_box["height"] / 2.0
+                        cx = box["x"] + box["width"] / 2.0
+                        cy = box["y"] + box["height"] / 2.0
+                        distance = abs(cx - reel_cx) + abs(cy - reel_cy)
+                    else:
+                        distance = 0.0
+
+                    candidates.append(
+                        (
+                            root_rank,
+                            distance,
+                            clickable,
+                            haystack[:180],
+                        )
+                    )
+                except Exception:
+                    continue
+
+        if candidates:
+            break
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda row: (row[0], row[1]))
+    return candidates[0][2]
+
+
+def _browser_wait_for_reel_comment_editor(
+    page,
+    *,
+    timeout_seconds: float = 6.0,
+):
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    while time.monotonic() < deadline:
+        editor = _browser_find_reel_comment_editor(page)
+        if editor is not None:
+            return editor
+
+        page.wait_for_timeout(300)
+
+    return None
+
+def _browser_open_reel_comments_if_needed(page) -> bool:
+    """
+    Open comments for the currently visible reel.
+
+    Handles multiple Instagram Reels layouts:
+      * editor already visible
+      * SVG Comment/Comments action
+      * button/role=button/aria-label Comment controls
+      * visible "View ... comments" text fallback
+
+    It waits for the actual editor/drawer instead of assuming a click worked.
+    """
+    editor = _browser_find_reel_comment_editor(page)
+    if editor is not None:
+        return True
+
+    control = _browser_find_visible_reel_action_control(
+        page,
+        ("comment", "comments"),
+    )
+
+    if control is not None:
+        try:
+            control.click(timeout=5000)
+            page.wait_for_timeout(450)
+        except Exception:
+            control = None
+
+        if control is not None:
+            editor = _browser_wait_for_reel_comment_editor(
+                page,
+                timeout_seconds=5.0,
+            )
+            if editor is not None:
+                return True
+
+    # Fallback: some layouts make the visible comment-count text clickable
+    # while the icon itself has no useful accessibility label.
+    scope = _browser_visible_reel_scope(page)
+
+    patterns = (
+        r"^View all [0-9,.KMBkmb]+ comments?$",
+        r"^View [0-9,.KMBkmb]+ comments?$",
+        r"^[0-9,.KMBkmb]+ comments?$",
+        r"^Comments?$",
+    )
+
+    for pattern in patterns:
+        try:
+            locs = scope.get_by_text(
+                re.compile(pattern, re.I),
+            )
+            for i in range(min(locs.count(), 8)):
+                loc = locs.nth(i)
+
+                if not loc.is_visible(timeout=150):
+                    continue
+
+                try:
+                    clickable = loc
+                    for xpath in (
+                        "xpath=ancestor::button[1]",
+                        "xpath=ancestor::*[@role='button'][1]",
+                        "xpath=ancestor::a[1]",
+                    ):
+                        parent = loc.locator(xpath)
+                        if parent.count():
+                            clickable = parent.first
+                            break
+
+                    clickable.click(timeout=4000)
+                    page.wait_for_timeout(450)
+                except Exception:
+                    continue
+
+                editor = _browser_wait_for_reel_comment_editor(
+                    page,
+                    timeout_seconds=5.0,
+                )
+                if editor is not None:
+                    return True
+        except Exception:
+            pass
+
+    return False
+
 
 
 
@@ -8088,7 +8401,7 @@ Rules:
 - Do not invent unseen actions, identities, relationships, locations, or facts.
 - Do not mention bots, automation, prompts, or source metadata.
 - No threats or slurs.
-- 3 to 20 words.
+- 3 to 28 words.
 - Output only the comment.
 """.strip()
 
@@ -8102,8 +8415,8 @@ Rules:
         result = _ollama_generate(
             prompt,
             min_words=3,
-            max_words=20,
-            attempts=2,
+            max_words=28,
+            attempts=3,
             system_prompt=persona,
         )
     except Exception:
@@ -8284,43 +8597,75 @@ def _browser_demo_wait_follow_slot(
 
 def _browser_find_reel_comment_editor(page):
     """
-    Find the visible comment editor in the currently open reel comments UI.
+    Find a visible comment editor in the open reel comments UI.
     """
     selectors = (
         "textarea[placeholder*='comment' i]",
         "textarea[aria-label*='comment' i]",
+        "input[placeholder*='comment' i]",
+        "input[aria-label*='comment' i]",
         "[contenteditable='true'][aria-label*='comment' i]",
+        "[contenteditable='true'][data-lexical-editor='true']",
         "div[role='textbox'][contenteditable='true']",
+        "div[role='textbox'][aria-label*='comment' i]",
     )
 
     roots = []
-    try:
-        dialogs = page.locator("[role='dialog']")
-        for i in range(dialogs.count() - 1, -1, -1):
-            d = dialogs.nth(i)
-            try:
-                if d.is_visible(timeout=120):
-                    roots.append(d)
-                    break
-            except Exception:
-                pass
-    except Exception:
-        pass
+
+    # Prefer visible dialogs/drawers first.
+    for selector in (
+        "[role='dialog']",
+        "aside",
+        "section",
+    ):
+        try:
+            locs = page.locator(selector)
+            for i in range(locs.count() - 1, -1, -1):
+                root = locs.nth(i)
+                try:
+                    if root.is_visible(timeout=100):
+                        roots.append(root)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     roots.append(page)
 
+    seen = set()
+
     for root in roots:
+        try:
+            key = id(root)
+            if key in seen:
+                continue
+            seen.add(key)
+        except Exception:
+            pass
+
         for selector in selectors:
             try:
                 locs = root.locator(selector)
                 for i in range(locs.count() - 1, -1, -1):
                     loc = locs.nth(i)
-                    if loc.is_visible(timeout=180):
-                        return loc
+
+                    if not loc.is_visible(timeout=180):
+                        continue
+
+                    try:
+                        box = loc.bounding_box(timeout=180)
+                    except Exception:
+                        box = None
+
+                    if not box or box["width"] < 10 or box["height"] < 10:
+                        continue
+
+                    return loc
             except Exception:
                 pass
 
     return None
+
 
 
 def _browser_submit_prepared_reel_comment(
@@ -8345,14 +8690,27 @@ def _browser_submit_prepared_reel_comment(
         return True
 
     if not _browser_open_reel_comments_if_needed(page):
+        controls = _browser_visible_action_controls(page)
+        summary = "; ".join(
+            row.get("label", "")
+            for row in controls[:12]
+            if row.get("label")
+        )
         update_account_metric(
             username,
             "add_history",
-            value="↪️ Reels Demo could not open the visible reel's comment panel.",
+            value=(
+                "↪️ Reels Demo could not open the visible reel's comment "
+                "panel. Visible action controls: "
+                f"{summary[:900] if summary else '(none detected)'}"
+            ),
         )
         return False
 
-    box = _browser_find_reel_comment_editor(page)
+    box = _browser_wait_for_reel_comment_editor(
+        page,
+        timeout_seconds=4.0,
+    )
     if box is None:
         update_account_metric(
             username,
@@ -8797,7 +9155,7 @@ def _browser_reels_demo(username, history, config) -> int:
         username,
         "add_history",
         value=(
-            "🎞️ Reels Demo starting: ONE visible reel; watch → grounded comment "
+            "🎞️ Reels Demo starting: ONE visible reel; longer watch → grounded comment "
             "→ Like → Save → Repost → Follow-if-needed."
         ),
     )
@@ -8872,7 +9230,7 @@ def _browser_reels_demo(username, history, config) -> int:
             reel_context = _browser_reel_watch_context(
                 page,
                 username,
-                watch_seconds=6.0,
+                watch_seconds=10.0,
             )
 
             if _browser_engage_security_problem(page, username):
@@ -13741,7 +14099,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reel Watch + Comment Continue Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reel Comment UI Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
