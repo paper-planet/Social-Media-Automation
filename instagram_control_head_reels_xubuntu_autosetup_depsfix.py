@@ -160,6 +160,21 @@ def _bootstrap_dependencies():
                 except Exception as exc:
                     print(f"⚠️ Could not auto-install ffmpeg: {exc}", flush=True)
 
+        # Tesseract provides a deterministic OCR pass for screenshots, memes,
+        # quote cards and other text-heavy static images. The multimodal model
+        # still interprets the image, but visible text is no longer dependent on
+        # the vision model noticing/reading it correctly.
+        if not shutil.which("tesseract"):
+            if shutil.which("apt-get"):
+                print("📦 Tesseract OCR missing; installing tesseract-ocr...", flush=True)
+                try:
+                    subprocess.run(["sudo", "apt-get", "update"], check=True)
+                    subprocess.run(["sudo", "apt-get", "install", "-y", "tesseract-ocr"], check=True)
+                except Exception as exc:
+                    print(f"⚠️ Could not auto-install Tesseract OCR: {exc}", flush=True)
+            else:
+                print("⚠️ Tesseract OCR is missing and apt-get is unavailable.", flush=True)
+
         # Prefer a desktop-installed browser. Ubuntu/Xubuntu commonly provides
         # Chromium as a Snap. Do not install Playwright's bundled Chromium on
         # this machine: it is the executable that was exiting with SIGTRAP/-5.
@@ -1649,6 +1664,126 @@ def extract_video_story_frames(video_path, count=5):
     return frames
 
 
+def _clean_ocr_text(raw_text, limit=7000):
+    """Normalize OCR while preserving enough line structure to interpret posts."""
+    value = str(raw_text or "").replace("\x0c", "\n")
+    lines = []
+    for raw_line in value.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if not line:
+            continue
+        # Drop lines that are almost entirely OCR punctuation noise.
+        useful = sum(ch.isalnum() for ch in line)
+        if useful < 2 and len(line) > 2:
+            continue
+        if not lines or line != lines[-1]:
+            lines.append(line)
+    return "\n".join(lines).strip()[:limit]
+
+
+def _ocr_score(value):
+    value = str(value or "")
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’_-]*", value)
+    alpha = sum(ch.isalnum() for ch in value)
+    return alpha + len(words) * 4
+
+
+def _ocr_image_text(image_path):
+    """
+    Extract visible text from a static image with local Tesseract.
+
+    Two page-segmentation modes are tried because social-media images vary from
+    dense paragraph screenshots to sparse meme/quote layouts. No OCR result is
+    treated as fact; it is passed to the model as *visible text in the image*.
+    """
+    exe = shutil.which("tesseract")
+    if not exe:
+        return ""
+
+    image_path = Path(image_path)
+    candidates = []
+    for psm in (11, 6):
+        try:
+            result = subprocess.run(
+                [exe, str(image_path), "stdout", "--psm", str(psm), "-l", "eng"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            if result.returncode in (0, 1):
+                cleaned = _clean_ocr_text(result.stdout)
+                if cleaned:
+                    candidates.append(cleaned)
+        except Exception:
+            continue
+
+    if not candidates:
+        return ""
+    return max(candidates, key=_ocr_score)
+
+
+def _image_text_views(image_path, text_heavy=False):
+    """
+    Return the original image plus readable crops for text-heavy uploads.
+
+    Vision models often understand the picture but miss small text when a full
+    screenshot/meme is downscaled. Crops preserve the words at a larger visual
+    scale while keeping the original for layout/context.
+    """
+    image_path = Path(image_path)
+    if not text_heavy:
+        return [image_path]
+
+    try:
+        from PIL import Image, ImageOps
+    except Exception:
+        return [image_path]
+
+    try:
+        im = Image.open(image_path).convert("RGB")
+        w, h = im.size
+        if w < 80 or h < 80:
+            return [image_path]
+
+        root = DOWNLOAD_ROOT / "image_text_views"
+        root.mkdir(parents=True, exist_ok=True)
+        stat = image_path.stat()
+        token = hashlib.sha256(
+            f"{image_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", "replace")
+        ).hexdigest()[:18]
+
+        views = [image_path]
+
+        # Create three overlapping vertical bands. This works well for tall
+        # screenshots and still gives wide quote cards larger readable text.
+        overlap = max(20, int(h * 0.08))
+        bands = [
+            (0, 0, w, min(h, int(h * 0.42) + overlap)),
+            (0, max(0, int(h * 0.29) - overlap), w, min(h, int(h * 0.72) + overlap)),
+            (0, max(0, int(h * 0.59) - overlap), w, h),
+        ]
+
+        for idx, box in enumerate(bands, 1):
+            crop = im.crop(box)
+            # Upscale smaller crops so glyphs survive multimodal preprocessing.
+            cw, ch = crop.size
+            scale = max(1.0, min(2.5, 1400.0 / max(1, cw)))
+            if scale > 1.05:
+                crop = crop.resize(
+                    (int(cw * scale), int(ch * scale)),
+                    Image.Resampling.LANCZOS,
+                )
+            crop = ImageOps.autocontrast(crop)
+            out = root / f"{token}_text_{idx}.jpg"
+            crop.save(out, "JPEG", quality=94)
+            views.append(out)
+
+        return views[:4]
+    except Exception:
+        return [image_path]
+
+
 def analyze_media_for_caption(
     media_files,
     sidecar_text="",
@@ -1660,17 +1795,28 @@ def analyze_media_for_caption(
     vision_model=get_ollama_vision_model()
 
     video=next((p for p in media_files if p.suffix.lower()==".mp4"),None)
-    image=next((p for p in media_files if p.suffix.lower() in {".jpg",".jpeg",".png"}),None)
+    image=next((p for p in media_files if p.suffix.lower() in {".jpg",".jpeg",".png",".webp"}),None)
 
     media_kind="video" if video else ("image" if image else "unknown")
     visual_files=[]
+    ocr_text=""
+    text_heavy=False
+
     if video:
         try:
             visual_files=extract_video_story_frames(video,frame_count)
         except Exception:
             visual_files=[]
     elif image:
-        visual_files=[image]
+        try:
+            ocr_text=_ocr_image_text(image)
+        except Exception:
+            ocr_text=""
+        # About a sentence or more of OCR means written content is important
+        # enough that we should give the vision model enlarged crops too.
+        ocr_words=re.findall(r"[A-Za-z0-9][A-Za-z0-9'’_-]*", ocr_text)
+        text_heavy=(len(ocr_words) >= 10 or len(ocr_text) >= 80)
+        visual_files=_image_text_views(image,text_heavy=text_heavy)
 
     if video and require_video_vision and (not vision_model or len(visual_files)<3):
         return {
@@ -1680,6 +1826,8 @@ def analyze_media_for_caption(
             "media_kind":"video",
             "vision_required_failed":True,
             "frames_analyzed":len(visual_files),
+            "ocr_text":"",
+            "text_heavy":False,
         }
 
     visual_description=""
@@ -1694,24 +1842,45 @@ Actually watch the sequence by comparing all frames from earliest to latest.
 Return:
 PERSPECTIVE: POV_FIRST_PERSON | SELFIE_VLOG | THIRD_PERSON | UNKNOWN
 SEQUENCE: 3-7 concise sentences explaining what happens over time, in order.
-NARRATION_NOTES: a concise first-person-friendly description suitable for a post caption.
+VISIBLE_TEXT: quote or accurately paraphrase important readable on-screen text.
+TEXT_MEANING: explain what that text is saying if it matters to the video.
+NARRATION_NOTES: concise first-person-friendly notes suitable for a post caption.
 
 Rules:
 - Base the answer only on visible evidence across the frames.
 - Notice changes between frames, actions, movement, setting, objects, and readable text.
+- If readable text expresses an opinion/claim, identify it as an opinion/claim rather than verified fact.
 - If this is POV/selfie/vlog footage, make that explicit.
 - Do not identify people by name or infer private traits.
 - Do not mention usernames, filenames, source accounts, reposting, or archive metadata.
 - Do not introduce trading or another topic unless it is visibly present.
 """.strip()
         else:
-            prompt = """
-Analyze this social-media image for caption writing.
-Return:
+            ocr_block = ocr_text if ocr_text else "(Local OCR found no reliable text.)"
+            prompt = f"""
+Analyze this ONE social-media image for caption writing. The original image and any following images are enlarged/overlapping crops of the SAME image, not separate scenes.
+
+LOCAL OCR FROM THE IMAGE:
+{ocr_block}
+
+IMPORTANT: If this image is mostly a screenshot, meme, quote card, sign, infographic, post, comment, argument, or other text-heavy graphic, the WRITTEN CONTENT is the main subject. Do not ignore it and write a generic caption about the wall/background/layout.
+
+Return exactly these labeled sections:
 PERSPECTIVE: SELFIE_VLOG | THIRD_PERSON | UNKNOWN
-SEQUENCE: 1-3 concise sentences describing what is visibly happening.
-NARRATION_NOTES: a concise first-person-friendly description suitable for a caption.
-Do not identify people by name, infer private traits, mention usernames/files, or invent topics.
+IMAGE_TYPE: PHOTO_SCENE | TEXT_HEAVY | MIXED
+VISIBLE_TEXT: reproduce the important legible wording as faithfully as possible; correct obvious OCR mistakes only when visually clear.
+TEXT_MEANING: explain the central point, argument, joke, criticism, opinion, or claim expressed by the visible text. Distinguish opinions/claims from established facts.
+VISUAL_CONTEXT: briefly describe non-text imagery only when it materially changes the meaning.
+CAPTION_ANGLES: 2-4 specific intelligent angles a caption could react to, summarize, question, or comment on.
+NARRATION_NOTES: concise notes for a caption grounded in the actual text and image.
+
+Rules:
+- Read the text before interpreting the background.
+- Use the local OCR as a clue, not unquestionable truth; reconcile it against what is visibly readable.
+- Do not invent missing sentences or names.
+- If wording is uncertain, say which fragment is unclear instead of guessing.
+- Do not identify people from appearance or infer private traits.
+- Do not mention usernames, filenames, source accounts, reposting, or archive metadata.
 """.strip()
         try:
             response=ollama.chat(
@@ -1721,7 +1890,11 @@ Do not identify people by name, infer private traits, mention usernames/files, o
                     "content":prompt,
                     "images":[str(p) for p in visual_files],
                 }],
-                options={"temperature":0.12,"top_p":0.8},
+                options={
+                    "temperature":0.08,
+                    "top_p":0.75,
+                    "num_predict":700 if media_kind=="image" else 500,
+                },
             )
             raw=str(
                 response.get("message",{}).get("content","")
@@ -1736,19 +1909,27 @@ Do not identify people by name, infer private traits, mention usernames/files, o
                 perspective=m.group(1).upper()
             visual_description=re.sub(
                 r"(?<!\w)@[A-Za-z0-9._]{2,}","",raw
-            ).strip()[:3500]
-        except Exception:
+            ).strip()[:7000]
+        except Exception as exc:
             visual_description=""
+            try:
+                print(f"⚠️ Vision caption analysis failed: {type(exc).__name__}: {str(exc)[:160]}", flush=True)
+            except Exception:
+                pass
 
     pieces=[]
+    if ocr_text:
+        pieces.append(
+            "LOCAL OCR — VISIBLE TEXT IN THE UPLOADED IMAGE:\n" + ocr_text
+        )
     if visual_description:
-        pieces.append("VIDEO/IMAGE VISUAL ANALYSIS:\n"+visual_description)
+        pieces.append("VISION INTERPRETATION:\n"+visual_description)
     if clean_text:
         pieces.append("SUPPORTING TEXT CONTEXT:\n"+clean_text)
     if not pieces:
         pieces.append(
-            "No reliable semantic description is available. Do not invent a topic, "
-            "identity, profession, location, or event."
+            "No reliable semantic description or OCR text is available. Do not invent a topic, "
+            "identity, profession, location, event, or argument."
         )
 
     return {
@@ -1758,6 +1939,8 @@ Do not identify people by name, infer private traits, mention usernames/files, o
         "media_kind":media_kind,
         "vision_required_failed":False,
         "frames_analyzed":len(visual_files),
+        "ocr_text":ocr_text,
+        "text_heavy":bool(text_heavy),
     }
 
 
@@ -1861,6 +2044,8 @@ ACCOUNT-SPECIFIC CAPTION INSTRUCTIONS:
 
 Requirements:
 - Narrate what happens in the supplied visual sequence, especially for video.
+- If MEDIA ANALYSIS contains LOCAL OCR, VISIBLE_TEXT, TEXT_MEANING, or says TEXT_HEAVY, the written content is the primary subject: summarize/react to the actual argument, opinion, joke, claim, or message instead of describing the background generically.
+- Treat opinions and allegations in the image as quoted/depicted viewpoints, not verified facts.
 - Never mention source/original usernames, repost metadata, archive folders, or filenames.
 - Never inject HFT/trading or another stock topic unless the actual media analysis supports it.
 - Smart, natural, specific, and coherent.
@@ -15463,7 +15648,14 @@ def _browser_fallback_caption(
         selection["folder"].get("source", ""),
     ).strip()
 
-    if clean_sidecar:
+    analysis_ocr = str((analysis or {}).get("ocr_text") or "").strip()
+
+    if analysis_ocr:
+        # If the AI writer fails, a text-heavy image should still post a caption
+        # about its actual written content rather than a generic scene caption.
+        first_lines = [line.strip() for line in analysis_ocr.splitlines() if line.strip()]
+        caption = _clip_chars(" ".join(first_lines[:3]), 260)
+    elif clean_sidecar:
         caption = _clip_chars(
             clean_sidecar.splitlines()[0].strip(),
             260,
@@ -15605,6 +15797,9 @@ HASHTAGS: <3-5 hashtags grounded in this exact media>
 
 Rules:
 - Base the caption on the supplied visual analysis.
+- If MEDIA ANALYSIS contains LOCAL OCR, VISIBLE_TEXT, TEXT_MEANING, or indicates TEXT_HEAVY/MIXED, treat the written content as the main subject. The caption should meaningfully summarize, react to, question, or comment on the actual text/opinion instead of describing a wall, graphic style, background, or layout.
+- Treat opinions, accusations, predictions, and claims shown in the image as depicted viewpoints unless independently supported by the media; do not rewrite them as verified facts.
+- Prefer specific concepts/arguments from the visible text over generic visual adjectives.
 - Never mention source usernames, repost metadata, archive folders, or filenames.
 - Do not invent a location, identity, profession, event, or stock/trading topic.
 - Keep the caption under {char_limit} characters before hashtags.
