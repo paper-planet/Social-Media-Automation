@@ -55,7 +55,7 @@ IG_ACCOUNTS_FILE = Path(
 ).expanduser()
 
 
-REELS_BUILD_ID = "auto-synergy-caption-label-fix-v9"
+REELS_BUILD_ID = "hashtag-relevance-v10"
 def _safe_account_slug(username):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(username or "").strip().lstrip("@"))
     return value.strip("._-") or "instagram_account"
@@ -14479,29 +14479,85 @@ def _browser_post_context_blob(selection, analysis=None) -> str:
 
 def _browser_post_topic(selection, analysis=None) -> str:
     """
-    Lightweight topic classification used only for choosing fallback hashtags.
+    Conservative topic classification for hashtag selection.
     """
     blob = _browser_post_context_blob(selection, analysis)
 
-    finance_terms = (
-        "stock", "stocks", "trading", "trader", "forex", "xau",
-        "gold", "futures", "market", "markets", "candlestick",
-        "price action", "chart", "equities", "nasdaq", "s&p",
-        "sp500", "dow", "options",
+    climbing_high = (
+        "bouldering",
+        "rock climbing",
+        "climbing gym",
+        "climber",
+        "climbers",
+        "crag",
+        "belay",
+        "belaying",
+        "climbing route",
+        "climbing holds",
+        "climbing wall",
     )
-    climbing_terms = (
-        "climb", "climbing", "boulder", "bouldering", "rock climbing",
-        "crag", "climbing gym", "route", "hold", "holds", "wall",
+    climbing_medium = (
+        "climb",
+        "climbing",
+        "boulder",
+        "chalk bag",
+        "harness",
+        "carabiner",
     )
 
-    finance_score = sum(term in blob for term in finance_terms)
-    climbing_score = sum(term in blob for term in climbing_terms)
+    finance_high = (
+        "stock market",
+        "stock trading",
+        "forex",
+        "xauusd",
+        "futures trading",
+        "options trading",
+        "candlestick chart",
+        "price action",
+        "nasdaq",
+        "s&p 500",
+        "sp500",
+        "portfolio",
+        "dividend",
+    )
+    finance_medium = (
+        "stocks",
+        "trading",
+        "trader",
+        "investing",
+        "investor",
+        "futures",
+        "options",
+        "equities",
+        "bitcoin",
+        "crypto",
+    )
 
-    if finance_score > climbing_score and finance_score > 0:
+    climbing_high_score = sum(term in blob for term in climbing_high)
+    climbing_medium_score = sum(term in blob for term in climbing_medium)
+    finance_high_score = sum(term in blob for term in finance_high)
+    finance_medium_score = sum(term in blob for term in finance_medium)
+
+    climbing_score = climbing_high_score * 3 + climbing_medium_score
+    finance_score = finance_high_score * 3 + finance_medium_score
+
+    climbing_confident = (
+        climbing_high_score >= 1
+        or climbing_medium_score >= 2
+    )
+    finance_confident = (
+        finance_high_score >= 1
+        or finance_medium_score >= 2
+    )
+
+    if finance_confident and finance_score > climbing_score:
         return "finance"
-    if climbing_score > finance_score and climbing_score > 0:
+
+    if climbing_confident and climbing_score > finance_score:
         return "climbing"
+
     return "general"
+
 
 
 def _browser_clean_hashtag(tag: str) -> str:
@@ -14513,6 +14569,123 @@ def _browser_clean_hashtag(tag: str) -> str:
     return f"#{tag}" if tag else ""
 
 
+_GENERIC_LOW_SIGNAL_HASHTAGS = {
+    "#fyp", "#foryou", "#foryoupage", "#viral", "#trending",
+    "#reels", "#reel", "#video", "#content", "#social",
+    "#explore", "#explorepage", "#photo", "#creator", "#daily",
+    "#instagood",
+}
+
+_CLIMBING_HASHTAG_WORDS = (
+    "climb", "boulder", "rockclimb", "climbinggym",
+    "climber", "crag", "belay",
+)
+
+_FINANCE_HASHTAG_WORDS = (
+    "stock", "trading", "trader", "forex", "future", "option",
+    "invest", "market", "nasdaq", "sp500", "bitcoin", "crypto",
+    "xau", "finance", "priceaction",
+)
+
+
+def _browser_hashtag_is_relevant(tag: str, topic: str) -> bool:
+    cleaned = _browser_clean_hashtag(tag)
+    if not cleaned:
+        return False
+
+    key = cleaned.lower()
+    if key in _GENERIC_LOW_SIGNAL_HASHTAGS:
+        return False
+
+    bare = key.lstrip("#")
+    is_climbing = any(word in bare for word in _CLIMBING_HASHTAG_WORDS)
+    is_finance = any(word in bare for word in _FINANCE_HASHTAG_WORDS)
+
+    if is_climbing and topic != "climbing":
+        return False
+
+    if is_finance and topic != "finance":
+        return False
+
+    return True
+
+
+def _browser_contextual_fallback_hashtags(selection, analysis=None) -> list[str]:
+    """
+    Small content-grounded fallback set. Never pads with discovery spam.
+    """
+    blob = _browser_post_context_blob(selection, analysis)
+    candidates = []
+
+    if any(
+        term in blob
+        for term in (
+            "confrontation",
+            "forcing",
+            "pushing",
+            "against a brick wall",
+            "distressed",
+            "altercation",
+            "argument",
+            "tense scene",
+        )
+    ):
+        candidates.extend([
+            "#confrontation",
+            "#dramaticmoment",
+            "#storytelling",
+            "#cinematicscene",
+        ])
+
+    if any(
+        term in blob
+        for term in (
+            "augmented reality",
+            "ar experience",
+            "interactive 3d",
+            "flashcards",
+            "3d model",
+        )
+    ):
+        candidates.extend([
+            "#augmentedreality",
+            "#edtech",
+            "#3dlearning",
+            "#interactivelearning",
+        ])
+
+    if any(
+        term in blob
+        for term in (
+            "python",
+            "github",
+            "git ",
+            "coding",
+            "programming",
+            "software",
+            "developer",
+            "automation",
+        )
+    ):
+        candidates.extend([
+            "#coding",
+            "#programming",
+            "#softwaredevelopment",
+            "#developer",
+        ])
+
+    result = []
+    seen = set()
+
+    for tag in candidates:
+        cleaned = _browser_clean_hashtag(tag)
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            seen.add(key)
+            result.append(cleaned)
+
+    return result[:5]
+
 def _browser_preferred_post_hashtags(
     username,
     selection,
@@ -14521,14 +14694,11 @@ def _browser_preferred_post_hashtags(
     ai_tags=None,
 ):
     """
-    Return exactly five useful hashtags.
+    Return 0-5 hashtags relevant to this exact media.
 
-    Finance media gets the requested market-oriented set. Climbing media gets
-    climbing tags. Generic low-signal tags such as #photo/#creator/#daily are
-    deliberately excluded.
+    Fewer relevant tags is preferable to unrelated padding.
     """
     topic = _browser_post_topic(selection, analysis)
-    settings = get_account_control_settings(username)
 
     if topic == "finance":
         preferred = [
@@ -14536,7 +14706,7 @@ def _browser_preferred_post_hashtags(
             "#trading",
             "#forex",
             "#futures",
-            "#fyp",
+            "#investing",
         ]
     elif topic == "climbing":
         preferred = [
@@ -14544,35 +14714,22 @@ def _browser_preferred_post_hashtags(
             "#bouldering",
             "#rockclimbing",
             "#climbinggym",
-            "#fyp",
+            "#climber",
         ]
     else:
         preferred = []
 
-        # AI tags come first for non-classified media.
         for tag in ai_tags or []:
             cleaned = _browser_clean_hashtag(tag)
             if cleaned:
                 preferred.append(cleaned)
 
-        # Then use the account's configured target topics.
-        for tag in _normalize_hashtag_list(
-            settings.get("target_hashtags") or []
-        ):
-            cleaned = _browser_clean_hashtag(tag)
-            if cleaned:
-                preferred.append(cleaned)
-
-        # Keep a couple of neutral discovery tags available as final fill.
-        preferred.extend(["#fyp", "#reels"])
-
-    blocked = {
-        "#photo",
-        "#creator",
-        "#explore",
-        "#daily",
-        "#instagood",
-    }
+        preferred.extend(
+            _browser_contextual_fallback_hashtags(
+                selection,
+                analysis,
+            )
+        )
 
     result = []
     seen = set()
@@ -14581,37 +14738,20 @@ def _browser_preferred_post_hashtags(
         cleaned = _browser_clean_hashtag(tag)
         key = cleaned.lower()
 
-        if not cleaned or key in blocked or key in seen:
+        if not cleaned or key in seen:
+            continue
+
+        if not _browser_hashtag_is_relevant(cleaned, topic):
             continue
 
         seen.add(key)
         result.append(cleaned)
 
-        if len(result) == 5:
-            break
-
-    # Ensure exactly five without falling back to the old generic spam set.
-    filler = (
-        ["#markets", "#investing", "#priceaction", "#fyp", "#finance"]
-        if topic == "finance"
-        else
-        ["#climbinglife", "#climber", "#outdoors", "#fyp", "#reels"]
-        if topic == "climbing"
-        else
-        ["#fyp", "#reels", "#video", "#content", "#social"]
-    )
-
-    for tag in filler:
-        cleaned = _browser_clean_hashtag(tag)
-        key = cleaned.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(cleaned)
         if len(result) == 5:
             break
 
     return result[:5]
+
 
 
 def _browser_strip_caption_labels(value: str) -> str:
@@ -14995,6 +15135,7 @@ def _browser_generate_post_caption(username, selection):
         settings.get("persona_prompt", RAGE_BAIT_PERSONA) or RAGE_BAIT_PERSONA
     ).strip()
     char_limit = int(settings["caption_char_limit"])
+    topic = _browser_post_topic(selection, analysis)
     preferred_tags = _browser_preferred_post_hashtags(
         username,
         selection,
@@ -15003,7 +15144,7 @@ def _browser_generate_post_caption(username, selection):
     preferred_tag_line = " ".join(preferred_tags)
 
     prompt = f"""
-Write ONE Instagram caption and EXACTLY 5 relevant hashtags for this exact media.
+Write ONE Instagram caption and 3-5 genuinely relevant hashtags for this exact media.
 
 MEDIA ANALYSIS:
 {semantic_context}
@@ -15015,12 +15156,15 @@ PERSPECTIVE:
 ACCOUNT-SPECIFIC CAPTION INSTRUCTIONS:
 {extra or "(none)"}
 
-PREFERRED ACCOUNT HASHTAGS WHEN RELEVANT:
-{preferred_tag_line}
+TOPIC CLASSIFICATION:
+{topic}
+
+TOPIC-SPECIFIC SEED HASHTAGS (use only when they precisely fit this media):
+{preferred_tag_line or "(none — derive tags only from the media itself)"}
 
 Return exactly:
 CAPTION: <caption text>
-HASHTAGS: #tag1 #tag2 #tag3 #tag4 #tag5
+HASHTAGS: <3-5 hashtags grounded in this exact media>
 
 Rules:
 - Base the caption on the supplied visual analysis.
@@ -15028,8 +15172,11 @@ Rules:
 - Do not invent a location, identity, profession, event, or stock/trading topic.
 - Keep the caption under {char_limit} characters before hashtags.
 - Complete natural sentences.
-- Prefer the supplied account hashtags when they fit the visual subject.
-- Avoid generic low-signal tags such as #photo #creator #explore #daily #instagood.
+- Never use a hashtag merely because it is an account target or common discovery tag.
+- Never infer climbing from an ordinary wall, route, or physical hold.
+- Never infer finance from generic words such as market, gold, option, or future unless the media context clearly indicates finance/trading.
+- Avoid generic low-signal tags such as #fyp #reels #viral #video #content #social #photo #creator #explore #daily #instagood.
+- If only 3 or 4 hashtags are truly relevant, return only those rather than adding unrelated filler.
 """.strip()
 
     try:
@@ -18976,7 +19123,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reels + Auto Synergy Caption Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Hashtag Relevance Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
