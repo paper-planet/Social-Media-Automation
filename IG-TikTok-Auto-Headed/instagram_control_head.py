@@ -7943,13 +7943,845 @@ def _browser_reels_scroll_next(page) -> bool:
             return False
 
 
+def _browser_reel_watch_context(
+    page,
+    username: str,
+    *,
+    watch_seconds: float = 6.0,
+) -> str:
+    """
+    Keep the currently visible reel on screen for a short watch period and
+    collect its visible caption/text context.
+
+    This does not infer hidden audio/transcript. The generated comment is
+    grounded only in text Instagram visibly exposes on the current reel.
+    """
+    scope = _browser_visible_reel_scope(page)
+    snapshots = []
+
+    try:
+        video = scope.locator("video").first
+        if not video.count():
+            video = page.locator("video").first
+    except Exception:
+        video = None
+
+    start_time = None
+    end_time = None
+
+    if video is not None:
+        try:
+            start_time = float(
+                video.evaluate("(v) => Number(v.currentTime || 0)")
+            )
+        except Exception:
+            start_time = None
+
+    started = time.monotonic()
+    next_log = 2.0
+
+    while time.monotonic() - started < watch_seconds:
+        problem = _browser_page_problem(page)
+        if problem:
+            _browser_pause_for_manual_security(username, problem)
+            break
+
+        try:
+            visible = re.sub(
+                r"\s+",
+                " ",
+                scope.inner_text(timeout=500) or "",
+            ).strip()
+            if visible:
+                snapshots.append(visible)
+        except Exception:
+            pass
+
+        elapsed = time.monotonic() - started
+        if elapsed >= next_log:
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"👀 Reels Demo watching current reel… {elapsed:.0f}s",
+            )
+            next_log += 2.0
+
+        page.wait_for_timeout(650)
+
+    if video is not None:
+        try:
+            end_time = float(
+                video.evaluate("(v) => Number(v.currentTime || 0)")
+            )
+        except Exception:
+            end_time = None
+
+    # Prefer the richest visible snapshot from the watch window.
+    visible = max(snapshots, key=len) if snapshots else ""
+
+    # Remove a few common action labels so they don't dominate the prompt.
+    visible = re.sub(
+        r"\b(?:Like|Unlike|Comment|Comments|Share|Save|Repost|Follow|Following)\b",
+        " ",
+        visible,
+        flags=re.I,
+    )
+    visible = re.sub(r"\s+", " ", visible).strip()[:1800]
+
+    playback_note = ""
+    if start_time is not None and end_time is not None:
+        playback_note = (
+            f" playback advanced {max(0.0, end_time - start_time):.1f}s"
+        )
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"👀 Reels Demo watch complete; visible context "
+            f"{'captured' if visible else 'was minimal'};{playback_note or ' playback state unavailable'}."
+        ),
+    )
+
+    return visible
+
+
+def _browser_prepare_reel_comment(
+    page,
+    username: str,
+    reel_context: str,
+) -> str:
+    """
+    Generate the comment before opening the comment drawer, so the UI does not
+    sit open while the local model is thinking.
+    """
+    context = re.sub(r"\s+", " ", str(reel_context or "")).strip()
+    if not context:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "↪️ Reels Demo: not enough visible reel context for a "
+                "grounded comment; comment will be skipped."
+            ),
+        )
+        return ""
+
+    settings = get_account_control_settings(username)
+    persona = str(
+        settings.get("persona_prompt", RAGE_BAIT_PERSONA)
+        or RAGE_BAIT_PERSONA
+    ).strip()
+    extra = str(settings.get("comment_prompt", "") or "").strip()
+
+    prompt = f"""
+Write ONE concise Instagram comment about the CURRENT REEL.
+
+VISIBLE REEL CAPTION/TEXT:
+{context}
+
+ACCOUNT COMMENT INSTRUCTIONS:
+{extra or "(none)"}
+
+Rules:
+- Respond specifically to what the visible reel text supports.
+- Do not invent unseen actions, identities, relationships, locations, or facts.
+- Do not mention bots, automation, prompts, or source metadata.
+- No threats or slurs.
+- 3 to 20 words.
+- Output only the comment.
+""".strip()
+
+    update_account_metric(
+        username,
+        "add_history",
+        value="🧠 Reels Demo preparing a reel-specific comment before opening comments.",
+    )
+
+    try:
+        result = _ollama_generate(
+            prompt,
+            min_words=3,
+            max_words=20,
+            attempts=2,
+            system_prompt=persona,
+        )
+    except Exception:
+        result = ""
+
+    comment = _clip_chars(
+        result or "",
+        int(settings.get("reply_char_limit", 280)),
+    ).strip()
+
+    if comment:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"💭 Reels Demo prepared comment: {comment[:120]}",
+        )
+    else:
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Reels Demo local model returned no usable reel-specific comment.",
+        )
+
+    return comment
+
+
+def _browser_demo_wait_write_slot(
+    page,
+    username: str,
+    action_type: str,
+    *,
+    max_wait: int = 45,
+) -> bool:
+    """
+    Manual demo helper.
+
+    Wait through the EXISTING pacing gate instead of changing/bypassing it.
+    The visible reel remains open while waiting. Security/restriction UI is
+    checked repeatedly.
+    """
+    reason = _shared_write_block_reason(username, action_type)
+    if reason:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"⏳ Reels Demo waiting for permitted {action_type} slot: "
+                f"{reason}"
+            ),
+        )
+
+    start = time.monotonic()
+
+    while True:
+        problem = _browser_page_problem(page)
+        if problem:
+            _browser_pause_for_manual_security(username, problem)
+            return False
+
+        allowed, account_reason = account_writes_allowed(username)
+        if not allowed:
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"🛑 Reels Demo {action_type} blocked: {account_reason}",
+            )
+            return False
+
+        ok, slot_reason = _reserve_shared_write_slot(
+            username,
+            action_type,
+        )
+        if ok:
+            waited = time.monotonic() - start
+            if waited >= 1.0:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"▶️ Reels Demo {action_type} slot available after "
+                        f"~{waited:.0f}s; continuing."
+                    ),
+                )
+            return True
+
+        if (
+            "Safety Backoff" in slot_reason
+            or "Account cooldown" in slot_reason
+            or "rolling budget" in slot_reason
+        ):
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"↪️ Reels Demo {action_type} unavailable: {slot_reason}",
+            )
+            return False
+
+        elapsed = time.monotonic() - start
+        if elapsed >= max_wait:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"↪️ Reels Demo {action_type} wait expired after "
+                    f"{max_wait}s: {slot_reason}"
+                ),
+            )
+            return False
+
+        page.wait_for_timeout(1000)
+
+
+def _browser_demo_wait_follow_slot(
+    page,
+    username: str,
+    *,
+    max_wait: int = 30,
+) -> bool:
+    """
+    Wait for the normal Follow reservation while retaining the daily 50-attempt
+    hard cap and security/backoff checks.
+    """
+    start = time.monotonic()
+    logged = False
+
+    while True:
+        problem = _browser_page_problem(page)
+        if problem:
+            _browser_pause_for_manual_security(username, problem)
+            return False
+
+        ok, reason = _reserve_browser_follow_slot(username)
+        if ok:
+            waited = time.monotonic() - start
+            if waited >= 1.0:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"▶️ Reels Demo follow slot available after "
+                        f"~{waited:.0f}s; continuing."
+                    ),
+                )
+            return True
+
+        lower = str(reason or "").lower()
+        if (
+            "daily follow hard cap" in lower
+            or "rolling write budget" in lower
+            or "safety" in lower
+            or "cooldown" in lower
+        ):
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"↪️ Reels Demo Follow unavailable: {reason}",
+            )
+            return False
+
+        if not logged:
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"⏳ Reels Demo waiting for permitted Follow slot: {reason}",
+            )
+            logged = True
+
+        if time.monotonic() - start >= max_wait:
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"↪️ Reels Demo Follow wait expired: {reason}",
+            )
+            return False
+
+        page.wait_for_timeout(1000)
+
+
+def _browser_find_reel_comment_editor(page):
+    """
+    Find the visible comment editor in the currently open reel comments UI.
+    """
+    selectors = (
+        "textarea[placeholder*='comment' i]",
+        "textarea[aria-label*='comment' i]",
+        "[contenteditable='true'][aria-label*='comment' i]",
+        "div[role='textbox'][contenteditable='true']",
+    )
+
+    roots = []
+    try:
+        dialogs = page.locator("[role='dialog']")
+        for i in range(dialogs.count() - 1, -1, -1):
+            d = dialogs.nth(i)
+            try:
+                if d.is_visible(timeout=120):
+                    roots.append(d)
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    roots.append(page)
+
+    for root in roots:
+        for selector in selectors:
+            try:
+                locs = root.locator(selector)
+                for i in range(locs.count() - 1, -1, -1):
+                    loc = locs.nth(i)
+                    if loc.is_visible(timeout=180):
+                        return loc
+            except Exception:
+                pass
+
+    return None
+
+
+def _browser_submit_prepared_reel_comment(
+    page,
+    username: str,
+    href: str,
+    history: dict,
+    comment: str,
+    *,
+    max_wait: int = 45,
+) -> bool:
+    history.setdefault("browser_commented_urls", [])
+
+    if not comment:
+        return False
+    if href in history["browser_commented_urls"]:
+        update_account_metric(
+            username,
+            "add_history",
+            value="💬 Reels Demo comment already recorded for this reel; not duplicating it.",
+        )
+        return True
+
+    if not _browser_open_reel_comments_if_needed(page):
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Reels Demo could not open the visible reel's comment panel.",
+        )
+        return False
+
+    box = _browser_find_reel_comment_editor(page)
+    if box is None:
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Reels Demo comment panel opened, but no visible comment editor was found.",
+        )
+        return False
+
+    if not _browser_demo_wait_write_slot(
+        page,
+        username,
+        "comment",
+        max_wait=max_wait,
+    ):
+        return False
+
+    try:
+        tag = str(
+            box.evaluate("(el) => el.tagName.toLowerCase()")
+        ).lower()
+    except Exception:
+        tag = ""
+
+    try:
+        if tag in {"textarea", "input"}:
+            box.fill(comment)
+        else:
+            box.click(timeout=2000)
+            page.keyboard.press("Control+A")
+            page.keyboard.insert_text(comment)
+
+        page.wait_for_timeout(250)
+
+        posted = False
+
+        try:
+            buttons = page.get_by_role(
+                "button",
+                name=re.compile(r"^(Post|Submit)$", re.I),
+            )
+            for i in range(min(buttons.count(), 6)):
+                btn = buttons.nth(i)
+                if btn.is_visible(timeout=120):
+                    btn.click(timeout=3500)
+                    posted = True
+                    break
+        except Exception:
+            pass
+
+        if not posted:
+            try:
+                page.keyboard.press("Enter")
+                posted = True
+            except Exception:
+                posted = False
+
+        if not posted:
+            _finish_shared_write_reservation(username, "comment", False)
+            return False
+
+        page.wait_for_timeout(900)
+    except Exception as exc:
+        _finish_shared_write_reservation(username, "comment", False)
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Reels Demo Comment failed: {type(exc).__name__}",
+        )
+        return False
+
+    if _browser_page_problem(page):
+        _finish_shared_write_reservation(username, "comment", False)
+        return False
+
+    # Best-effort visible confirmation.
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=700) or "",
+        )
+        confirmed = comment.lower() in body.lower()
+    except Exception:
+        confirmed = False
+
+    if confirmed:
+        record_write(username, "comment")
+        history["browser_commented_urls"].append(href)
+        history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"💬 Reels Demo comment confirmed: {comment[:120]}",
+        )
+        return True
+
+    _finish_shared_write_reservation(username, "comment", False)
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "⚠️ Reels Demo comment submission was not visibly confirmed; "
+            "continuing without counting it."
+        ),
+    )
+    return False
+
+
+def _browser_demo_save(
+    page,
+    username: str,
+    href: str,
+    history: dict,
+) -> bool:
+    history.setdefault("browser_saved_urls", [])
+
+    if href in history["browser_saved_urls"]:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"🔖 Reel already recorded as saved: {href}",
+        )
+        return True
+
+    save_svg = _browser_find_svg_action_visible(page, ("Save",))
+    if save_svg is None:
+        if _browser_find_svg_action_visible(page, ("Remove", "Unsave")) is not None:
+            history["browser_saved_urls"].append(href)
+            history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
+            update_account_metric(
+                username,
+                "add_history",
+                value="🔖 Visible reel is already saved; leaving it saved.",
+            )
+            return True
+
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Reels Demo Save control is not visible on this reel.",
+        )
+        return False
+
+    if not _browser_demo_wait_write_slot(
+        page,
+        username,
+        "save",
+        max_wait=45,
+    ):
+        return False
+
+    try:
+        _browser_clickable_from_svg(save_svg).click(timeout=4000)
+        page.wait_for_timeout(700)
+    except Exception as exc:
+        _finish_shared_write_reservation(username, "save", False)
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Reels Demo Save click failed: {type(exc).__name__}",
+        )
+        return False
+
+    if _browser_find_svg_action_visible(page, ("Remove", "Unsave")) is not None:
+        record_write(username, "save")
+        history["browser_saved_urls"].append(href)
+        history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
+        update_account_metric(
+            username,
+            "add_history",
+            value="🔖 Reels Demo Save confirmed.",
+        )
+        return True
+
+    _finish_shared_write_reservation(username, "save", False)
+    update_account_metric(
+        username,
+        "add_history",
+        value="⚠️ Reels Demo Save was not visibly confirmed.",
+    )
+    return False
+
+
+def _browser_demo_repost(
+    page,
+    username: str,
+    href: str,
+    history: dict,
+) -> bool:
+    history.setdefault("browser_reposted_urls", [])
+
+    if href in history["browser_reposted_urls"]:
+        update_account_metric(
+            username,
+            "add_history",
+            value="🔁 Reel already recorded as reposted; not toggling it again.",
+        )
+        return True
+
+    repost_svg = _browser_find_svg_action_visible(page, ("Repost",))
+    button = (
+        _browser_clickable_from_svg(repost_svg)
+        if repost_svg is not None
+        else None
+    )
+
+    if button is None:
+        try:
+            candidates = page.get_by_role(
+                "button",
+                name=re.compile(r"^Repost$", re.I),
+            )
+            for i in range(min(candidates.count(), 6)):
+                c = candidates.nth(i)
+                if c.is_visible(timeout=120):
+                    button = c
+                    break
+        except Exception:
+            button = None
+
+    if button is None:
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Reels Demo Repost control is not visible on this reel.",
+        )
+        return False
+
+    if not _browser_demo_wait_write_slot(
+        page,
+        username,
+        "repost",
+        max_wait=45,
+    ):
+        return False
+
+    try:
+        button.click(timeout=4000)
+        page.wait_for_timeout(450)
+
+        # Some layouts require a second exact Repost choice.
+        try:
+            exact = page.get_by_text(
+                re.compile(r"^Repost$", re.I),
+                exact=True,
+            )
+            for i in range(min(exact.count(), 6)):
+                item = exact.nth(i)
+                if item.is_visible(timeout=120):
+                    item.click(timeout=3000)
+                    page.wait_for_timeout(650)
+                    break
+        except Exception:
+            pass
+    except Exception as exc:
+        _finish_shared_write_reservation(username, "repost", False)
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Reels Demo Repost failed: {type(exc).__name__}",
+        )
+        return False
+
+    confirmed = (
+        _browser_find_svg_action_visible(
+            page,
+            ("Remove repost", "Undo repost", "Reposted"),
+        )
+        is not None
+    )
+
+    if not confirmed:
+        try:
+            body = re.sub(
+                r"\s+",
+                " ",
+                page.locator("body").inner_text(timeout=500) or "",
+            ).lower()
+            confirmed = any(
+                phrase in body
+                for phrase in ("reposted", "remove repost", "undo repost")
+            )
+        except Exception:
+            confirmed = False
+
+    if confirmed:
+        record_write(username, "repost")
+        history["browser_reposted_urls"].append(href)
+        history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+        update_account_metric(
+            username,
+            "add_history",
+            value="🔁 Reels Demo Repost confirmed.",
+        )
+        return True
+
+    _finish_shared_write_reservation(username, "repost", False)
+    update_account_metric(
+        username,
+        "add_history",
+        value="⚠️ Reels Demo Repost was not visibly confirmed.",
+    )
+    return False
+
+
+def _browser_demo_follow_if_needed(
+    page,
+    username: str,
+    href: str,
+) -> bool:
+    used, cap = _daily_follow_attempts_status(username)
+    if used >= cap:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"↪️ Reels Demo Follow skipped: daily cap reached ({used}/{cap}).",
+        )
+        return False
+
+    scope = _browser_visible_reel_scope(page)
+
+    # If Following or Requested is visible, explicitly leave it alone.
+    for state in ("Following", "Requested"):
+        try:
+            locs = scope.get_by_role(
+                "button",
+                name=re.compile(rf"^{state}$", re.I),
+            )
+            for i in range(min(locs.count(), 4)):
+                if locs.nth(i).is_visible(timeout=120):
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=f"👤 Reels Demo author already {state.lower()}; no Follow click.",
+                    )
+                    return True
+        except Exception:
+            pass
+
+    try:
+        follows = scope.get_by_role(
+            "button",
+            name=re.compile(r"^Follow$", re.I),
+        )
+        button = None
+        for i in range(min(follows.count(), 5)):
+            candidate = follows.nth(i)
+            if candidate.is_visible(timeout=150):
+                button = candidate
+                break
+    except Exception:
+        button = None
+
+    if button is None:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "↪️ Reels Demo found no exact visible Follow button; "
+                "assuming no follow action is needed/available."
+            ),
+        )
+        return False
+
+    if not _browser_demo_wait_follow_slot(
+        page,
+        username,
+        max_wait=30,
+    ):
+        return False
+
+    try:
+        button.click(timeout=4000)
+        page.wait_for_timeout(800)
+    except Exception as exc:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Reels Demo Follow click failed: {type(exc).__name__}",
+        )
+        return False
+
+    for state in ("Following", "Requested"):
+        try:
+            loc = scope.get_by_role(
+                "button",
+                name=re.compile(rf"^{state}$", re.I),
+            ).first
+            if loc.count() and loc.is_visible(timeout=250):
+                record_write(username, "follow")
+                update_account_metric(username, "total_follows", increment=1)
+                used_after, cap_after = _daily_follow_attempts_status(username)
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"✅ Reels Demo Follow confirmed [{state}]; "
+                        f"daily follows={used_after}/{cap_after}."
+                    ),
+                )
+                return True
+        except Exception:
+            pass
+
+    update_account_metric(
+        username,
+        "add_history",
+        value="⚠️ Reels Demo Follow state ambiguous; not counted confirmed.",
+    )
+    return False
+
 def _browser_reels_demo(username, history, config) -> int:
     """
     Manual one-reel demonstration.
 
-    If Chromium is already on a reel/reels page, use the reel currently on
-    screen. Otherwise open /reels/ once. Attempt all five actions exactly once
-    on that one reel and stop. Auto being OFF does not cancel this manual task.
+    Reuses the reel already visible in Chromium when possible.
+
+    Sequence:
+      1. watch current reel briefly + capture visible context
+      2. prepare a context-grounded comment BEFORE opening comments
+      3. comment
+      4. like
+      5. save
+      6. repost
+      7. follow author only when an exact visible Follow button exists
+
+    Existing pacing/security limits are respected. For the manual demo, a
+    temporary pacing gap is waited out rather than immediately skipping the
+    remaining actions.
     """
     for key in (
         "browser_liked_urls",
@@ -7965,8 +8797,8 @@ def _browser_reels_demo(username, history, config) -> int:
         username,
         "add_history",
         value=(
-            "🎞️ Reels Demo starting: exactly ONE currently visible reel; "
-            "attempting Like + Save + Repost + Follow-author + Comment once."
+            "🎞️ Reels Demo starting: ONE visible reel; watch → grounded comment "
+            "→ Like → Save → Repost → Follow-if-needed."
         ),
     )
 
@@ -7984,7 +8816,6 @@ def _browser_reels_demo(username, history, config) -> int:
             except Exception:
                 current_url = ""
 
-            # Reuse the current reel instead of navigating away from it.
             if (
                 "instagram.com/reel/" not in current_url.lower()
                 and "instagram.com/reels" not in current_url.lower()
@@ -8005,14 +8836,13 @@ def _browser_reels_demo(username, history, config) -> int:
                     username,
                     "add_history",
                     value=(
-                        "🎞️ Reels Demo is reusing the reel already visible "
-                        "in Chromium; no navigation performed."
+                        "🎞️ Reels Demo is using the reel already visible in "
+                        "Chromium; no navigation performed."
                     ),
                 )
 
             _browser_check_ready(page, context, username)
 
-            # Manual action must NOT stop merely because background Auto is off.
             safety = get_account_safety_state(username)
             if safety["active"]:
                 update_account_metric(
@@ -8025,128 +8855,166 @@ def _browser_reels_demo(username, history, config) -> int:
                 )
                 return 0
 
-            problem = _browser_engage_security_problem(
-                page,
-                username,
-            )
+            problem = _browser_engage_security_problem(page, username)
             if problem:
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🛑 Reels Demo stopped before actions because Instagram "
-                        f"requires manual attention: {problem}"
-                    ),
-                )
                 return 0
 
             scope = _browser_visible_reel_scope(page)
-            reel_key = _browser_visible_reel_permalink(
+            reel_key = _browser_visible_reel_permalink(page, scope)
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"🎬 Reels Demo 1/1: {reel_key}",
+            )
+
+            # WATCH FIRST.
+            reel_context = _browser_reel_watch_context(
                 page,
-                scope,
+                username,
+                watch_seconds=6.0,
             )
 
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # PREPARE COMMENT WHILE THE REEL ITSELF IS STILL VISIBLE.
+            prepared_comment = _browser_prepare_reel_comment(
+                page,
+                username,
+                reel_context,
+            )
+
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # 1) COMMENT
             update_account_metric(
                 username,
                 "add_history",
-                value=(
-                    f"🎬 Reels Demo 1/1: {reel_key} · "
-                    "attempting all five actions now."
-                ),
+                value="1️⃣ Reels Demo: opening comments and posting the prepared reel-specific comment.",
             )
-
-            page.wait_for_timeout(700)
-
-            # 1) LIKE
-            update_account_metric(
-                username,
-                "add_history",
-                value="1️⃣ Reels Demo: attempting Like.",
-            )
-            if _browser_try_like_engage(
+            if _browser_submit_prepared_reel_comment(
                 page,
                 username,
                 reel_key,
                 history,
+                prepared_comment,
+                max_wait=45,
             ):
                 confirmed_actions += 1
 
             if _browser_engage_security_problem(page, username):
                 return confirmed_actions
 
-            # 2) SAVE
+            # Close the comment drawer/panel before targeting reel controls.
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+
+            # 2) LIKE — use existing helper. It is the next write, so wait for
+            # the normal pacing slot first and then let the helper click it.
             update_account_metric(
                 username,
                 "add_history",
-                value="2️⃣ Reels Demo: attempting Save.",
+                value="2️⃣ Reels Demo: attempting Like.",
             )
-            if _browser_try_save_engage(
-                page,
-                username,
-                reel_key,
-                history,
-            ):
-                confirmed_actions += 1
 
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # 3) REPOST
-            update_account_metric(
-                username,
-                "add_history",
-                value="3️⃣ Reels Demo: attempting Repost.",
+            already_liked = (
+                reel_key in history.get("browser_liked_urls", [])
+                or _browser_find_svg_action_visible(page, ("Unlike",)) is not None
             )
-            if _browser_try_repost_engage(
-                page,
-                username,
-                reel_key,
-                history,
-            ):
-                confirmed_actions += 1
 
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # 4) FOLLOW AUTHOR
-            update_account_metric(
-                username,
-                "add_history",
-                value="4️⃣ Reels Demo: attempting Follow-author.",
-            )
-            if _browser_try_follow_author_engage(
-                page,
-                username,
-                reel_key,
-            ):
-                confirmed_actions += 1
-
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # 5) COMMENT
-            update_account_metric(
-                username,
-                "add_history",
-                value="5️⃣ Reels Demo: attempting Comment.",
-            )
-            if _browser_open_reel_comments_if_needed(page):
-                if _browser_try_comment_engage(
-                    page,
-                    username,
-                    reel_key,
-                    history,
-                ):
-                    confirmed_actions += 1
-            else:
+            if already_liked:
                 update_account_metric(
                     username,
                     "add_history",
-                    value=(
-                        "↪️ Reels Demo Comment control/panel was unavailable "
-                        "on the visible reel."
-                    ),
+                    value="❤️ Visible reel is already liked; leaving it liked.",
                 )
+                confirmed_actions += 1
+            else:
+                if _browser_demo_wait_write_slot(
+                    page,
+                    username,
+                    "like",
+                    max_wait=45,
+                ):
+                    like_svg = _browser_find_svg_action_visible(page, ("Like",))
+                    if like_svg is not None:
+                        try:
+                            _browser_clickable_from_svg(like_svg).click(timeout=4000)
+                            page.wait_for_timeout(700)
+                        except Exception as exc:
+                            _finish_shared_write_reservation(username, "like", False)
+                            update_account_metric(
+                                username,
+                                "add_history",
+                                value=f"⚠️ Reels Demo Like failed: {type(exc).__name__}",
+                            )
+                        else:
+                            if _browser_find_svg_action_visible(page, ("Unlike",)) is not None:
+                                record_write(username, "like")
+                                history["browser_liked_urls"].append(reel_key)
+                                history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
+                                update_account_metric(username, "total_likes", increment=1)
+                                update_account_metric(
+                                    username,
+                                    "add_history",
+                                    value="❤️ Reels Demo Like confirmed.",
+                                )
+                                confirmed_actions += 1
+                            else:
+                                _finish_shared_write_reservation(username, "like", False)
+                                update_account_metric(
+                                    username,
+                                    "add_history",
+                                    value="⚠️ Reels Demo Like was not visibly confirmed.",
+                                )
+                    else:
+                        _finish_shared_write_reservation(username, "like", False)
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value="↪️ Reels Demo Like control is not visible.",
+                        )
+
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # 3) SAVE
+            update_account_metric(
+                username,
+                "add_history",
+                value="3️⃣ Reels Demo: attempting Save.",
+            )
+            if _browser_demo_save(page, username, reel_key, history):
+                confirmed_actions += 1
+
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # 4) REPOST
+            update_account_metric(
+                username,
+                "add_history",
+                value="4️⃣ Reels Demo: attempting Repost.",
+            )
+            if _browser_demo_repost(page, username, reel_key, history):
+                confirmed_actions += 1
+
+            if _browser_engage_security_problem(page, username):
+                return confirmed_actions
+
+            # 5) FOLLOW ONLY IF NOT ALREADY FOLLOWING.
+            update_account_metric(
+                username,
+                "add_history",
+                value="5️⃣ Reels Demo: checking whether the reel author needs a Follow.",
+            )
+            if _browser_demo_follow_if_needed(page, username, reel_key):
+                confirmed_actions += 1
 
             if _browser_engage_security_problem(page, username):
                 return confirmed_actions
@@ -8173,12 +9041,13 @@ def _browser_reels_demo(username, history, config) -> int:
         username,
         "add_history",
         value=(
-            f"🎞️ Reels Demo finished: viewed 1 reel, "
-            f"confirmed actions={confirmed_actions}; no second reel opened."
+            f"🎞️ Reels Demo finished: one reel, "
+            f"confirmed/retained actions={confirmed_actions}."
         ),
     )
 
     return confirmed_actions
+
 
 
 
@@ -11870,7 +12739,7 @@ function cardHtml(user,a){
     <div class="section">
       <b>Manual actions</b>
       <div class="row">
-        <button class="good" ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','reels_demo')">🎞️ Reels Demo · 1 Reel</button>
+        <button class="good" ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','reels_demo')">🎞️ Reels Demo · Watch + Act</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
         <button ${connected ? "":"disabled"} onclick="clearUploadCooldown('${esc(user)}')">Clear Upload Cooldown</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
@@ -12872,7 +13741,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Single Reel Demo Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reel Watch + Comment Continue Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
