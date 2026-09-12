@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import random
 import re
@@ -160,11 +161,11 @@ AUTO_PASSES_BEFORE_LONG_MAX = max(
 )
 AUTO_FOLLOW_BATCH_MIN = max(
     1,
-    min(10, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MIN", "1"))),
+    min(12, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MIN", "1"))),
 )
 AUTO_FOLLOW_BATCH_MAX = max(
     AUTO_FOLLOW_BATCH_MIN,
-    min(10, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MAX", "10"))),
+    min(12, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MAX", "12"))),
 )
 
 DAILY_FOLLOW_HARD_CAP = 50
@@ -173,7 +174,6 @@ DAILY_FOLLOW_HARD_CAP = 50
 AUTO_SUCCESS_PASSES = {}
 AUTO_LONG_BREAK_TARGET = {}
 
-BURST_UNTIL = {}
 LAST_BROWSER_DM_CHECK = {}
 NEXT_BROWSER_DM_CHECK = {}
 LAST_BROWSER_COMMENT_CHECK = {}
@@ -186,22 +186,6 @@ ACTIVE_SESSION_MIN_SECONDS = max(
 ACTIVE_SESSION_MAX_SECONDS = max(
     ACTIVE_SESSION_MIN_SECONDS,
     int(os.environ.get("IG_ACTIVE_SESSION_MAX_SECONDS", "300")),
-)
-BURST_SESSION_MIN_SECONDS = max(
-    60,
-    int(os.environ.get("IG_BURST_SESSION_MIN_SECONDS", "60")),
-)
-BURST_SESSION_MAX_SECONDS = max(
-    BURST_SESSION_MIN_SECONDS,
-    int(os.environ.get("IG_BURST_SESSION_MAX_SECONDS", "120")),
-)
-BURST_BROWSE_GAP_MIN_SECONDS = max(
-    2,
-    int(os.environ.get("IG_BURST_BROWSE_GAP_MIN_SECONDS", "2")),
-)
-BURST_BROWSE_GAP_MAX_SECONDS = max(
-    BURST_BROWSE_GAP_MIN_SECONDS,
-    int(os.environ.get("IG_BURST_BROWSE_GAP_MAX_SECONDS", "5")),
 )
 ACTIVE_BROWSE_GAP_MIN_SECONDS = max(
     3,
@@ -781,7 +765,7 @@ def _default_control_settings(username, conf):
         "target_accounts": list(conf.get("competitor_accounts") or []),
         "follow_source": "both",
         "follow_limit": 2,
-        "auto_follow_batch_max": 10,
+        "auto_follow_batch_max": 12,
         "active_session_max_passes": 8,
         "engage_clips_per_pass": 12,
         "engage_scroll_steps": 8,
@@ -912,7 +896,7 @@ def _sanitize_control_settings(username, conf, raw):
         ),
         "follow_source": follow_source,
         "follow_limit": as_int("follow_limit", 1, 20),
-        "auto_follow_batch_max": as_int("auto_follow_batch_max", 1, 10),
+        "auto_follow_batch_max": as_int("auto_follow_batch_max", 1, 12),
         "active_session_max_passes": as_int("active_session_max_passes", 1, 20),
         "engage_clips_per_pass": as_int("engage_clips_per_pass", 1, 20),
         "engage_scroll_steps": as_int("engage_scroll_steps", 1, 20),
@@ -6745,97 +6729,40 @@ def _reserve_browser_follow_slot(username: str) -> tuple[bool, str]:
 
 
 
-def _next_overnight_auto_delay(
-    username: str,
-    result: str,
-    *,
-    manual_run: bool = False,
-) -> tuple[int, str]:
+def _next_overnight_auto_delay(username: str, result: str, *, manual_run: bool = False) -> tuple[int, str]:
     if result != "ran":
         if result in {"disconnected", "paused"}:
             return max(WORKFLOW_RETRY_IDLE_SECONDS, 300), "idle/disconnected"
         return WORKFLOW_RETRY_IDLE_SECONDS, "retry"
-
     if manual_run:
         return random.randint(60, 150), "short rest after manual action"
 
     pace_mode = _runtime_pace_mode(username)
-
-    if pace_mode == "burst":
-        # Burst Now is temporary. After the active worker finishes, retire the
-        # request and return to the account's persisted mode.
-        BURST_UNTIL.pop(username, None)
-        persisted = get_account_control_settings(username).get(
-            "pace_mode",
-            "normal",
-        )
-        if persisted == "overnight":
-            delay = random.randint(
-                OVERNIGHT_REST_MIN_SECONDS,
-                OVERNIGHT_REST_MAX_SECONDS,
-            )
-            return delay, "post-burst overnight rest"
-        return random.randint(120, 300), "post-burst rest"
-
     if pace_mode == "overnight":
         count = int(AUTO_SUCCESS_PASSES.get(username, 0) or 0) + 1
-        target = int(
-            AUTO_LONG_BREAK_TARGET.get(username, 0)
-            or random.randint(
-                AUTO_PASSES_BEFORE_LONG_MIN,
-                AUTO_PASSES_BEFORE_LONG_MAX,
-            )
-        )
+        target = int(AUTO_LONG_BREAK_TARGET.get(username, 0) or random.randint(AUTO_PASSES_BEFORE_LONG_MIN, AUTO_PASSES_BEFORE_LONG_MAX))
         AUTO_SUCCESS_PASSES[username] = count
         AUTO_LONG_BREAK_TARGET[username] = target
-
         if count >= target:
-            delay = random.randint(
-                OVERNIGHT_LONG_REST_MIN_SECONDS,
-                OVERNIGHT_LONG_REST_MAX_SECONDS,
-            )
+            delay = random.randint(OVERNIGHT_LONG_REST_MIN_SECONDS, OVERNIGHT_LONG_REST_MAX_SECONDS)
             AUTO_SUCCESS_PASSES[username] = 0
-            AUTO_LONG_BREAK_TARGET[username] = random.randint(
-                AUTO_PASSES_BEFORE_LONG_MIN,
-                AUTO_PASSES_BEFORE_LONG_MAX,
-            )
+            AUTO_LONG_BREAK_TARGET[username] = random.randint(AUTO_PASSES_BEFORE_LONG_MIN, AUTO_PASSES_BEFORE_LONG_MAX)
             return delay, "scheduled long overnight rest"
-
-        delay = random.randint(
-            OVERNIGHT_REST_MIN_SECONDS,
-            OVERNIGHT_REST_MAX_SECONDS,
-        )
+        delay = random.randint(OVERNIGHT_REST_MIN_SECONDS, OVERNIGHT_REST_MAX_SECONDS)
         return delay, f"overnight rest ({count}/{target} active sessions before long rest)"
 
-    # Normal pace retains the quieter single-pass cadence.
     count = int(AUTO_SUCCESS_PASSES.get(username, 0) or 0) + 1
-    target = int(
-        AUTO_LONG_BREAK_TARGET.get(username, 0)
-        or random.randint(
-            AUTO_PASSES_BEFORE_LONG_MIN,
-            AUTO_PASSES_BEFORE_LONG_MAX,
-        )
-    )
+    target = int(AUTO_LONG_BREAK_TARGET.get(username, 0) or random.randint(AUTO_PASSES_BEFORE_LONG_MIN, AUTO_PASSES_BEFORE_LONG_MAX))
     AUTO_SUCCESS_PASSES[username] = count
     AUTO_LONG_BREAK_TARGET[username] = target
-
     if count >= target:
-        delay = random.randint(
-            AUTO_LONG_REST_MIN_SECONDS,
-            AUTO_LONG_REST_MAX_SECONDS,
-        )
+        delay = random.randint(AUTO_LONG_REST_MIN_SECONDS, AUTO_LONG_REST_MAX_SECONDS)
         AUTO_SUCCESS_PASSES[username] = 0
-        AUTO_LONG_BREAK_TARGET[username] = random.randint(
-            AUTO_PASSES_BEFORE_LONG_MIN,
-            AUTO_PASSES_BEFORE_LONG_MAX,
-        )
+        AUTO_LONG_BREAK_TARGET[username] = random.randint(AUTO_PASSES_BEFORE_LONG_MIN, AUTO_PASSES_BEFORE_LONG_MAX)
         return delay, "normal scheduled long rest"
-
-    delay = random.randint(
-        AUTO_ACTIVE_REST_MIN_SECONDS,
-        AUTO_ACTIVE_REST_MAX_SECONDS,
-    )
+    delay = random.randint(AUTO_ACTIVE_REST_MIN_SECONDS, AUTO_ACTIVE_REST_MAX_SECONDS)
     return delay, f"normal rest ({count}/{target} passes before long rest)"
+
 
 
 def _browser_follow_network(username, history, config, manual=False) -> int:
@@ -6875,7 +6802,7 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
             min(
                 AUTO_FOLLOW_BATCH_MAX,
                 int(settings.get("auto_follow_batch_max", AUTO_FOLLOW_BATCH_MAX)),
-                10,
+                12,
             ),
         )
         limit = random.randint(AUTO_FOLLOW_BATCH_MIN, auto_cap)
@@ -7028,16 +6955,21 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                     break
 
                 if candidate is None:
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value=(
-                            "👁️ Browser Follow: no more currently visible "
-                            "Follow buttons in this open people-list popup; "
-                            "ending the batch without scrolling or refreshing."
-                        ),
-                    )
-                    break
+                    if manual:
+                        update_account_metric(username,"add_history",value="👁️ Browser Follow: no more currently visible Follow buttons; ending the manual pass.")
+                        break
+                    idle_rounds += 1
+                    if idle_rounds >= 5:
+                        update_account_metric(username,"add_history",value="👁️ Auto Follow: no additional Follow rows loaded after in-popup scrolling; ending without refreshing/reopening.")
+                        break
+                    update_account_metric(username,"add_history",value=f"↕️ Auto Follow needs {limit-attempt_count} more attempt(s); scrolling inside the same open people-list popup.")
+                    try:
+                        root.evaluate("(el) => el.scrollBy(0, Math.max(420, el.clientHeight * 0.72))")
+                    except Exception:
+                        try: root.locator("div").last.scroll_into_view_if_needed(timeout=900)
+                        except Exception: pass
+                    page.wait_for_timeout(800)
+                    continue
 
                 idle_rounds = 0
 
@@ -7306,6 +7238,38 @@ def _browser_try_like_engage(page, username: str, href: str, history: dict) -> b
     )
     return False
 
+
+def _browser_try_save_engage(page, username: str, href: str, history: dict) -> bool:
+    history.setdefault("browser_saved_urls", [])
+    if href in history["browser_saved_urls"]:
+        update_account_metric(username,"add_history",value=f"🔖 Save already recorded; leaving reel saved: {href}")
+        return True
+    save_svg=_browser_find_svg_action(page,("Save",))
+    if save_svg is None:
+        if _browser_find_svg_action(page,("Remove","Unsave")) is not None:
+            history["browser_saved_urls"].append(href)
+            history["browser_saved_urls"]=history["browser_saved_urls"][-5000:]
+            update_account_metric(username,"add_history",value=f"🔖 Reel already saved: {href}")
+            return True
+        update_account_metric(username,"add_history",value=f"↪️ Save control unavailable: {href}")
+        return False
+    if not wait_for_write_slot(username,"save",max_wait=0,fail_fast=True):
+        update_account_metric(username,"add_history",value="↪️ Save attempted but write pacing/budget is full; continuing.")
+        return False
+    try:
+        _browser_clickable_from_svg(save_svg).click(timeout=4000)
+        page.wait_for_timeout(650)
+    except Exception as exc:
+        update_account_metric(username,"add_history",value=f"⚠️ Save click failed; continuing: {type(exc).__name__}")
+        return False
+    if _browser_find_svg_action(page,("Remove","Unsave")) is not None:
+        record_write(username,"save")
+        history["browser_saved_urls"].append(href)
+        history["browser_saved_urls"]=history["browser_saved_urls"][-5000:]
+        update_account_metric(username,"add_history",value=f"🔖 Save confirmed: {href}")
+        return True
+    update_account_metric(username,"add_history",value=f"⚠️ Save state ambiguous; continuing: {href}")
+    return False
 
 def _browser_try_repost_engage(page, username: str, href: str, history: dict) -> bool:
     history.setdefault("browser_reposted_urls", [])
@@ -7846,235 +7810,82 @@ def _browser_reels_scroll_next(page) -> bool:
 
 
 def _browser_reels_demo(username, history, config) -> int:
-    """
-    Manual, visible Reels demonstration.
-
-    Opens Instagram Reels once, then stays in the feed and advances by scrolling.
-    Individual action failures never terminate the demo. Security/restriction
-    UI does terminate it immediately.
-    """
-    settings = get_account_control_settings(username, config)
-
-    reel_target = max(
-        1,
-        min(
-            10,
-            int(settings.get("engage_clips_per_pass", 6)),
-        ),
-    )
-
-    history.setdefault("browser_liked_urls", [])
-    history.setdefault("browser_reposted_urls", [])
-    history.setdefault("browser_commented_urls", [])
-
-    viewed = 0
-    confirmed_actions = 0
-    seen_keys = set()
-
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            f"🎞️ Reels Demo starting: up to {reel_target} reel(s); "
-            f"Like≈{int(settings.get('engage_like_percent',75))}% · "
-            f"Repost≈{int(settings.get('engage_repost_percent',75))}% · "
-            f"Comment≈{int(settings.get('engage_comment_percent',10))}% "
-            f"{'(enabled)' if settings.get('enable_comments',False) else '(comments disabled)'} · "
-            f"Follow-author≈{int(settings.get('engage_follow_percent',25))}% "
-            f"{'(enabled)' if settings.get('enable_follow',False) else '(follow disabled)'}."
-        ),
-    )
+    settings=get_account_control_settings(username,config)
+    reel_target=max(1,min(10,int(settings.get("engage_clips_per_pass",6))))
+    for k in ("browser_liked_urls","browser_saved_urls","browser_reposted_urls","browser_commented_urls"):
+        history.setdefault(k,[])
+    viewed=0
+    confirmed_actions=0
+    seen_keys=set()
+    update_account_metric(username,"add_history",value=f"🎞️ Reels Demo starting: up to {reel_target} reel(s); each reel attempts Like + Save + Repost + Follow-author + Comment.")
 
     with sync_playwright() as p:
-        context = _browser_launch(
-            p,
-            username,
-            headed=True,
-        )
-        page = context.pages[0] if context.pages else context.new_page()
-
+        context=_browser_launch(p,username,headed=True)
+        page=context.pages[0] if context.pages else context.new_page()
         try:
-            page.goto(
-                "https://www.instagram.com/reels/",
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
+            page.goto("https://www.instagram.com/reels/",wait_until="domcontentloaded",timeout=60000)
             page.wait_for_timeout(1400)
-            _browser_check_ready(page, context, username)
+            _browser_check_ready(page,context,username)
 
-            while viewed < reel_target:
-                if username in CONTROL_PAUSED_ACCOUNTS:
+            while viewed<reel_target:
+                if username in CONTROL_PAUSED_ACCOUNTS or get_account_safety_state(username)["active"]:
+                    break
+                if _browser_engage_security_problem(page,username):
                     break
 
-                safety = get_account_safety_state(username)
-                if safety["active"]:
-                    break
-
-                problem = _browser_engage_security_problem(
-                    page,
-                    username,
-                )
-                if problem:
-                    break
-
-                reel_key = _browser_current_visible_reel_key(
-                    page,
-                    viewed + 1,
-                )
-
-                # If a small scroll did not advance to a distinct reel, try one
-                # more feed advance rather than refreshing/reloading the page.
+                reel_key=_browser_current_visible_reel_key(page,viewed+1)
                 if reel_key in seen_keys:
                     if not _browser_reels_scroll_next(page):
                         break
-                    reel_key = _browser_current_visible_reel_key(
-                        page,
-                        viewed + 1,
-                    )
+                    reel_key=_browser_current_visible_reel_key(page,viewed+1)
                     if reel_key in seen_keys:
-                        update_account_metric(
-                            username,
-                            "add_history",
-                            value=(
-                                "↪️ Reels Demo could not identify a new visible "
-                                "reel after scrolling; ending without refresh."
-                            ),
-                        )
                         break
 
                 seen_keys.add(reel_key)
-                viewed += 1
+                viewed+=1
+                update_account_metric(username,"add_history",value=f"🎬 Reels Demo {viewed}/{reel_target}: attempting all five actions on {reel_key}")
+                page.wait_for_timeout(900)
 
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=f"🎬 Reels Demo {viewed}/{reel_target}: {reel_key}",
-                )
+                if _browser_try_like_engage(page,username,reel_key,history): confirmed_actions+=1
+                if _browser_engage_security_problem(page,username): break
 
-                # Allow the reel UI to settle visibly before optional actions.
-                page.wait_for_timeout(random.randint(900, 1500))
+                if _browser_try_save_engage(page,username,reel_key,history): confirmed_actions+=1
+                if _browser_engage_security_problem(page,username): break
 
-                if _browser_engage_percent(
-                    settings,
-                    "engage_like_percent",
-                    75,
-                ):
-                    if _browser_try_like_engage(
-                        page,
-                        username,
-                        reel_key,
-                        history,
-                    ):
-                        confirmed_actions += 1
+                if _browser_try_repost_engage(page,username,reel_key,history): confirmed_actions+=1
+                if _browser_engage_security_problem(page,username): break
 
-                if _browser_engage_security_problem(page, username):
+                if _browser_try_follow_author_engage(page,username,reel_key): confirmed_actions+=1
+                if _browser_engage_security_problem(page,username): break
+
+                if _browser_open_reel_comments_if_needed(page):
+                    if _browser_try_comment_engage(page,username,reel_key,history): confirmed_actions+=1
+                else:
+                    update_account_metric(username,"add_history",value="↪️ Comment attempted but the visible comment control/panel was unavailable.")
+                if _browser_engage_security_problem(page,username): break
+
+                try:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(250)
+                except Exception:
+                    pass
+                if viewed>=reel_target:
                     break
-
-                if _browser_engage_percent(
-                    settings,
-                    "engage_repost_percent",
-                    75,
-                ):
-                    if _browser_try_repost_engage(
-                        page,
-                        username,
-                        reel_key,
-                        history,
-                    ):
-                        confirmed_actions += 1
-
-                if _browser_engage_security_problem(page, username):
-                    break
-
-                if (
-                    settings.get("enable_follow", False)
-                    and _browser_engage_percent(
-                        settings,
-                        "engage_follow_percent",
-                        25,
-                    )
-                ):
-                    if _browser_try_follow_author_engage(
-                        page,
-                        username,
-                        reel_key,
-                    ):
-                        confirmed_actions += 1
-
-                if _browser_engage_security_problem(page, username):
-                    break
-
-                if (
-                    settings.get("enable_comments", False)
-                    and _browser_engage_percent(
-                        settings,
-                        "engage_comment_percent",
-                        10,
-                    )
-                ):
-                    if _browser_open_reel_comments_if_needed(page):
-                        if _browser_try_comment_engage(
-                            page,
-                            username,
-                            reel_key,
-                            history,
-                        ):
-                            confirmed_actions += 1
-                    else:
-                        update_account_metric(
-                            username,
-                            "add_history",
-                            value=(
-                                "↪️ Reels Demo skip Comment: visible reel "
-                                "comment control/panel was not available."
-                            ),
-                        )
-
-                if _browser_engage_security_problem(page, username):
-                    break
-
-                if viewed >= reel_target:
-                    break
-
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value="↕️ Reels Demo scrolling to the next reel; no refresh.",
-                )
-
+                update_account_metric(username,"add_history",value="↕️ Reels Demo scrolling to next reel; no refresh.")
                 if not _browser_reels_scroll_next(page):
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value="⚠️ Reels Demo could not advance the feed; ending.",
-                    )
                     break
-
         finally:
             try:
-                _browser_refresh_saved_sessionid(
-                    context,
-                    username,
-                )
+                _browser_refresh_saved_sessionid(context,username)
             except Exception:
                 pass
             _browser_close_context(context)
 
-    history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
-    history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
-    history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
-
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            f"🎞️ Reels Demo finished: viewed {viewed} reel(s), "
-            f"confirmed actions={confirmed_actions}. "
-            "The Reels feed was advanced by scrolling, not refreshing."
-        ),
-    )
-
+    for k in ("browser_liked_urls","browser_saved_urls","browser_reposted_urls","browser_commented_urls"):
+        history[k]=history[k][-5000:]
+    update_account_metric(username,"add_history",value=f"🎞️ Reels Demo finished: viewed {viewed}, confirmed actions={confirmed_actions}; every reel attempted all five actions.")
     return confirmed_actions
+
 
 def _browser_engage_hashtag(username, history, config, manual=False) -> int:
     settings = get_account_control_settings(username, config)
@@ -9642,11 +9453,9 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
 
 
 def _runtime_pace_mode(username: str) -> str:
-    if float(BURST_UNTIL.get(username, 0.0) or 0.0) > time.time():
-        return "burst"
-    return str(
-        get_account_control_settings(username).get("pace_mode", "normal")
-    ).strip().lower()
+    mode = str(get_account_control_settings(username).get("pace_mode", "normal")).strip().lower()
+    return mode if mode in {"normal", "overnight"} else "normal"
+
 
 
 def _control_set_pace_mode(username: str, mode: str):
@@ -9662,9 +9471,6 @@ def _control_set_pace_mode(username: str, mode: str):
         username,
         {"pace_mode": mode},
     )
-
-    if mode == "normal":
-        BURST_UNTIL.pop(username, None)
 
     if username not in CONTROL_PAUSED_ACCOUNTS:
         CONTROL_FORCE_RUN.add(username)
@@ -9684,58 +9490,6 @@ def _control_set_pace_mode(username: str, mode: str):
     return {"ok": True, "pace_mode": settings["pace_mode"]}
 
 
-def _control_burst_now(username: str):
-    username = str(username or "").strip().lstrip("@")
-
-    if username not in CONTROL_ROSTER:
-        raise ValueError(f"Unknown account @{username}")
-
-    if username in BROWSER_LOGIN_IN_PROGRESS:
-        raise RuntimeError("Finish Browser Login before starting a burst.")
-
-    if username in BROWSER_NATIVE_ACCOUNTS and not _browser_live_port_open(username):
-        _mark_browser_login_needed(
-            username,
-            "the live Chromium window is closed",
-        )
-        raise RuntimeError("Live Chromium is closed. Use Quick Login or Browser Login first.")
-
-    state = get_account_safety_state(username)
-    if state["active"]:
-        raise RuntimeError(
-            f"Safety Backoff is active until {state['until']}: "
-            f"{state['reason'][:140]}"
-        )
-
-    duration = random.randint(
-        BURST_SESSION_MIN_SECONDS,
-        BURST_SESSION_MAX_SECONDS,
-    )
-    BURST_UNTIL[username] = time.time() + duration
-
-    CONTROL_PAUSED_ACCOUNTS.discard(username)
-    CONTROL_FORCE_RUN.add(username)
-
-    update_account_metric(
-        username,
-        "status",
-        status="Burst Session Requested",
-    )
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            f"⚡ Burst Now requested for ~{duration//60}m "
-            f"{duration%60:02d}s of active work. Rolling write budget, "
-            "50/day follow cap, and security stops remain active."
-        ),
-    )
-
-    return {
-        "ok": True,
-        "burst_seconds": duration,
-        "burst_until": BURST_UNTIL[username],
-    }
 
 
 def _browser_readonly_dm_check(username: str, context, page) -> bool:
@@ -9887,39 +9641,20 @@ def _browser_readonly_comment_check(username: str, context, page) -> bool:
 
 
 def _browser_maybe_run_readonly_listeners(username: str) -> None:
-    settings = get_account_control_settings(username)
-    if not (
-        settings.get("enable_dms", False)
-        or settings.get("enable_comments", False)
-    ):
+    """Active work checks comments only. DMs are handled only during rest periods."""
+    settings=get_account_control_settings(username)
+    if not settings.get("enable_comments",False):
         return
-
     if not _browser_live_port_open(username):
         return
-
     with sync_playwright() as p:
-        context = _browser_launch(p, username, headed=None)
-        page = context.pages[0] if context.pages else context.new_page()
+        context=_browser_launch(p,username,headed=None)
+        page=context.pages[0] if context.pages else context.new_page()
         try:
-            # At most one listener navigation per active-session checkpoint.
-            checks = []
-            if settings.get("enable_dms", False):
-                checks.append("dms")
-            if settings.get("enable_comments", False):
-                checks.append("comments")
-            random.shuffle(checks)
-
-            for check in checks:
-                if check == "dms" and _browser_readonly_dm_check(
-                    username, context, page
-                ):
-                    break
-                if check == "comments" and _browser_readonly_comment_check(
-                    username, context, page
-                ):
-                    break
+            _browser_readonly_comment_check(username,context,page)
         finally:
             _browser_close_context(context)
+
 
 
 def _browser_auto_choices(username: str, settings: dict, folder_pool) -> list[str]:
@@ -10224,7 +9959,7 @@ def run_browser_profile_workflow(username, conf, folder_pool):
         else:
             pace_mode = _runtime_pace_mode(username)
 
-            if pace_mode in {"overnight", "burst"}:
+            if pace_mode == "overnight":
                 _run_browser_active_session(
                     username,
                     history,
@@ -10604,10 +10339,6 @@ def _control_metrics_payload():
             "write_window_seconds":WRITE_WINDOW_SECONDS,"upload_cooldown_seconds":_effective_pacing(username)["upload"],
             "settings":get_account_control_settings(username,conf),"safety":get_account_safety_state(username),
             "pace_mode":_runtime_pace_mode(username),
-            "burst_remaining_seconds":max(
-                0,
-                int(float(BURST_UNTIL.get(username,0.0) or 0.0)-time.time()),
-            ),
         }
         result[username]=row
     return {"accounts":result,"recent_posts":load_recent_posts()[:25],"media":media_root_payload()}
@@ -11733,7 +11464,7 @@ function cardHtml(user,a){
     </div>
     <div class="small">Write budget: ${Number(c.write_budget_used||0)}/${Number(c.write_budget_max||0)} per rolling ${Math.round(Number(c.write_window_seconds||0)/60)} min · uploads ≥ ${Math.round(Number(c.upload_cooldown_seconds||0)/60)} min apart</div>
     <div class="small">Daily follows: <b>${Number(c.daily_follow_used||0)}/${Number(c.daily_follow_cap||50)}</b> · hard reset at local midnight</div>
-    <div class="small">Pace: <b>${esc(c.pace_mode||s.pace_mode||"normal")}</b>${Number(c.burst_remaining_seconds||0)>0 ? ` · burst remaining ~${Math.ceil(Number(c.burst_remaining_seconds)/60)}m` : ""}</div>
+    <div class="small">Pace: <b>${esc(c.pace_mode||s.pace_mode||"normal")}</b></div>
     ${c.safety?.active ? `<div class="small bad">Safety Backoff until ${esc(c.safety.until||"")} · ${esc(c.safety.reason||"")}</div>` : ""}
 
     <div class="section">
@@ -11749,8 +11480,6 @@ function cardHtml(user,a){
           onclick="pauseAccount('${esc(user)}',${autoEnabled ? "true":"false"})">
           ${autoEnabled ? "Stop Automation":"Start Automation"}
         </button>
-        <button class="good" ${connected ? "":"disabled"}
-          onclick="burstNow('${esc(user)}')">⚡ Burst Now · 1-2 min</button>
         <button ${connected ? "":"disabled"}
           onclick="setPaceMode('${esc(user)}','overnight')">🌙 Overnight Pace</button>
         <button ${connected ? "":"disabled"}
@@ -11809,7 +11538,7 @@ function cardHtml(user,a){
         <div><label>Caption char limit</label><input id="caplim_${esc(user)}" type="number" min="80" max="2200" value="${Number(s.caption_char_limit||420)}"></div>
         <div><label>Reply char limit</label><input id="replim_${esc(user)}" type="number" min="20" max="1000" value="${Number(s.reply_char_limit||280)}"></div>
         <div><label>Follow limit / pass</label><input id="followlim_${esc(user)}" type="number" min="1" max="20" value="${Number(s.follow_limit||2)}"></div>
-        <div><label>Auto follow batch max (1-10 visible rows)</label><input id="autofollowmax_${esc(user)}" type="number" min="1" max="10" value="${Number(s.auto_follow_batch_max||10)}"></div>
+        <div><label>Auto follow batch max (1-12)</label><input id="autofollowmax_${esc(user)}" type="number" min="1" max="12" value="${Number(s.auto_follow_batch_max||12)}"></div>
         <div><label>Active-session passes (1-20)</label><input id="sessionpasses_${esc(user)}" type="number" min="1" max="20" value="${Number(s.active_session_max_passes||8)}"></div>
         <div><label>Engage clips / pass (1-20)</label><input id="engageclips_${esc(user)}" type="number" min="1" max="20" value="${Number(s.engage_clips_per_pass||12)}"></div>
         <div><label>Engage discovery scrolls (1-20)</label><input id="engagescrolls_${esc(user)}" type="number" min="1" max="20" value="${Number(s.engage_scroll_steps||8)}"></div>
@@ -11846,7 +11575,6 @@ function cardHtml(user,a){
     <div class="section">
       <b>Manual actions</b>
       <div class="row">
-        <button class="good" ${connected ? "":"disabled"} onclick="burstNow('${esc(user)}')">⚡ Burst Now (1-2 min)</button>
         <button class="good" ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','reels_demo')">🎞️ Reels Demo</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
         <button ${connected ? "":"disabled"} onclick="clearUploadCooldown('${esc(user)}')">Clear Upload Cooldown</button>
@@ -12153,14 +11881,6 @@ async function setPaceMode(user,mode){
   }catch(e){toast(e.message,true)}
 }
 
-async function burstNow(user){
-  try{
-    await autoSaveBehavior(user,true);
-    const r=await api("burst_now",{username:user});
-    toast(`Burst started for @${user} (~${Math.ceil(Number(r.burst_seconds||0)/60)} min).`);
-    await refreshMetrics();
-  }catch(e){toast(e.message,true)}
-}
 
 function collectBehavior(user){
   return {
@@ -12292,9 +12012,6 @@ refreshNow(true);
                     username,
                     str(body.get("mode", "normal")),
                 )
-
-            elif action == "burst_now":
-                result = _control_burst_now(username)
 
             elif action == "save_settings":
                 result = _control_save_settings(
@@ -12488,6 +12205,282 @@ ACCOUNT_WORKFLOW_THREADS = {}
 ACCOUNT_WORKFLOW_THREADS_LOCK = threading.RLock()
 
 
+REST_DM_DUE = {}
+REST_DM_RUNNING = set()
+REST_DM_LOCK = threading.RLock()
+
+
+def _browser_rest_dm_reply_once(username: str, conf: dict) -> int:
+    if not get_account_control_settings(username, conf).get("enable_dms", False):
+        return 0
+    if not _browser_live_port_open(username):
+        return 0
+
+    history = load_json(
+        conf["history_file"],
+        {"browser_dm_reply_fingerprints": []},
+    )
+    history.setdefault("browser_dm_reply_fingerprints", [])
+
+    with sync_playwright() as p:
+        context = _browser_launch(p, username, headed=None)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.goto(
+                "https://www.instagram.com/direct/inbox/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(1100)
+            _browser_check_ready(page, context, username)
+
+            links = page.locator("a[href*='/direct/t/']")
+            thread = None
+            thread_href = ""
+
+            for i in range(min(links.count(), 40)):
+                candidate = links.nth(i)
+                try:
+                    if not candidate.is_visible(timeout=120):
+                        continue
+                    txt = re.sub(
+                        r"\s+",
+                        " ",
+                        candidate.inner_text(timeout=250) or "",
+                    )
+                    aria = str(candidate.get_attribute("aria-label") or "")
+                    unread_desc = candidate.locator(
+                        "[aria-label*='unread' i], [title*='unread' i]"
+                    ).count() > 0
+                except Exception:
+                    continue
+
+                if "unread" in f"{txt} {aria}".lower() or unread_desc:
+                    thread = candidate
+                    thread_href = str(candidate.get_attribute("href") or "")
+                    break
+
+            if thread is None:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value="👂 Rest DM check: no visibly unread thread found.",
+                )
+                return 0
+
+            thread.click(timeout=5000)
+            page.wait_for_timeout(900)
+            _browser_check_ready(page, context, username)
+
+            root = page.locator("main").first
+            if not root.count():
+                root = page
+
+            try:
+                conversation = re.sub(
+                    r"\s+",
+                    " ",
+                    root.inner_text(timeout=1000) or "",
+                ).strip()
+            except Exception:
+                conversation = ""
+
+            if not conversation:
+                return 0
+
+            tail = conversation[-1800:]
+            fingerprint = hashlib.sha1(
+                f"{thread_href}|{tail}".encode("utf-8", "ignore")
+            ).hexdigest()
+            if fingerprint in history["browser_dm_reply_fingerprints"]:
+                return 0
+
+            settings = get_account_control_settings(username, conf)
+            persona = str(
+                settings.get("persona_prompt", RAGE_BAIT_PERSONA)
+                or RAGE_BAIT_PERSONA
+            )
+            extra = str(settings.get("dm_prompt", "") or "")
+            prompt = (
+                "Reply once to the most recent incoming Instagram DM.\n\n"
+                f"VISIBLE CONVERSATION:\n{tail}\n\n"
+                f"ACCOUNT DM INSTRUCTIONS:\n{extra or '(none)'}\n\n"
+                "Rules: reply to what they actually said; match tone; "
+                "do not invent facts; 3-45 words; output only the reply."
+            )
+
+            reply = _ollama_generate(
+                prompt,
+                min_words=3,
+                max_words=45,
+                attempts=2,
+                system_prompt=persona,
+            )
+            reply = _clip_chars(
+                reply or "",
+                int(settings.get("reply_char_limit", 500)),
+            )
+            if not reply:
+                return 0
+
+            if not wait_for_write_slot(
+                username,
+                "dm",
+                max_wait=0,
+                fail_fast=True,
+            ):
+                return 0
+
+            box = None
+            for selector in (
+                "textarea[placeholder*='message' i]",
+                "textarea[aria-label*='message' i]",
+                "div[role='textbox'][contenteditable='true']",
+            ):
+                try:
+                    loc = page.locator(selector).last
+                    if loc.count() and loc.is_visible(timeout=250):
+                        box = loc
+                        break
+                except Exception:
+                    pass
+
+            if box is None:
+                return 0
+
+            try:
+                tag = str(box.evaluate("(el) => el.tagName.toLowerCase()"))
+                if tag in {"textarea", "input"}:
+                    box.fill(reply)
+                else:
+                    box.click(timeout=2000)
+                    page.keyboard.insert_text(reply)
+
+                send = page.get_by_role(
+                    "button",
+                    name=re.compile(r"^Send$", re.I),
+                ).first
+                if send.count() and send.is_visible(timeout=250):
+                    send.click(timeout=3500)
+                else:
+                    page.keyboard.press("Enter")
+                page.wait_for_timeout(800)
+            except Exception:
+                return 0
+
+            if _browser_page_problem(page):
+                return 0
+
+            record_write(username, "dm")
+            history["browser_dm_reply_fingerprints"].append(fingerprint)
+            history["browser_dm_reply_fingerprints"] = (
+                history["browser_dm_reply_fingerprints"][-1000:]
+            )
+            save_json(conf["history_file"], history)
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"📤 Rest-period DM reply sent once: {reply[:130]}",
+            )
+            return 1
+        finally:
+            _browser_close_context(context)
+
+
+def _run_rest_dm_once(username: str, conf: dict) -> None:
+    try:
+        if username in CONTROL_PAUSED_ACCOUNTS:
+            return
+        if not get_account_control_settings(username, conf).get("enable_dms", False):
+            return
+        if get_account_safety_state(username)["active"]:
+            return
+
+        cl = CLIENT_CACHE.get(username)
+        if cl is not None and username not in CONTROL_DISCONNECTED_ACCOUNTS:
+            history = load_json(
+                conf["history_file"],
+                {
+                    "replied_dms": [],
+                    "dm_reply_memory": {},
+                    "dm_thread_last_reply_at": {},
+                },
+            )
+            replied = handle_direct_messages(
+                cl,
+                history,
+                username,
+                max_replies=1,
+                debug=False,
+            )
+            if replied:
+                save_json(conf["history_file"], history)
+        elif username in BROWSER_NATIVE_ACCOUNTS:
+            _browser_rest_dm_reply_once(username, conf)
+    finally:
+        with REST_DM_LOCK:
+            REST_DM_RUNNING.discard(username)
+
+
+def _schedule_rest_dm_once(
+    username: str,
+    conf: dict,
+    delay_seconds: int,
+    *,
+    manual_run: bool = False,
+) -> None:
+    with REST_DM_LOCK:
+        REST_DM_DUE.pop(username, None)
+
+    if manual_run or delay_seconds < 120:
+        return
+    if not get_account_control_settings(username, conf).get("enable_dms", False):
+        return
+    if random.random() >= 0.35:
+        return
+
+    offset = random.randint(
+        max(30, int(delay_seconds * 0.25)),
+        max(31, int(delay_seconds * 0.70)),
+    )
+    with REST_DM_LOCK:
+        REST_DM_DUE[username] = time.monotonic() + offset
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"👂 One DM listen/reply opportunity scheduled ~{offset}s "
+            "into this rest period."
+        ),
+    )
+
+
+def _launch_due_rest_dm_checks() -> None:
+    now = time.monotonic()
+    with REST_DM_LOCK:
+        due = [
+            u
+            for u, when in REST_DM_DUE.items()
+            if now >= float(when) and u not in REST_DM_RUNNING
+        ]
+        for u in due:
+            REST_DM_DUE.pop(u, None)
+            REST_DM_RUNNING.add(u)
+
+    for u in due:
+        conf = CONTROL_ROSTER.get(u)
+        if conf:
+            threading.Thread(
+                target=_run_rest_dm_once,
+                args=(u, conf),
+                daemon=True,
+                name=f"ig-rest-dm-{u}",
+            ).start()
+        else:
+            with REST_DM_LOCK:
+                REST_DM_RUNNING.discard(u)
+
 def _background_account_workflow(username, conf, next_workflow_at):
     update_account_metric(username,"add_history",value="🧵 Worker started.")
     forced_task = NEXT_TASK_OVERRIDE.get(username)
@@ -12523,6 +12516,12 @@ def _background_account_workflow(username, conf, next_workflow_at):
             f"next Auto eligibility in ~{delay}s "
             f"({delay_reason})."
         ),
+    )
+    _schedule_rest_dm_once(
+        username,
+        conf,
+        delay,
+        manual_run=bool(forced_task),
     )
     with ACCOUNT_WORKFLOW_THREADS_LOCK:
         next_workflow_at[username]=time.monotonic()+delay; ACCOUNT_WORKFLOW_THREADS.pop(username,None)
@@ -12569,7 +12568,6 @@ def main():
     CONTROL_PAUSED_ACCOUNTS.update(active_roster.keys())
     CONTROL_FORCE_RUN.clear()
     LAST_DM_POLL.clear()
-    BURST_UNTIL.clear()
     LAST_BROWSER_DM_CHECK.clear()
     NEXT_BROWSER_DM_CHECK.clear()
     LAST_BROWSER_COMMENT_CHECK.clear()
@@ -12579,7 +12577,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Caption + Hashtag Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reels All Actions + Rest DM: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
@@ -12587,7 +12585,7 @@ def main():
     print("Boot mode: DISCONNECTED / AUTO OFF")
     print(f"Daily follow hard cap: {DAILY_FOLLOW_HARD_CAP} attempts per local day")
     print(
-        "Auto cadence: Burst = 1-2 min active session; Normal single-pass; Overnight uses "
+        "Auto cadence: Normal single-pass; Overnight uses "
         f"{ACTIVE_SESSION_MIN_SECONDS//60}-{ACTIVE_SESSION_MAX_SECONDS//60} min active sessions, "
         f"{OVERNIGHT_REST_MIN_SECONDS//60}-{OVERNIGHT_REST_MAX_SECONDS//60} min ordinary rests, "
         f"{OVERNIGHT_LONG_REST_MIN_SECONDS//60}-{OVERNIGHT_LONG_REST_MAX_SECONDS//60} min periodic long rests; "
@@ -12605,8 +12603,8 @@ def main():
 
     try:
         while True:
-            # Listener respects Auto Off and the DMs checkbox.
-            poll_all_cached_dms(CONTROL_ROSTER)
+            # DMs are checked/replied to only during scheduled rest windows.
+            _launch_due_rest_dm_checks()
 
             now_mono = time.monotonic()
             for current_user, conf in list(CONTROL_ROSTER.items()):
