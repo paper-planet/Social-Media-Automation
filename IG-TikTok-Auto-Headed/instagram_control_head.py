@@ -7731,6 +7731,351 @@ def _browser_collect_engage_links(
 
     return links
 
+def _browser_current_visible_reel_key(page, fallback_index: int = 0) -> str:
+    """
+    Find the reel permalink nearest the viewport center without navigating.
+    """
+    try:
+        href = page.evaluate(
+            """
+            () => {
+              const links = [...document.querySelectorAll('a[href*="/reel/"]')];
+              const vh = window.innerHeight || 1;
+              const vw = window.innerWidth || 1;
+              let best = null;
+              let bestScore = Infinity;
+
+              for (const a of links) {
+                const r = a.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                if (r.bottom <= 0 || r.top >= vh) continue;
+
+                const cx = r.left + r.width / 2;
+                const cy = r.top + r.height / 2;
+                const score =
+                  Math.abs(cx - vw / 2) * 0.25 +
+                  Math.abs(cy - vh / 2);
+
+                if (score < bestScore) {
+                  bestScore = score;
+                  best = a.href || a.getAttribute('href') || '';
+                }
+              }
+              return best || '';
+            }
+            """
+        )
+    except Exception:
+        href = ""
+
+    href = str(href or "").split("?", 1)[0].strip()
+    if href:
+        return href
+
+    return f"reels-demo:{int(fallback_index)}:{int(time.time())}"
+
+
+def _browser_open_reel_comments_if_needed(page) -> bool:
+    """
+    Open the visible reel's comments panel if Instagram exposes a Comment
+    action. Missing controls are non-fatal.
+    """
+    try:
+        existing = page.locator(
+            "textarea[placeholder*='comment' i], "
+            "textarea[aria-label*='comment' i]"
+        ).first
+        if existing.count() and existing.is_visible(timeout=200):
+            return True
+    except Exception:
+        pass
+
+    comment_svg = _browser_find_svg_action(
+        page,
+        ("Comment", "Comments"),
+    )
+    if comment_svg is None:
+        return False
+
+    try:
+        _browser_clickable_from_svg(comment_svg).click(timeout=3500)
+        page.wait_for_timeout(500)
+    except Exception:
+        return False
+
+    try:
+        box = page.locator(
+            "textarea[placeholder*='comment' i], "
+            "textarea[aria-label*='comment' i]"
+        ).first
+        return bool(
+            box.count()
+            and box.is_visible(timeout=400)
+        )
+    except Exception:
+        return False
+
+
+def _browser_reels_scroll_next(page) -> bool:
+    """
+    Advance the Reels feed without refresh/navigation.
+    """
+    try:
+        vh = int(
+            page.evaluate(
+                "() => Math.max(500, window.innerHeight || 800)"
+            )
+        )
+    except Exception:
+        vh = 800
+
+    try:
+        page.mouse.wheel(
+            0,
+            int(vh * random.uniform(0.82, 1.05)),
+        )
+        page.wait_for_timeout(random.randint(900, 1500))
+        return True
+    except Exception:
+        try:
+            page.keyboard.press("ArrowDown")
+            page.wait_for_timeout(random.randint(900, 1500))
+            return True
+        except Exception:
+            return False
+
+
+def _browser_reels_demo(username, history, config) -> int:
+    """
+    Manual, visible Reels demonstration.
+
+    Opens Instagram Reels once, then stays in the feed and advances by scrolling.
+    Individual action failures never terminate the demo. Security/restriction
+    UI does terminate it immediately.
+    """
+    settings = get_account_control_settings(username, config)
+
+    reel_target = max(
+        1,
+        min(
+            10,
+            int(settings.get("engage_clips_per_pass", 6)),
+        ),
+    )
+
+    history.setdefault("browser_liked_urls", [])
+    history.setdefault("browser_reposted_urls", [])
+    history.setdefault("browser_commented_urls", [])
+
+    viewed = 0
+    confirmed_actions = 0
+    seen_keys = set()
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🎞️ Reels Demo starting: up to {reel_target} reel(s); "
+            f"Like≈{int(settings.get('engage_like_percent',75))}% · "
+            f"Repost≈{int(settings.get('engage_repost_percent',75))}% · "
+            f"Comment≈{int(settings.get('engage_comment_percent',10))}% "
+            f"{'(enabled)' if settings.get('enable_comments',False) else '(comments disabled)'} · "
+            f"Follow-author≈{int(settings.get('engage_follow_percent',25))}% "
+            f"{'(enabled)' if settings.get('enable_follow',False) else '(follow disabled)'}."
+        ),
+    )
+
+    with sync_playwright() as p:
+        context = _browser_launch(
+            p,
+            username,
+            headed=True,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            page.goto(
+                "https://www.instagram.com/reels/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(1400)
+            _browser_check_ready(page, context, username)
+
+            while viewed < reel_target:
+                if username in CONTROL_PAUSED_ACCOUNTS:
+                    break
+
+                safety = get_account_safety_state(username)
+                if safety["active"]:
+                    break
+
+                problem = _browser_engage_security_problem(
+                    page,
+                    username,
+                )
+                if problem:
+                    break
+
+                reel_key = _browser_current_visible_reel_key(
+                    page,
+                    viewed + 1,
+                )
+
+                # If a small scroll did not advance to a distinct reel, try one
+                # more feed advance rather than refreshing/reloading the page.
+                if reel_key in seen_keys:
+                    if not _browser_reels_scroll_next(page):
+                        break
+                    reel_key = _browser_current_visible_reel_key(
+                        page,
+                        viewed + 1,
+                    )
+                    if reel_key in seen_keys:
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value=(
+                                "↪️ Reels Demo could not identify a new visible "
+                                "reel after scrolling; ending without refresh."
+                            ),
+                        )
+                        break
+
+                seen_keys.add(reel_key)
+                viewed += 1
+
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=f"🎬 Reels Demo {viewed}/{reel_target}: {reel_key}",
+                )
+
+                # Allow the reel UI to settle visibly before optional actions.
+                page.wait_for_timeout(random.randint(900, 1500))
+
+                if _browser_engage_percent(
+                    settings,
+                    "engage_like_percent",
+                    75,
+                ):
+                    if _browser_try_like_engage(
+                        page,
+                        username,
+                        reel_key,
+                        history,
+                    ):
+                        confirmed_actions += 1
+
+                if _browser_engage_security_problem(page, username):
+                    break
+
+                if _browser_engage_percent(
+                    settings,
+                    "engage_repost_percent",
+                    75,
+                ):
+                    if _browser_try_repost_engage(
+                        page,
+                        username,
+                        reel_key,
+                        history,
+                    ):
+                        confirmed_actions += 1
+
+                if _browser_engage_security_problem(page, username):
+                    break
+
+                if (
+                    settings.get("enable_follow", False)
+                    and _browser_engage_percent(
+                        settings,
+                        "engage_follow_percent",
+                        25,
+                    )
+                ):
+                    if _browser_try_follow_author_engage(
+                        page,
+                        username,
+                        reel_key,
+                    ):
+                        confirmed_actions += 1
+
+                if _browser_engage_security_problem(page, username):
+                    break
+
+                if (
+                    settings.get("enable_comments", False)
+                    and _browser_engage_percent(
+                        settings,
+                        "engage_comment_percent",
+                        10,
+                    )
+                ):
+                    if _browser_open_reel_comments_if_needed(page):
+                        if _browser_try_comment_engage(
+                            page,
+                            username,
+                            reel_key,
+                            history,
+                        ):
+                            confirmed_actions += 1
+                    else:
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value=(
+                                "↪️ Reels Demo skip Comment: visible reel "
+                                "comment control/panel was not available."
+                            ),
+                        )
+
+                if _browser_engage_security_problem(page, username):
+                    break
+
+                if viewed >= reel_target:
+                    break
+
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value="↕️ Reels Demo scrolling to the next reel; no refresh.",
+                )
+
+                if not _browser_reels_scroll_next(page):
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value="⚠️ Reels Demo could not advance the feed; ending.",
+                    )
+                    break
+
+        finally:
+            try:
+                _browser_refresh_saved_sessionid(
+                    context,
+                    username,
+                )
+            except Exception:
+                pass
+            _browser_close_context(context)
+
+    history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
+    history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+    history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🎞️ Reels Demo finished: viewed {viewed} reel(s), "
+            f"confirmed actions={confirmed_actions}. "
+            "The Reels feed was advanced by scrolling, not refreshing."
+        ),
+    )
+
+    return confirmed_actions
+
 def _browser_engage_hashtag(username, history, config, manual=False) -> int:
     settings = get_account_control_settings(username, config)
 
@@ -8095,8 +8440,383 @@ def _browser_select_post_media(username, history, folder_pool):
     return None
 
 
-def _browser_fallback_caption(username, selection, reason="AI unavailable"):
-    """Guaranteed fallback so AI failure does not cancel a valid upload."""
+def _browser_post_context_blob(selection, analysis=None) -> str:
+    parts = []
+
+    if analysis:
+        for key in ("context", "narration_notes", "summary", "description"):
+            value = str(analysis.get(key) or "").strip()
+            if value:
+                parts.append(value)
+
+    sidecar = _sanitize_post_context(
+        selection.get("text_context", ""),
+        selection["folder"].get("source", ""),
+    ).strip()
+    if sidecar:
+        parts.append(sidecar)
+
+    return " ".join(parts).lower()
+
+
+def _browser_post_topic(selection, analysis=None) -> str:
+    """
+    Lightweight topic classification used only for choosing fallback hashtags.
+    """
+    blob = _browser_post_context_blob(selection, analysis)
+
+    finance_terms = (
+        "stock", "stocks", "trading", "trader", "forex", "xau",
+        "gold", "futures", "market", "markets", "candlestick",
+        "price action", "chart", "equities", "nasdaq", "s&p",
+        "sp500", "dow", "options",
+    )
+    climbing_terms = (
+        "climb", "climbing", "boulder", "bouldering", "rock climbing",
+        "crag", "climbing gym", "route", "hold", "holds", "wall",
+    )
+
+    finance_score = sum(term in blob for term in finance_terms)
+    climbing_score = sum(term in blob for term in climbing_terms)
+
+    if finance_score > climbing_score and finance_score > 0:
+        return "finance"
+    if climbing_score > finance_score and climbing_score > 0:
+        return "climbing"
+    return "general"
+
+
+def _browser_clean_hashtag(tag: str) -> str:
+    tag = str(tag or "").strip()
+    if not tag:
+        return ""
+    tag = tag.lstrip("#")
+    tag = re.sub(r"[^A-Za-z0-9_]", "", tag)
+    return f"#{tag}" if tag else ""
+
+
+def _browser_preferred_post_hashtags(
+    username,
+    selection,
+    analysis=None,
+    *,
+    ai_tags=None,
+):
+    """
+    Return exactly five useful hashtags.
+
+    Finance media gets the requested market-oriented set. Climbing media gets
+    climbing tags. Generic low-signal tags such as #photo/#creator/#daily are
+    deliberately excluded.
+    """
+    topic = _browser_post_topic(selection, analysis)
+    settings = get_account_control_settings(username)
+
+    if topic == "finance":
+        preferred = [
+            "#stocks",
+            "#trading",
+            "#forex",
+            "#futures",
+            "#fyp",
+        ]
+    elif topic == "climbing":
+        preferred = [
+            "#climbing",
+            "#bouldering",
+            "#rockclimbing",
+            "#climbinggym",
+            "#fyp",
+        ]
+    else:
+        preferred = []
+
+        # AI tags come first for non-classified media.
+        for tag in ai_tags or []:
+            cleaned = _browser_clean_hashtag(tag)
+            if cleaned:
+                preferred.append(cleaned)
+
+        # Then use the account's configured target topics.
+        for tag in _normalize_hashtag_list(
+            settings.get("target_hashtags") or []
+        ):
+            cleaned = _browser_clean_hashtag(tag)
+            if cleaned:
+                preferred.append(cleaned)
+
+        # Keep a couple of neutral discovery tags available as final fill.
+        preferred.extend(["#fyp", "#reels"])
+
+    blocked = {
+        "#photo",
+        "#creator",
+        "#explore",
+        "#daily",
+        "#instagood",
+    }
+
+    result = []
+    seen = set()
+
+    for tag in preferred:
+        cleaned = _browser_clean_hashtag(tag)
+        key = cleaned.lower()
+
+        if not cleaned or key in blocked or key in seen:
+            continue
+
+        seen.add(key)
+        result.append(cleaned)
+
+        if len(result) == 5:
+            break
+
+    # Ensure exactly five without falling back to the old generic spam set.
+    filler = (
+        ["#markets", "#investing", "#priceaction", "#fyp", "#finance"]
+        if topic == "finance"
+        else
+        ["#climbinglife", "#climber", "#outdoors", "#fyp", "#reels"]
+        if topic == "climbing"
+        else
+        ["#fyp", "#reels", "#video", "#content", "#social"]
+    )
+
+    for tag in filler:
+        cleaned = _browser_clean_hashtag(tag)
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(cleaned)
+        if len(result) == 5:
+            break
+
+    return result[:5]
+
+
+def _browser_extract_caption_from_ai(raw: str) -> str:
+    """
+    Accept both the requested CAPTION:/HASHTAGS: format and ordinary model
+    output so a harmless formatting miss does not force a fallback.
+    """
+    raw = _clean_ollama_output(raw or "").strip()
+    if not raw:
+        return ""
+
+    match = re.search(
+        r"CAPTION:\s*(.*?)(?:\n\s*HASHTAGS:|\Z)",
+        raw,
+        re.I | re.S,
+    )
+    if match:
+        return match.group(1).strip()
+
+    # Remove a trailing hashtag section if the model omitted CAPTION:.
+    cleaned = re.split(
+        r"\n\s*HASHTAGS?\s*:",
+        raw,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip()
+
+    # Also strip standalone hashtag-only tail lines.
+    lines = []
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if stripped and re.fullmatch(
+            r"(?:#[A-Za-z0-9_]+\s*){2,}",
+            stripped,
+        ):
+            continue
+        if stripped:
+            lines.append(stripped)
+
+    cleaned = " ".join(lines).strip()
+    cleaned = re.sub(r"^CAPTION\s*:\s*", "", cleaned, flags=re.I)
+    return cleaned
+
+
+def _browser_caption_readback(locator) -> str:
+    try:
+        tag = str(locator.evaluate("(el) => el.tagName.toLowerCase()"))
+    except Exception:
+        tag = ""
+
+    if tag in {"textarea", "input"}:
+        try:
+            return str(locator.input_value(timeout=600) or "")
+        except Exception:
+            return ""
+
+    try:
+        return str(
+            locator.evaluate(
+                "(el) => (el.innerText || el.textContent || '')"
+            )
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+def _browser_find_caption_editor(page):
+    """
+    Prefer caption controls inside the visible Create/Share dialog.
+    """
+    roots = []
+
+    try:
+        dialogs = page.locator("[role='dialog']")
+        for i in range(dialogs.count() - 1, -1, -1):
+            dialog = dialogs.nth(i)
+            try:
+                if dialog.is_visible(timeout=150):
+                    roots.append(dialog)
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    roots.append(page)
+
+    selectors = (
+        "textarea[aria-label*='caption' i]",
+        "textarea[placeholder*='caption' i]",
+        "[contenteditable='true'][aria-label*='caption' i]",
+        "[contenteditable='true'][data-lexical-editor='true']",
+        "div[role='textbox'][contenteditable='true']",
+    )
+
+    for root in roots:
+        for selector in selectors:
+            try:
+                locators = root.locator(selector)
+                for i in range(locators.count() - 1, -1, -1):
+                    loc = locators.nth(i)
+                    if loc.is_visible(timeout=250):
+                        return loc
+            except Exception:
+                pass
+
+    return None
+
+
+def _browser_set_caption_verified(page, caption_box, full_caption: str) -> tuple[bool, str]:
+    """
+    Write caption text and verify Instagram's editor actually contains it.
+
+    Share is not allowed to continue merely because .fill() returned without an
+    exception.
+    """
+    expected = re.sub(r"\s+", " ", full_caption).strip()
+    expected_tags = re.findall(r"#[A-Za-z0-9_]+", full_caption)
+
+    def valid(readback: str) -> bool:
+        actual = re.sub(r"\s+", " ", str(readback or "")).strip()
+        if not actual:
+            return False
+
+        # Require a meaningful portion of caption plus all five hashtags.
+        caption_head = re.sub(
+            r"\s+#[A-Za-z0-9_]+.*$",
+            "",
+            expected,
+        ).strip()
+        head_probe = caption_head[: min(40, len(caption_head))].strip()
+
+        if head_probe and head_probe.lower() not in actual.lower():
+            return False
+
+        return all(tag.lower() in actual.lower() for tag in expected_tags)
+
+    attempts = []
+
+    # 1) Normal Playwright fill.
+    try:
+        caption_box.fill(full_caption)
+        page.wait_for_timeout(350)
+        readback = _browser_caption_readback(caption_box)
+        attempts.append(("fill", readback))
+        if valid(readback):
+            return True, readback
+    except Exception:
+        pass
+
+    # 2) Real keyboard insertion into the focused editor.
+    try:
+        caption_box.click(timeout=2000)
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.insert_text(full_caption)
+        page.wait_for_timeout(450)
+        readback = _browser_caption_readback(caption_box)
+        attempts.append(("keyboard", readback))
+        if valid(readback):
+            return True, readback
+    except Exception:
+        pass
+
+    # 3) Native setter + input event for React/contenteditable variants.
+    try:
+        caption_box.evaluate(
+            """
+            (el, value) => {
+              el.focus();
+
+              if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+                const proto = el.tagName === 'TEXTAREA'
+                  ? HTMLTextAreaElement.prototype
+                  : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(
+                  proto,
+                  'value'
+                ).set;
+                setter.call(el, value);
+              } else {
+                el.textContent = value;
+              }
+
+              el.dispatchEvent(
+                new InputEvent(
+                  'input',
+                  {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: value
+                  }
+                )
+              );
+              el.dispatchEvent(new Event('change', {bubbles:true}));
+            }
+            """,
+            full_caption,
+        )
+        page.wait_for_timeout(500)
+        readback = _browser_caption_readback(caption_box)
+        attempts.append(("native", readback))
+        if valid(readback):
+            return True, readback
+    except Exception:
+        pass
+
+    last = attempts[-1][1] if attempts else ""
+    return False, last
+
+def _browser_fallback_caption(
+    username,
+    selection,
+    reason="AI unavailable",
+    analysis=None,
+):
+    """
+    Guaranteed fallback so AI failure does not cancel a valid upload.
+
+    Uses topic-aware hashtags instead of the old generic
+    #photo/#creator/#explore/#daily/#instagood set.
+    """
     settings = get_account_control_settings(username)
 
     clean_sidecar = _sanitize_post_context(
@@ -8105,33 +8825,40 @@ def _browser_fallback_caption(username, selection, reason="AI unavailable"):
     ).strip()
 
     if clean_sidecar:
-        caption = _clip_chars(clean_sidecar.splitlines()[0].strip(), 220)
+        caption = _clip_chars(
+            clean_sidecar.splitlines()[0].strip(),
+            260,
+        )
     else:
-        caption = "New post."
+        topic = _browser_post_topic(selection, analysis)
+        if topic == "finance":
+            caption = "Watching this setup develop."
+        elif topic == "climbing":
+            caption = "One move at a time."
+        else:
+            caption = "Worth a closer look."
 
-    is_video = any(
-        p.suffix.lower() == ".mp4"
-        for p in selection["files"]
+    tags = _browser_preferred_post_hashtags(
+        username,
+        selection,
+        analysis,
     )
-
-    tags = (
-        "#video #reels #creator #explore #daily"
-        if is_video
-        else "#photo #creator #explore #daily #instagood"
-    )
+    tag_line = " ".join(tags)
 
     total_limit = int(settings["caption_char_limit"])
     caption = _clip_chars(
         caption,
-        max(20, total_limit - len(tags) - 2),
+        max(20, total_limit - len(tag_line) - 2),
     )
 
     return {
-        "caption": f"{caption}\n\n{tags}".strip(),
+        "caption": f"{caption}\n\n{tag_line}".strip(),
         "used_fallback": True,
         "reason": str(reason or "AI unavailable"),
-        "analysis": None,
+        "analysis": analysis,
+        "hashtags": tags,
     }
+
 
 
 def _browser_generate_post_caption(username, selection):
@@ -8176,6 +8903,7 @@ def _browser_generate_post_caption(username, selection):
                 "required video vision unavailable "
                 f"(frames={analysis.get('frames_analyzed', 0)})"
             ),
+            analysis=analysis,
         )
 
     semantic_context = str(analysis.get("context") or "").strip()
@@ -8201,6 +8929,12 @@ def _browser_generate_post_caption(username, selection):
         settings.get("persona_prompt", RAGE_BAIT_PERSONA) or RAGE_BAIT_PERSONA
     ).strip()
     char_limit = int(settings["caption_char_limit"])
+    preferred_tags = _browser_preferred_post_hashtags(
+        username,
+        selection,
+        analysis,
+    )
+    preferred_tag_line = " ".join(preferred_tags)
 
     prompt = f"""
 Write ONE Instagram caption and EXACTLY 5 relevant hashtags for this exact media.
@@ -8215,6 +8949,9 @@ PERSPECTIVE:
 ACCOUNT-SPECIFIC CAPTION INSTRUCTIONS:
 {extra or "(none)"}
 
+PREFERRED ACCOUNT HASHTAGS WHEN RELEVANT:
+{preferred_tag_line}
+
 Return exactly:
 CAPTION: <caption text>
 HASHTAGS: #tag1 #tag2 #tag3 #tag4 #tag5
@@ -8225,6 +8962,8 @@ Rules:
 - Do not invent a location, identity, profession, event, or stock/trading topic.
 - Keep the caption under {char_limit} characters before hashtags.
 - Complete natural sentences.
+- Prefer the supplied account hashtags when they fit the visual subject.
+- Avoid generic low-signal tags such as #photo #creator #explore #daily #instagood.
 """.strip()
 
     try:
@@ -8234,7 +8973,11 @@ Rules:
                 {"role": "system", "content": persona},
                 {"role": "user", "content": prompt},
             ],
-            options={"temperature": 0.55, "top_p": 0.9},
+            options={
+                "temperature": 0.5,
+                "top_p": 0.85,
+                "num_predict": 220,
+            },
         )
 
         raw = _clean_ollama_output(
@@ -8251,14 +8994,10 @@ Rules:
             username,
             selection,
             reason=f"caption model error: {type(exc).__name__}",
+            analysis=analysis,
         )
 
-    caption_match = re.search(
-        r"CAPTION:\s*(.*?)(?:\n\s*HASHTAGS:|\Z)",
-        raw,
-        re.I | re.S,
-    )
-    caption = caption_match.group(1).strip() if caption_match else ""
+    caption = _browser_extract_caption_from_ai(raw)
 
     hashtag_match = re.search(
         r"HASHTAGS:\s*(.*)",
@@ -8274,27 +9013,19 @@ Rules:
         if len(tags) == 5:
             break
 
-    is_video = any(
-        p.suffix.lower() == ".mp4"
-        for p in selection["files"]
+    tags = _browser_preferred_post_hashtags(
+        username,
+        selection,
+        analysis,
+        ai_tags=tags,
     )
-    fallback_tags = (
-        ("#video", "#reels", "#creator", "#explore", "#daily")
-        if is_video
-        else ("#photo", "#creator", "#explore", "#daily", "#instagood")
-    )
-
-    for tag in fallback_tags:
-        if len(tags) >= 5:
-            break
-        if tag not in tags:
-            tags.append(tag)
 
     if not caption:
         return _browser_fallback_caption(
             username,
             selection,
             reason="caption model returned no usable caption",
+            analysis=analysis,
         )
 
     tag_line = " ".join(tags[:5])
@@ -8308,6 +9039,7 @@ Rules:
         "used_fallback": False,
         "reason": "",
         "analysis": analysis,
+        "hashtags": tags[:5],
     }
 
 
@@ -8638,24 +9370,11 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                 ),
             )
 
-            caption_box = None
-            for selector in (
-                "textarea[aria-label*='caption' i]",
-                "textarea[placeholder*='caption' i]",
-                "[contenteditable='true'][aria-label*='caption' i]",
-                "div[role='textbox'][contenteditable='true']",
-            ):
-                try:
-                    loc = page.locator(selector).last
-                    if loc.count() and loc.is_visible(timeout=500):
-                        caption_box = loc
-                        break
-                except Exception:
-                    pass
+            caption_box = _browser_find_caption_editor(page)
 
             if caption_box is None:
                 raise RuntimeError(
-                    "Instagram Web caption editor was not found."
+                    "Instagram Web caption editor was not found in the visible composer."
                 )
 
             generated = None
@@ -8726,16 +9445,39 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                     value=f"✅ Browser Post AI caption ready in {ai_elapsed}s.",
                 )
 
-            try:
-                caption_box.fill(full_caption)
-            except Exception:
-                caption_box.focus()
-                page.keyboard.insert_text(full_caption)
+            caption_ok, caption_readback = _browser_set_caption_verified(
+                page,
+                caption_box,
+                full_caption,
+            )
 
+            if not caption_ok:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "❌ Browser Post caption verification failed; Share was "
+                        "not clicked. Instagram's visible caption editor did not "
+                        "retain the expected caption + hashtags."
+                    ),
+                )
+                raise RuntimeError(
+                    "Instagram caption editor did not retain the caption; "
+                    "upload left in composer instead of sharing without text."
+                )
+
+            post_tags = re.findall(
+                r"#[A-Za-z0-9_]+",
+                full_caption,
+            )
             update_account_metric(
                 username,
                 "add_history",
-                value=f"✍️ Browser Post caption entered ({len(full_caption)} chars).",
+                value=(
+                    f"✍️ Browser Post caption verified in editor "
+                    f"({len(caption_readback)} chars); hashtags="
+                    f"{' '.join(post_tags[:5])}."
+                ),
             )
 
             page.wait_for_timeout(500)
@@ -9452,6 +10194,13 @@ def run_browser_profile_workflow(username, conf, folder_pool):
                 history,
                 conf,
                 manual=True,
+            )
+
+        elif forced_task == "reels_demo":
+            _browser_reels_demo(
+                username,
+                history,
+                conf,
             )
 
         elif forced_task == "repost":
@@ -10638,7 +11387,7 @@ def _control_pause(username, pause):
 
 def _control_queue_task(username, task):
     username = str(username or "").strip().lstrip("@")
-    allowed = {"repost", "networking", "hashtags", "comments"}
+    allowed = {"repost", "networking", "hashtags", "comments", "reels_demo"}
 
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
@@ -10673,6 +11422,11 @@ def _control_queue_task(username, task):
 
     if task not in allowed:
         raise ValueError(f"Unsupported task: {task}")
+
+    if task == "reels_demo" and not browser_mode:
+        raise RuntimeError(
+            "Reels Demo requires Browser Mode. Use Quick Login or Browser Login."
+        )
 
     if task == "repost":
         pacing_reason = _shared_write_block_reason(username, "upload")
@@ -11093,6 +11847,7 @@ function cardHtml(user,a){
       <b>Manual actions</b>
       <div class="row">
         <button class="good" ${connected ? "":"disabled"} onclick="burstNow('${esc(user)}')">⚡ Burst Now (1-2 min)</button>
+        <button class="good" ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','reels_demo')">🎞️ Reels Demo</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
         <button ${connected ? "":"disabled"} onclick="clearUploadCooldown('${esc(user)}')">Clear Upload Cooldown</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
@@ -11824,7 +12579,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Engage + Burst Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Caption + Hashtag Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
