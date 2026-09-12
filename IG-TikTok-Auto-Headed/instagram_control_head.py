@@ -160,12 +160,14 @@ AUTO_PASSES_BEFORE_LONG_MAX = max(
 )
 AUTO_FOLLOW_BATCH_MIN = max(
     1,
-    min(5, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MIN", "1"))),
+    min(10, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MIN", "1"))),
 )
 AUTO_FOLLOW_BATCH_MAX = max(
     AUTO_FOLLOW_BATCH_MIN,
-    min(5, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MAX", "5"))),
+    min(10, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MAX", "10"))),
 )
+
+DAILY_FOLLOW_HARD_CAP = 50
 
 
 AUTO_SUCCESS_PASSES = {}
@@ -771,7 +773,8 @@ def _default_control_settings(username, conf):
         "target_accounts": list(conf.get("competitor_accounts") or []),
         "follow_source": "both",
         "follow_limit": 2,
-        "auto_follow_batch_max": 5,
+        "auto_follow_batch_max": 10,
+        "active_session_max_passes": 8,
         "pace_mode": "normal",
         "video_frames": 5,
         "require_video_vision": True,
@@ -895,7 +898,8 @@ def _sanitize_control_settings(username, conf, raw):
         ),
         "follow_source": follow_source,
         "follow_limit": as_int("follow_limit", 1, 20),
-        "auto_follow_batch_max": as_int("auto_follow_batch_max", 1, 5),
+        "auto_follow_batch_max": as_int("auto_follow_batch_max", 1, 10),
+        "active_session_max_passes": as_int("active_session_max_passes", 1, 20),
         "pace_mode": pace_mode,
         "video_frames": as_int("video_frames", 3, 9),
         "require_video_vision": bool(raw.get("require_video_vision", base["require_video_vision"])),
@@ -6605,18 +6609,44 @@ def _browser_open_network_list_stable(
         "a valid people-list popup within 10s."
     )
 
+def _local_day_key(timestamp: float | None = None) -> str:
+    ts = time.time() if timestamp is None else float(timestamp)
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _daily_follow_attempts_status(username: str) -> tuple[int, int]:
+    """
+    Return (used_today, hard_cap) from the persistent shared pacing file.
+    """
+    fd = _acquire_shared_pacing_lock()
+    if fd is None:
+        return 0, DAILY_FOLLOW_HARD_CAP
+
+    try:
+        data = _load_shared_pacing()
+        row = data.setdefault("accounts", {}).setdefault(username, {})
+        today = _local_day_key()
+
+        if str(row.get("follow_day") or "") != today:
+            return 0, DAILY_FOLLOW_HARD_CAP
+
+        used = int(row.get("follow_attempts_today") or 0)
+        return max(0, used), DAILY_FOLLOW_HARD_CAP
+    finally:
+        _release_shared_pacing_lock(fd)
+
 def _reserve_browser_follow_slot(username: str) -> tuple[bool, str]:
     """
-    Reserve one Browser Follow attempt against the rolling write budget.
+    Reserve one Browser Follow attempt.
 
-    Browser Follow uses BROWSER_FOLLOW_MIN_GAP_SECONDS for its local cadence,
-    but still respects:
+    Enforces:
       * safety backoff
-      * configured rolling writes/window
+      * 50 follow-click attempts per local calendar day, persisted on disk
+      * configured rolling write budget
       * cross-process global minimum gap
 
-    The attempt consumes a rolling-budget slot even if Instagram later leaves
-    the relationship state ambiguous.
+    The daily counter increments BEFORE the click so ambiguous/failed follow
+    attempts still count toward the safety ceiling.
     """
     allowed, reason = account_writes_allowed(username)
     if not allowed:
@@ -6629,6 +6659,8 @@ def _reserve_browser_follow_slot(username: str) -> tuple[bool, str]:
     try:
         data = _load_shared_pacing()
         now = time.time()
+        today = _local_day_key(now)
+
         settings = get_account_control_settings(username)
         window = int(settings["write_window_seconds"])
         max_window = int(settings["max_writes_per_window"])
@@ -6641,8 +6673,23 @@ def _reserve_browser_follow_slot(username: str) -> tuple[bool, str]:
                 "last_write": 0.0,
                 "last_upload": 0.0,
                 "pending_upload_until": 0.0,
+                "follow_day": today,
+                "follow_attempts_today": 0,
             },
         )
+
+        if str(row.get("follow_day") or "") != today:
+            row["follow_day"] = today
+            row["follow_attempts_today"] = 0
+
+        used_today = int(row.get("follow_attempts_today") or 0)
+
+        if used_today >= DAILY_FOLLOW_HARD_CAP:
+            return (
+                False,
+                f"daily follow hard cap reached "
+                f"({used_today}/{DAILY_FOLLOW_HARD_CAP}); resumes next local day",
+            )
 
         cutoff = now - window
         row["writes"] = [
@@ -6657,9 +6704,16 @@ def _reserve_browser_follow_slot(username: str) -> tuple[bool, str]:
 
         global_last = float(data.get("global_last") or 0.0)
         if now - global_last < GLOBAL_WRITE_MIN_GAP_SECONDS:
-            wait = int(max(1, GLOBAL_WRITE_MIN_GAP_SECONDS - (now - global_last)))
+            wait = int(
+                max(
+                    1,
+                    GLOBAL_WRITE_MIN_GAP_SECONDS - (now - global_last),
+                )
+            )
             return False, f"shared global gap; retry in ~{wait}s"
 
+        # Reserve the attempt atomically before Chromium clicks Follow.
+        row["follow_attempts_today"] = used_today + 1
         row["writes"].append(now)
         row["last_write"] = now
         data["global_last"] = now
@@ -6668,6 +6722,7 @@ def _reserve_browser_follow_slot(username: str) -> tuple[bool, str]:
         return True, ""
     finally:
         _release_shared_pacing_lock(fd)
+
 
 
 def _next_overnight_auto_delay(
@@ -6800,10 +6855,23 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
             min(
                 AUTO_FOLLOW_BATCH_MAX,
                 int(settings.get("auto_follow_batch_max", AUTO_FOLLOW_BATCH_MAX)),
-                5,
+                10,
             ),
         )
         limit = random.randint(AUTO_FOLLOW_BATCH_MIN, auto_cap)
+
+    daily_used, daily_cap = _daily_follow_attempts_status(username)
+
+    if daily_used >= daily_cap:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🛑 Browser Follow skipped: daily follow hard cap reached "
+                f"({daily_used}/{daily_cap})."
+            ),
+        )
+        return 0
 
     update_account_metric(
         username,
@@ -6813,6 +6881,7 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
             f"batch target={limit}; "
             f"mode={'visible-manual' if manual else 'visible-auto'}; "
             f"visible rows only; no list refresh/scroll; "
+            f"daily follows={daily_used}/{daily_cap}; "
             f"browser gap≈{BROWSER_FOLLOW_MIN_GAP_SECONDS}s"
         ),
     )
@@ -7083,6 +7152,18 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                 # Keep the same people-list viewport fixed for the entire
                 # batch. We only act on Follow buttons that are already visible.
 
+                if attempt_count < limit:
+                    between_follow_gap = random.uniform(3.0, 6.0)
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            f"… Visible follow batch gap ~{between_follow_gap:.1f}s "
+                            "before the next currently visible row."
+                        ),
+                    )
+                    page.wait_for_timeout(int(between_follow_gap * 1000))
+
             if attempt_count and not confirmed_count:
                 _browser_follow_debug_snapshot(
                     page,
@@ -7098,13 +7179,17 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                     ),
                 )
 
+            daily_used_after, daily_cap_after = (
+                _daily_follow_attempts_status(username)
+            )
             update_account_metric(
                 username,
                 "add_history",
                 value=(
                     f"🌐 Browser Follow visible batch finished: "
                     f"{attempt_count}/{limit} attempt(s), "
-                    f"{confirmed_count} confirmed; popup stayed in place."
+                    f"{confirmed_count} confirmed; popup stayed in place; "
+                    f"daily follows={daily_used_after}/{daily_cap_after}."
                 ),
             )
 
@@ -8559,6 +8644,13 @@ def _run_browser_active_session(
     hard_deadline = time.monotonic() + duration
     cycles = 0
     post_used = False
+    max_passes = max(
+        1,
+        min(
+            20,
+            int(settings.get("active_session_max_passes", 8)),
+        ),
+    )
 
     update_account_metric(
         username,
@@ -8566,7 +8658,8 @@ def _run_browser_active_session(
         value=(
             f"⚡ {mode.title()} active session started for up to ~{duration//60}m "
             f"{duration%60:02d}s; short browsing gaps "
-            f"{ACTIVE_BROWSE_GAP_MIN_SECONDS}-{ACTIVE_BROWSE_GAP_MAX_SECONDS}s."
+            f"{ACTIVE_BROWSE_GAP_MIN_SECONDS}-{ACTIVE_BROWSE_GAP_MAX_SECONDS}s; "
+            f"max passes={max_passes}."
         ),
     )
 
@@ -8645,7 +8738,15 @@ def _run_browser_active_session(
 
         cycles += 1
 
-        if cycles >= 10:
+        if cycles >= max_passes:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"⚡ Active session reached configured pass limit "
+                    f"({cycles}/{max_passes}); entering rest."
+                ),
+            )
             break
 
         if time.monotonic() >= hard_deadline:
@@ -9153,6 +9254,7 @@ def _control_metrics_payload():
         browser_mode=username in BROWSER_NATIVE_ACCOUNTS; browser_live=_browser_live_port_open(username)
         private_connected=username in CLIENT_CACHE and username not in CONTROL_DISCONNECTED_ACCOUNTS
         connected=private_connected or (browser_mode and browser_live)
+        daily_follow_used, daily_follow_cap = _daily_follow_attempts_status(username)
         row["control"]={
             "connected":connected,"disconnected":not connected,"paused":username in CONTROL_PAUSED_ACCOUNTS,
             "auto_enabled":connected and username not in CONTROL_PAUSED_ACCOUNTS,
@@ -9162,6 +9264,7 @@ def _control_metrics_payload():
             "saved_session":session_path.exists(),"session_file":session_path.name,
             "queued_task":NEXT_TASK_OVERRIDE.get(username,""),"auth_event":AUTH_EVENT.get(username,""),
             "write_budget_used":len(_prune_write_window(username)),"write_budget_max":MAX_WRITES_PER_WINDOW,
+            "daily_follow_used":daily_follow_used,"daily_follow_cap":daily_follow_cap,
             "write_window_seconds":WRITE_WINDOW_SECONDS,"upload_cooldown_seconds":_effective_pacing(username)["upload"],
             "settings":get_account_control_settings(username,conf),"safety":get_account_safety_state(username),
             "pace_mode":_runtime_pace_mode(username),
@@ -10288,6 +10391,7 @@ function cardHtml(user,a){
       <div class="stat"><b>${Number(a.total_likes||0)}</b><span>Likes</span></div>
     </div>
     <div class="small">Write budget: ${Number(c.write_budget_used||0)}/${Number(c.write_budget_max||0)} per rolling ${Math.round(Number(c.write_window_seconds||0)/60)} min · uploads ≥ ${Math.round(Number(c.upload_cooldown_seconds||0)/60)} min apart</div>
+    <div class="small">Daily follows: <b>${Number(c.daily_follow_used||0)}/${Number(c.daily_follow_cap||50)}</b> · hard reset at local midnight</div>
     <div class="small">Pace: <b>${esc(c.pace_mode||s.pace_mode||"normal")}</b>${Number(c.burst_remaining_seconds||0)>0 ? ` · burst remaining ~${Math.ceil(Number(c.burst_remaining_seconds)/60)}m` : ""}</div>
     ${c.safety?.active ? `<div class="small bad">Safety Backoff until ${esc(c.safety.until||"")} · ${esc(c.safety.reason||"")}</div>` : ""}
 
@@ -10364,7 +10468,8 @@ function cardHtml(user,a){
         <div><label>Caption char limit</label><input id="caplim_${esc(user)}" type="number" min="80" max="2200" value="${Number(s.caption_char_limit||420)}"></div>
         <div><label>Reply char limit</label><input id="replim_${esc(user)}" type="number" min="20" max="1000" value="${Number(s.reply_char_limit||280)}"></div>
         <div><label>Follow limit / pass</label><input id="followlim_${esc(user)}" type="number" min="1" max="20" value="${Number(s.follow_limit||2)}"></div>
-        <div><label>Auto follow batch max (1-5 visible rows)</label><input id="autofollowmax_${esc(user)}" type="number" min="1" max="5" value="${Number(s.auto_follow_batch_max||5)}"></div>
+        <div><label>Auto follow batch max (1-10 visible rows)</label><input id="autofollowmax_${esc(user)}" type="number" min="1" max="10" value="${Number(s.auto_follow_batch_max||10)}"></div>
+        <div><label>Active-session passes (1-20)</label><input id="sessionpasses_${esc(user)}" type="number" min="1" max="20" value="${Number(s.active_session_max_passes||8)}"></div>
         <div><label>Video frames to watch</label><input id="frames_${esc(user)}" type="number" min="3" max="9" value="${Number(s.video_frames||5)}"></div>
         <div><label>Writes / rolling window</label><input id="maxwrites_${esc(user)}" type="number" min="1" max="30" value="${Number(s.max_writes_per_window||8)}"></div>
         <div><label>Rolling window seconds</label><input id="window_${esc(user)}" type="number" min="60" max="7200" value="${Number(s.write_window_seconds||900)}"></div>
@@ -10720,6 +10825,7 @@ function collectBehavior(user){
     reply_char_limit:Number(document.getElementById(`replim_${user}`).value),
     follow_limit:Number(document.getElementById(`followlim_${user}`).value),
     auto_follow_batch_max:Number(document.getElementById(`autofollowmax_${user}`).value),
+    active_session_max_passes:Number(document.getElementById(`sessionpasses_${user}`).value),
     pace_mode:(latestData.accounts?.[user]?.control?.settings?.pace_mode || "normal"),
     video_frames:Number(document.getElementById(`frames_${user}`).value),
     max_writes_per_window:Number(document.getElementById(`maxwrites_${user}`).value),
@@ -11118,18 +11224,20 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Active Session Controls: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Daily Follow Cap: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
     print("Dashboard account cap: 3")
     print("Boot mode: DISCONNECTED / AUTO OFF")
+    print(f"Daily follow hard cap: {DAILY_FOLLOW_HARD_CAP} attempts per local day")
     print(
         "Auto cadence: Normal single-pass; Overnight uses "
         f"{ACTIVE_SESSION_MIN_SECONDS//60}-{ACTIVE_SESSION_MAX_SECONDS//60} min active sessions, "
         f"{OVERNIGHT_REST_MIN_SECONDS//60}-{OVERNIGHT_REST_MAX_SECONDS//60} min ordinary rests, "
         f"{OVERNIGHT_LONG_REST_MIN_SECONDS//60}-{OVERNIGHT_LONG_REST_MAX_SECONDS//60} min periodic long rests; "
-        f"Auto Follow batches {AUTO_FOLLOW_BATCH_MIN}-{AUTO_FOLLOW_BATCH_MAX} visible rows max."
+        f"Auto Follow batches {AUTO_FOLLOW_BATCH_MIN}-{AUTO_FOLLOW_BATCH_MAX} visible rows max; "
+        "active-session pass count is configurable per account in the hub."
     )
 
     server = ThreadingHTTPServer((IG_HOST, IG_PORT), DashboardAPIHandler)
