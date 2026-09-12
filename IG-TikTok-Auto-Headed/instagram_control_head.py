@@ -773,6 +773,8 @@ def _default_control_settings(username, conf):
         "engage_repost_percent": 75,
         "engage_comment_percent": 10,
         "engage_follow_percent": 25,
+        "reels_write_gap_seconds": 8,
+        "reels_comment_watch_seconds": 16,
         "pace_mode": "normal",
         "video_frames": 5,
         "require_video_vision": True,
@@ -904,6 +906,8 @@ def _sanitize_control_settings(username, conf, raw):
         "engage_repost_percent": as_int("engage_repost_percent", 0, 100),
         "engage_comment_percent": as_int("engage_comment_percent", 0, 100),
         "engage_follow_percent": as_int("engage_follow_percent", 0, 100),
+        "reels_write_gap_seconds": as_int("reels_write_gap_seconds", 8, 60),
+        "reels_comment_watch_seconds": as_int("reels_comment_watch_seconds", 10, 30),
         "pace_mode": pace_mode,
         "video_frames": as_int("video_frames", 3, 9),
         "require_video_vision": bool(raw.get("require_video_vision", base["require_video_vision"])),
@@ -8360,12 +8364,7 @@ def _browser_analyze_reel_frames(
     visible_text: str,
 ) -> str:
     """
-    Analyze chronological screenshots from the current reel with the installed
-    Ollama vision model.
-
-    Audio is never guessed. Visible subtitles/on-screen captions may be used as
-    speech/audio evidence because they are actually present in the screenshots
-    or DOM text.
+    Deep chronological reel analysis for comment-bound reels only.
     """
     model = get_ollama_vision_model()
     frames = [
@@ -8379,38 +8378,59 @@ def _browser_analyze_reel_frames(
             username,
             "add_history",
             value=(
-                "🧠 Reels vision unavailable; comment grounding will use "
-                "visible caption/subtitle text only."
+                "🧠 Deep reel vision unavailable; comment grounding will use "
+                "the changing visible caption/subtitle text only."
             ),
         )
         return ""
 
     prompt = f"""
-These are chronological screenshots sampled from ONE currently visible
-Instagram Reel.
+You are analyzing chronological screenshots from ONE Instagram Reel that is
+being considered for a comment. The screenshots span the reel over time.
 
-VISIBLE INSTAGRAM TEXT/CAPTION:
-{visible_text[:1800] or "(none)"}
+VISIBLE CAPTION / SUBTITLES / ON-SCREEN TEXT COLLECTED DURING WATCH:
+{visible_text[:4200] or "(none)"}
 
-Analyze the actual reel content, not the Instagram interface chrome.
+Your job is to understand the reel's actual context BEFORE any comment is
+written.
 
 Return exactly these sections:
-VIDEO_SUMMARY: 2-5 concrete sentences describing what visibly happens across
-the frames, including changes over time.
-VISIBLE_TEXT: Important words/subtitles/on-screen text that are actually
-visible in the reel or supplied caption.
-AUDIO_OR_SPEECH_EVIDENCE: Only describe speech/audio content when it is
-supported by visible subtitles, captions, or supplied text. Otherwise write
-NOT_AVAILABLE.
-SPECIFIC_COMMENT_BASIS: One concise, specific observation or opinion angle
-that a viewer could reasonably comment on.
+
+SCENE_PROGRESSION:
+Describe what visibly changes from the earliest frame to the latest frame.
+Use concrete objects/actions/settings. 3-7 sentences.
+
+MAIN_SUBJECT_OR_ACTIVITY:
+What is the reel mainly about visually? Be specific and conservative.
+
+TEXT_AND_SUBTITLE_CONTEXT:
+Summarize the important visible caption, subtitles, signs, code, labels, or
+other on-screen text. If fragments change over time, connect them cautiously.
+
+AUDIO_OR_SPEECH_EVIDENCE:
+Only report speech/audio meaning that is supported by visible subtitles,
+captions, or supplied text. Otherwise write NOT_AVAILABLE.
+
+CREATOR_POINT_OR_SETUP:
+What point, joke, demonstration, attempt, comparison, progress update, or
+situation does the combined visual/text evidence most strongly support?
+If uncertain, say UNCERTAIN and explain briefly.
+
+COMMENTABLE_DETAILS:
+Give 2-4 concrete details that a real viewer could react to without inventing
+anything.
+
+AVOID_CLAIMS:
+List anything the evidence does NOT establish and that the comment writer
+should avoid claiming.
 
 Rules:
-- Compare all frames in chronological order.
-- Ignore heart/comment/share/save buttons and other Instagram UI.
-- Do not invent audio, dialogue, identities, locations, motives, or events.
-- Do not infer private/sensitive traits.
-- Prefer concrete visual details over generic social-media commentary.
+- Treat the frames as a time sequence, not separate unrelated images.
+- Distinguish Instagram interface chrome from reel content.
+- Do not invent dialogue, audio, identity, location, motive, relationships,
+  outcomes, or expertise.
+- If the evidence is ambiguous, preserve the ambiguity.
+- Prefer a boring accurate interpretation over a clever unsupported one.
 """.strip()
 
     try:
@@ -8422,11 +8442,12 @@ Rules:
                 "images": [str(p) for p in frames],
             }],
             options={
-                "temperature": 0.12,
-                "top_p": 0.8,
-                "num_predict": 420,
+                "temperature": 0.05,
+                "top_p": 0.72,
+                "num_predict": 650,
             },
         )
+
         raw = str(
             response.get("message", {}).get("content", "")
             if isinstance(response, dict)
@@ -8436,13 +8457,14 @@ Rules:
                 "",
             )
         ).strip()
+
     except Exception as exc:
         update_account_metric(
             username,
             "add_history",
             value=(
-                f"⚠️ Reels vision analysis failed: "
-                f"{type(exc).__name__}; using visible text only."
+                f"⚠️ Deep reel vision failed: {type(exc).__name__}; "
+                "using collected visible text only."
             ),
         )
         return ""
@@ -8458,12 +8480,13 @@ Rules:
             username,
             "add_history",
             value=(
-                f"🧠 Reels vision analyzed {len(frames)} frame(s) "
-                f"with {model}."
+                f"🧠 Deep reel vision understood {len(frames)} chronological "
+                f"frame(s) with {model}."
             ),
         )
 
-    return raw[:4200]
+    return raw[:6500]
+
 
 
 def _shared_write_budget_status(username: str) -> dict:
@@ -8543,28 +8566,111 @@ def _reason_is_long_rolling_budget(reason: str, *, threshold: int = 20) -> bool:
     retry = _retry_seconds_from_reason(reason)
     return retry <= 0 or retry > threshold
 
+def _merge_reel_text_snapshots(snapshots, *, limit: int = 4200) -> str:
+    """
+    Preserve changing on-screen text/subtitles instead of keeping only the
+    single longest DOM snapshot.
+    """
+    cleaned = []
+    seen = set()
+
+    for raw in snapshots or []:
+        value = re.sub(r"\s+", " ", str(raw or "")).strip()
+        value = re.sub(
+            r"\b(?:Like|Unlike|Comment|Comments|Share|Save|Repost|Follow|Following)\b",
+            " ",
+            value,
+            flags=re.I,
+        )
+        value = re.sub(r"\s+", " ", value).strip()
+
+        if not value:
+            continue
+
+        # Break long DOM dumps into smaller chunks so changing subtitles can
+        # survive even when most of the surrounding reel UI is unchanged.
+        chunks = re.split(r"(?<=[.!?])\s+|\s{2,}", value)
+        if not chunks:
+            chunks = [value]
+
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if len(chunk) < 3:
+                continue
+
+            key = re.sub(r"[^a-z0-9]+", " ", chunk.lower()).strip()
+            if not key or key in seen:
+                continue
+
+            # Ignore tiny generic action/UI fragments.
+            if key in {
+                "audio",
+                "original audio",
+                "more",
+                "see translation",
+                "view comments",
+            }:
+                continue
+
+            seen.add(key)
+            cleaned.append(chunk)
+
+    merged = " | ".join(cleaned)
+    return merged[:limit]
+
+
+def _reels_should_comment_auto(username: str, settings: dict) -> bool:
+    if not settings.get("enable_comments", False):
+        return False
+
+    try:
+        pct = max(
+            0,
+            min(
+                100,
+                int(settings.get("engage_comment_percent", 10)),
+            ),
+        )
+    except Exception:
+        pct = 10
+
+    return random.random() < (pct / 100.0)
+
 def _browser_reel_watch_context(
     page,
     username: str,
     *,
-    watch_seconds: float = 8.0,
+    watch_seconds: float = 4.0,
+    analyze_vision: bool = False,
+    frame_count: int = 5,
 ) -> str:
     """
-    Watch the current reel while sampling visual frames and visible
-    caption/subtitle text.
+    Watch the current reel.
 
-    The resulting context combines:
-      * chronological Ollama vision analysis of reel screenshots
-      * visible Instagram caption/text/subtitles
-      * playback observation
+    Fast path (analyze_vision=False):
+      * short visible watch
+      * collect visible caption/subtitle/on-screen text
+      * NO Ollama vision call
 
-    Audio/dialogue is never invented. It is represented only when visible
-    subtitles/captions/text support it.
+    Deep comment path (analyze_vision=True):
+      * longer watch
+      * configurable chronological screenshots
+      * preserve changing subtitle/text snapshots
+      * Ollama vision analysis across the whole sampled sequence
     """
     scope = _browser_visible_reel_scope(page)
     text_snapshots = []
     frame_paths = []
     stamp = f"{int(time.time()*1000)}_{random.randint(1000,9999)}"
+
+    frame_count = max(3, min(9, int(frame_count or 5)))
+    watch_seconds = max(
+        2.0,
+        min(
+            30.0,
+            float(watch_seconds or 4.0),
+        ),
+    )
 
     video = _browser_visible_video(page, scope)
 
@@ -8582,13 +8688,25 @@ def _browser_reel_watch_context(
     started = time.monotonic()
     next_log = 2.0
 
-    # Four chronological visual samples across the watch window.
-    sample_marks = [
-        0.4,
-        max(1.5, watch_seconds * 0.32),
-        max(3.0, watch_seconds * 0.62),
-        max(4.5, watch_seconds * 0.90),
-    ]
+    sample_marks = []
+    if analyze_vision:
+        # Spread samples across the full watch, including early and late reel
+        # context rather than clustering them near the start.
+        if frame_count <= 1:
+            sample_marks = [watch_seconds * 0.5]
+        else:
+            start_mark = min(0.5, watch_seconds * 0.08)
+            end_mark = max(start_mark, watch_seconds * 0.94)
+            step = (
+                (end_mark - start_mark) / (frame_count - 1)
+                if frame_count > 1
+                else 0.0
+            )
+            sample_marks = [
+                start_mark + step * i
+                for i in range(frame_count)
+            ]
+
     captured_marks = set()
 
     while time.monotonic() - started < watch_seconds:
@@ -8610,32 +8728,43 @@ def _browser_reel_watch_context(
         except Exception:
             pass
 
-        for idx, mark in enumerate(sample_marks, 1):
-            if idx in captured_marks or elapsed < mark:
-                continue
-            frame = _browser_capture_reel_frame(
-                page,
-                scope,
-                username,
-                idx,
-                stamp,
-            )
-            captured_marks.add(idx)
-            if frame:
-                frame_paths.append(frame)
+        if analyze_vision:
+            for idx, mark in enumerate(sample_marks, 1):
+                if idx in captured_marks or elapsed < mark:
+                    continue
+
+                frame = _browser_capture_reel_frame(
+                    page,
+                    scope,
+                    username,
+                    idx,
+                    stamp,
+                )
+                captured_marks.add(idx)
+
+                if frame:
+                    frame_paths.append(frame)
 
         if elapsed >= next_log:
+            if analyze_vision:
+                msg = (
+                    f"👀 Deep comment analysis watching reel… {elapsed:.0f}s · "
+                    f"frames={len(frame_paths)}/{frame_count}"
+                )
+            else:
+                msg = (
+                    f"👀 Reels quick watch… {elapsed:.0f}s · "
+                    "no vision model"
+                )
+
             update_account_metric(
                 username,
                 "add_history",
-                value=(
-                    f"👀 Reels watching current reel… {elapsed:.0f}s · "
-                    f"visual samples={len(frame_paths)}"
-                ),
+                value=msg,
             )
             next_log += 2.0
 
-        page.wait_for_timeout(550)
+        page.wait_for_timeout(500)
 
     if video is not None:
         try:
@@ -8645,21 +8774,20 @@ def _browser_reel_watch_context(
         except Exception:
             end_time = None
 
-    visible = max(text_snapshots, key=len) if text_snapshots else ""
-
-    visible = re.sub(
-        r"\b(?:Like|Unlike|Comment|Comments|Share|Save|Repost|Follow|Following)\b",
-        " ",
-        visible,
-        flags=re.I,
+    visible = _merge_reel_text_snapshots(
+        text_snapshots,
+        limit=4200 if analyze_vision else 1800,
     )
-    visible = re.sub(r"\s+", " ", visible).strip()[:2200]
 
-    vision = _browser_analyze_reel_frames(
-        username,
-        frame_paths,
-        visible,
-    )
+    vision = ""
+    if analyze_vision:
+        vision = _browser_analyze_reel_frames(
+            username,
+            frame_paths,
+            visible,
+        )
+
+    captured_count = len(frame_paths)
 
     for frame in frame_paths:
         try:
@@ -8680,36 +8808,44 @@ def _browser_reel_watch_context(
 
     if visible:
         pieces.append(
-            "VISIBLE INSTAGRAM CAPTION/SUBTITLE/TEXT:\n" + visible
+            "VISIBLE CAPTION / SUBTITLES / ON-SCREEN TEXT OVER TIME:\n"
+            + visible
         )
 
     if playback_advanced is not None:
         pieces.append(
-            f"PLAYBACK OBSERVATION: visible video currentTime advanced "
-            f"{playback_advanced:.1f} seconds during sampling."
+            f"PLAYBACK OBSERVATION: video currentTime advanced "
+            f"{playback_advanced:.1f} seconds during this watch."
         )
 
     if not pieces:
         pieces.append(
-            "No reliable visual/caption context was recovered. "
-            "Do not invent a topic."
+            "No reliable reel context was recovered. Do not invent a topic."
         )
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            f"👀 Reels watch complete; visual frames={len(frame_paths)}; "
-            f"visible text={'yes' if visible else 'minimal'}; "
-            + (
-                f"playback advanced {playback_advanced:.1f}s."
-                if playback_advanced is not None
-                else "playback timing unavailable."
+            (
+                f"🧠 Deep comment analysis complete: "
+                f"{captured_count} frame(s), "
+                f"{watch_seconds:.0f}s watch; "
             )
+            if analyze_vision
+            else (
+                f"👀 Quick reel watch complete: {watch_seconds:.0f}s; "
+            )
+        )
+        + (
+            "changing visible text captured."
+            if visible
+            else "visible text was minimal."
         ),
     )
 
     return "\n\n".join(pieces)
+
 
 
 
@@ -8719,83 +8855,88 @@ def _browser_prepare_reel_comment(
     reel_context: str,
 ) -> str:
     """
-    Generate a specific opinion/reaction from multimodal reel evidence.
+    Write a comment only after the deep reel-analysis path has produced
+    chronological visual/text evidence.
     """
     context = str(reel_context or "").strip()
 
-    if not context or context.startswith("No reliable visual"):
+    if not context or context.startswith("No reliable reel"):
         update_account_metric(
             username,
             "add_history",
             value=(
-                "↪️ Reels: not enough reliable visual/caption evidence for "
-                "a grounded comment; comment will be skipped."
+                "↪️ Reels: deep analysis did not recover enough reliable "
+                "context; comment will be skipped."
             ),
         )
         return ""
 
     settings = get_account_control_settings(username)
     extra = str(settings.get("comment_prompt", "") or "").strip()
-
-    # Use a grounding-first system prompt. The account style can shape tone
-    # only after the content is anchored to the reel evidence.
     persona = str(
         settings.get("persona_prompt", RAGE_BAIT_PERSONA)
         or RAGE_BAIT_PERSONA
     ).strip()
 
     system_prompt = f"""
-You write short Instagram comments. Accuracy to the supplied reel evidence is
-more important than persona or provocation.
+Write a short Instagram comment from supplied evidence.
+
+Accuracy rules outrank STYLE GUIDANCE.
 
 STYLE GUIDANCE:
 {persona}
 
-Hard rules:
-- Base the comment on at least one concrete detail from the supplied visual
-  analysis, visible caption, on-screen text, or visible subtitles.
-- Give a natural opinion/reaction to THAT content.
-- Never invent audio/dialogue when AUDIO_OR_SPEECH_EVIDENCE says
-  NOT_AVAILABLE or when no visible subtitle/caption supports it.
-- Never drift into unrelated philosophy, politics, trading, relationships,
-  identities, or topics absent from the reel evidence.
-- Do not mention automation, AI, prompts, or analysis.
+NON-NEGOTIABLE RULES:
+- First identify the supported CREATOR_POINT_OR_SETUP and COMMENTABLE_DETAILS.
+- The final comment must directly react to at least one of those supported
+  details.
+- Never introduce a topic that is absent from the evidence.
+- Never invent audio/dialogue if AUDIO_OR_SPEECH_EVIDENCE is NOT_AVAILABLE.
+- Respect AVOID_CLAIMS.
+- If the reel context is uncertain, phrase the reaction conservatively rather
+  than pretending certainty.
+- Do not mention AI, analysis, screenshots, prompts, or automation.
 """.strip()
 
     prompt = f"""
-Write ONE concise Instagram comment about this CURRENT REEL.
+Write ONE natural comment about the CURRENT REEL.
 
-REEL EVIDENCE:
-{context[:6200]}
+DEEP REEL ANALYSIS:
+{context[:9000]}
 
 ACCOUNT COMMENT INSTRUCTIONS:
 {extra or "(none)"}
 
+Before producing the final sentence, silently verify:
+1. What is visibly happening across the reel?
+2. What visible caption/subtitle/text changes the meaning?
+3. What specific detail am I reacting to?
+4. Is every factual claim supported by the evidence?
+
+Then output ONLY the final comment.
+
 Requirements:
-- Mention or clearly react to a specific visible event, object, statement,
-  subtitle, caption idea, or change described above.
-- Make it sound like a viewer who actually watched the reel.
-- If speech/audio is not supported by visible subtitles/caption evidence,
-  comment on visuals/caption instead.
-- 4 to 24 words.
+- 5 to 28 words.
 - One complete sentence.
-- Output only the comment.
+- Specific enough that it would not fit an unrelated reel.
+- Prefer reacting to the reel's actual attempt/result/joke/demo/progression
+  over generic praise or philosophy.
 """.strip()
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            "🧠 Reels preparing a multimodal, evidence-grounded comment "
-            "before opening comments."
+            "🧠 Reels writing comment from the completed deep multimodal "
+            "analysis."
         ),
     )
 
     try:
         result = _ollama_generate(
             prompt,
-            min_words=4,
-            max_words=24,
+            min_words=5,
+            max_words=28,
             attempts=3,
             system_prompt=system_prompt,
         )
@@ -8811,18 +8952,177 @@ Requirements:
         update_account_metric(
             username,
             "add_history",
-            value=f"💭 Reels prepared grounded comment: {comment[:160]}",
+            value=f"💭 Reels prepared deep-grounded comment: {comment[:180]}",
         )
     else:
         update_account_metric(
             username,
             "add_history",
-            value="↪️ Reels model returned no usable grounded comment.",
+            value="↪️ Reels model returned no usable deep-grounded comment.",
         )
 
     return comment
 
 
+
+
+def _reels_write_gap_seconds(username: str) -> int:
+    try:
+        return max(
+            8,
+            min(
+                60,
+                int(
+                    get_account_control_settings(username).get(
+                        "reels_write_gap_seconds",
+                        8,
+                    )
+                ),
+            ),
+        )
+    except Exception:
+        return 8
+
+
+def _reels_write_block_reason(
+    username: str,
+    action_type: str,
+) -> str:
+    """
+    Read-only Reels pacing check.
+
+    Reels has its own bounded account gap, but still respects:
+      * account safety/backoff
+      * rolling write budget
+      * global cross-process gap
+      * upload cooldown when applicable
+    """
+    allowed, reason = account_writes_allowed(username)
+    if not allowed:
+        return reason
+
+    fd = _acquire_shared_pacing_lock()
+    if fd is None:
+        return "shared pacing lock busy"
+
+    try:
+        data = _load_shared_pacing()
+        now = time.time()
+        settings = get_account_control_settings(username)
+        window = int(settings["write_window_seconds"])
+        maximum = int(settings["max_writes_per_window"])
+        reels_gap = _reels_write_gap_seconds(username)
+
+        row = data.setdefault("accounts", {}).setdefault(
+            username,
+            {
+                "writes": [],
+                "last_write": 0.0,
+                "last_upload": 0.0,
+                "pending_upload_until": 0.0,
+            },
+        )
+
+        cutoff = now - window
+        writes = sorted(
+            float(t)
+            for t in row.get("writes", [])
+            if isinstance(t, (int, float)) and float(t) >= cutoff
+        )
+
+        if len(writes) >= maximum:
+            retry = int(max(1, writes[0] + window - now))
+            return f"shared rolling budget; retry in ~{retry}s"
+
+        account_last = float(row.get("last_write") or 0.0)
+        if now - account_last < reels_gap:
+            retry = int(max(1, reels_gap - (now - account_last)))
+            return f"reels account gap; retry in ~{retry}s"
+
+        global_last = float(data.get("global_last") or 0.0)
+        if now - global_last < GLOBAL_WRITE_MIN_GAP_SECONDS:
+            retry = int(
+                max(
+                    1,
+                    GLOBAL_WRITE_MIN_GAP_SECONDS - (now - global_last),
+                )
+            )
+            return f"shared global gap; retry in ~{retry}s"
+
+        return ""
+    finally:
+        _release_shared_pacing_lock(fd)
+
+
+def _reserve_reels_write_slot(
+    username: str,
+    action_type: str,
+) -> tuple[bool, str]:
+    """
+    Reserve one Reels write with the Reels-specific account gap.
+
+    This does NOT change the rolling write ceiling or global cross-process gap.
+    """
+    allowed, reason = account_writes_allowed(username)
+    if not allowed:
+        return False, reason
+
+    fd = _acquire_shared_pacing_lock()
+    if fd is None:
+        return False, "shared pacing lock busy"
+
+    try:
+        data = _load_shared_pacing()
+        now = time.time()
+        settings = get_account_control_settings(username)
+        window = int(settings["write_window_seconds"])
+        maximum = int(settings["max_writes_per_window"])
+        reels_gap = _reels_write_gap_seconds(username)
+
+        row = data.setdefault("accounts", {}).setdefault(
+            username,
+            {
+                "writes": [],
+                "last_write": 0.0,
+                "last_upload": 0.0,
+                "pending_upload_until": 0.0,
+            },
+        )
+
+        cutoff = now - window
+        row["writes"] = sorted(
+            float(t)
+            for t in row.get("writes", [])
+            if isinstance(t, (int, float)) and float(t) >= cutoff
+        )
+
+        if len(row["writes"]) >= maximum:
+            retry = int(max(1, row["writes"][0] + window - now))
+            return False, f"shared rolling budget; retry in ~{retry}s"
+
+        account_last = float(row.get("last_write") or 0.0)
+        if now - account_last < reels_gap:
+            retry = int(max(1, reels_gap - (now - account_last)))
+            return False, f"reels account gap; retry in ~{retry}s"
+
+        global_last = float(data.get("global_last") or 0.0)
+        if now - global_last < GLOBAL_WRITE_MIN_GAP_SECONDS:
+            retry = int(
+                max(
+                    1,
+                    GLOBAL_WRITE_MIN_GAP_SECONDS - (now - global_last),
+                )
+            )
+            return False, f"shared global gap; retry in ~{retry}s"
+
+        row["writes"].append(now)
+        row["last_write"] = now
+        data["global_last"] = now
+        _save_shared_pacing(data)
+
+        return True, ""
+    finally:
+        _release_shared_pacing_lock(fd)
 
 def _browser_demo_wait_write_slot(
     page,
@@ -8832,24 +9132,13 @@ def _browser_demo_wait_write_slot(
     max_wait: int = 45,
 ) -> bool:
     """
-    Manual demo helper.
+    Wait for the bounded Reels-specific write slot.
 
-    Wait through the EXISTING pacing gate instead of changing/bypassing it.
-    The visible reel remains open while waiting. Security/restriction UI is
-    checked repeatedly.
+    Rolling-budget and safety blocks still stop/defer the action. Short
+    Reels/global gaps can be waited through.
     """
-    reason = _shared_write_block_reason(username, action_type)
-    if reason:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                f"⏳ Reels Demo waiting for permitted {action_type} slot: "
-                f"{reason}"
-            ),
-        )
-
     start = time.monotonic()
+    logged_reason = ""
 
     while True:
         problem = _browser_page_problem(page)
@@ -8862,11 +9151,11 @@ def _browser_demo_wait_write_slot(
             update_account_metric(
                 username,
                 "add_history",
-                value=f"🛑 Reels Demo {action_type} blocked: {account_reason}",
+                value=f"🛑 Reels {action_type} blocked: {account_reason}",
             )
             return False
 
-        ok, slot_reason = _reserve_shared_write_slot(
+        ok, slot_reason = _reserve_reels_write_slot(
             username,
             action_type,
         )
@@ -8877,37 +9166,50 @@ def _browser_demo_wait_write_slot(
                     username,
                     "add_history",
                     value=(
-                        f"▶️ Reels Demo {action_type} slot available after "
+                        f"▶️ Reels {action_type} slot available after "
                         f"~{waited:.0f}s; continuing."
                     ),
                 )
             return True
 
+        lower = str(slot_reason or "").lower()
+
         if (
-            "Safety Backoff" in slot_reason
-            or "Account cooldown" in slot_reason
-            or "rolling budget" in slot_reason
+            "rolling budget" in lower
+            or "safety" in lower
+            or "cooldown" in lower
         ):
             update_account_metric(
                 username,
                 "add_history",
-                value=f"↪️ Reels Demo {action_type} unavailable: {slot_reason}",
+                value=f"↪️ Reels {action_type} unavailable: {slot_reason}",
             )
             return False
 
-        elapsed = time.monotonic() - start
-        if elapsed >= max_wait:
+        if slot_reason != logged_reason:
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    f"↪️ Reels Demo {action_type} wait expired after "
+                    f"⏳ Reels waiting for {action_type}: "
+                    f"{slot_reason}"
+                ),
+            )
+            logged_reason = slot_reason
+
+        if time.monotonic() - start >= max_wait:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"↪️ Reels {action_type} wait expired after "
                     f"{max_wait}s: {slot_reason}"
                 ),
             )
             return False
 
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(500)
+
 
 
 def _browser_demo_wait_follow_slot(
@@ -8922,6 +9224,7 @@ def _browser_demo_wait_follow_slot(
     """
     start = time.monotonic()
     logged = False
+    reels_gap = _reels_write_gap_seconds(username)
 
     while True:
         problem = _browser_page_problem(page)
@@ -8929,7 +9232,13 @@ def _browser_demo_wait_follow_slot(
             _browser_pause_for_manual_security(username, problem)
             return False
 
-        ok, reason = _reserve_browser_follow_slot(username)
+        reels_reason = _reels_write_block_reason(username, "follow")
+        if reels_reason:
+            reason = reels_reason
+            ok = False
+        else:
+            ok, reason = _reserve_browser_follow_slot(username)
+
         if ok:
             waited = time.monotonic() - start
             if waited >= 1.0:
@@ -9760,6 +10069,7 @@ def _short_shared_gap_seconds(reason: str) -> int:
     if not any(
         marker in lower
         for marker in (
+            "reels account gap",
             "shared account gap",
             "shared multi-process gap",
             "shared global gap",
@@ -9863,9 +10173,9 @@ def _browser_reel_action_blocked_now(username: str, action: str) -> str:
 
         # Follow uses its own reservation function, so only use the generic
         # shared reason as a hint for whether to defer right now.
-        return _shared_write_block_reason(username, "follow") or ""
+        return _reels_write_block_reason(username, "follow") or ""
 
-    return _shared_write_block_reason(username, action) or ""
+    return _reels_write_block_reason(username, action) or ""
 
 
 def _browser_run_reel_action_cycle(
@@ -9875,6 +10185,7 @@ def _browser_run_reel_action_cycle(
     history: dict,
     prepared_comment: str,
     *,
+    include_comment: bool = True,
     max_cycle_seconds: int = 145,
 ) -> tuple[int, list[str]]:
     """
@@ -9890,7 +10201,9 @@ def _browser_run_reel_action_cycle(
         then continues the remaining actions
       * non-Like actions are guarded against accidentally toggling Like off
     """
-    actions = ["like", "save", "repost", "follow", "comment"]
+    actions = ["like", "save", "repost", "follow"]
+    if include_comment:
+        actions.append("comment")
     random.shuffle(actions)
 
     budget = _shared_write_budget_status(username)
@@ -9902,7 +10215,13 @@ def _browser_run_reel_action_cycle(
             "🎲 Reels action order: "
             + " → ".join(a.title() for a in actions)
             + f" · shared write budget {budget['used']}/{budget['max']} "
-            + f"({budget['remaining']} slot(s) currently remaining)."
+            + f"({budget['remaining']} slot(s) currently remaining). "
+            + (
+                "Comment selected; deep analysis was completed. "
+                if include_comment
+                else "No comment selected; vision analysis was skipped. "
+            )
+            + "All sub-actions belong to ONE reel pass."
         ),
     )
 
@@ -10046,7 +10365,7 @@ def _browser_run_reel_action_cycle(
             if _browser_engage_security_problem(page, username):
                 break
 
-            page.wait_for_timeout(random.randint(350, 750))
+            page.wait_for_timeout(random.randint(1000, 2000))
 
         if long_budget_blocked:
             names = [a.title() for a, _ in long_budget_blocked]
@@ -10188,38 +10507,90 @@ def _browser_run_one_reel(
     username: str,
     history: dict,
     *,
-    watch_seconds: float = 8.0,
+    comment_intent: bool,
+    quick_watch_seconds: float = 3.0,
     max_cycle_seconds: int = 145,
 ) -> int:
     """
-    Shared one-reel unit used by both manual Reels Demo and Auto Reels.
+    Shared one-reel unit.
+
+    Comment intent is decided before expensive analysis:
+      * comment_intent=False -> short watch, no vision model
+      * comment_intent=True  -> longer configurable deep multimodal analysis
     """
+    settings = get_account_control_settings(username)
+
     scope = _browser_visible_reel_scope(page)
     reel_key = _browser_visible_reel_permalink(page, scope)
 
     update_account_metric(
         username,
         "add_history",
-        value=f"🎬 Reels unit: {reel_key}",
+        value=(
+            f"🎬 Reels unit: {reel_key} · "
+            f"comment_intent={'yes' if comment_intent else 'no'}"
+        ),
     )
 
-    reel_context = _browser_reel_watch_context(
-        page,
-        username,
-        watch_seconds=watch_seconds,
-    )
+    prepared_comment = ""
 
-    if _browser_engage_security_problem(page, username):
-        return 0
+    if comment_intent:
+        deep_seconds = int(
+            settings.get("reels_comment_watch_seconds", 16)
+        )
+        frame_count = int(
+            settings.get("video_frames", 5)
+        )
 
-    prepared_comment = _browser_prepare_reel_comment(
-        page,
-        username,
-        reel_context,
-    )
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🔬 Comment selected for this reel: deep analysis "
+                f"{deep_seconds}s / {frame_count} frame(s)."
+            ),
+        )
 
-    if _browser_engage_security_problem(page, username):
-        return 0
+        reel_context = _browser_reel_watch_context(
+            page,
+            username,
+            watch_seconds=deep_seconds,
+            analyze_vision=True,
+            frame_count=frame_count,
+        )
+
+        if _browser_engage_security_problem(page, username):
+            return 0
+
+        prepared_comment = _browser_prepare_reel_comment(
+            page,
+            username,
+            reel_context,
+        )
+
+        if _browser_engage_security_problem(page, username):
+            return 0
+
+    else:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "⚡ No comment selected for this reel: using short watch "
+                "and skipping the vision model."
+            ),
+        )
+
+        _browser_reel_watch_context(
+            page,
+            username,
+            watch_seconds=quick_watch_seconds,
+            analyze_vision=False,
+            frame_count=3,
+        )
+
+        if _browser_engage_security_problem(page, username):
+            return 0
 
     confirmed, _ = _browser_run_reel_action_cycle(
         page,
@@ -10227,10 +10598,12 @@ def _browser_run_one_reel(
         reel_key,
         history,
         prepared_comment,
+        include_comment=comment_intent,
         max_cycle_seconds=max_cycle_seconds,
     )
 
     return confirmed
+
 
 
 def _browser_auto_reels(username, history, config) -> int:
@@ -10285,11 +10658,30 @@ def _browser_auto_reels(username, history, config) -> int:
             if get_account_safety_state(username)["active"]:
                 return 0
 
+            comment_intent = _reels_should_comment_auto(
+                username,
+                settings,
+            )
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🎯 Auto Reels comment decision: "
+                    + (
+                        "COMMENT — running deep analysis."
+                        if comment_intent
+                        else "NO COMMENT — skipping deep vision analysis."
+                    )
+                ),
+            )
+
             confirmed = _browser_run_one_reel(
                 page,
                 username,
                 history,
-                watch_seconds=8.0,
+                comment_intent=comment_intent,
+                quick_watch_seconds=3.0,
                 max_cycle_seconds=135,
             )
 
@@ -10298,9 +10690,26 @@ def _browser_auto_reels(username, history, config) -> int:
                 "add_history",
                 value=(
                     f"🎞️ Auto Reels pass finished; "
-                    f"confirmed/retained actions={confirmed}."
+                    f"confirmed/retained actions={confirmed}. "
+                    "This entire reel counts as exactly 1 active-session pass."
                 ),
             )
+
+            # Prepare the next reel for the next Auto pass. The current pass
+            # still counts only once regardless of its five sub-actions.
+            try:
+                if _browser_reels_scroll_next(page):
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            "↕️ Auto Reels advanced once and left the next reel "
+                            "visible for the next pass."
+                        ),
+                    )
+            except Exception:
+                pass
+
             return confirmed
 
         finally:
@@ -10327,7 +10736,7 @@ def _browser_reels_demo(username, history, config) -> int:
         "add_history",
         value=(
             "🎞️ Reels Demo starting: ONE visible reel; shared random-order "
-            "action engine."
+            "action engine. Manual demo consumes 0 Auto session passes."
         ),
     )
 
@@ -10384,11 +10793,14 @@ def _browser_reels_demo(username, history, config) -> int:
                 )
                 return 0
 
+            # Manual demo always intends to comment, so it always uses the
+            # deep analysis path. It still counts as one reel / zero Auto passes.
             confirmed = _browser_run_one_reel(
                 page,
                 username,
                 history,
-                watch_seconds=10.0,
+                comment_intent=True,
+                quick_watch_seconds=3.0,
                 max_cycle_seconds=145,
             )
 
@@ -12330,6 +12742,17 @@ def _run_browser_active_session(
 
         cycles += 1
 
+        if task == "reels":
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"🎞️ Session pass {cycles}/{max_passes} consumed by "
+                    "ONE reel; Like/Save/Repost/Follow/Comment did not consume "
+                    "additional passes."
+                ),
+            )
+
         if cycles >= max_passes:
             update_account_metric(
                 username,
@@ -14079,7 +14502,9 @@ function cardHtml(user,a){
         <div><label>Engage Repost %</label><input id="engagerepost_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_repost_percent??75)}"></div>
         <div><label>Engage Comment %</label><input id="engagecomment_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_comment_percent??10)}"></div>
         <div><label>Engage Follow-author %</label><input id="engagefollow_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_follow_percent??25)}"></div>
-        <div><label>Video frames to watch</label><input id="frames_${esc(user)}" type="number" min="3" max="9" value="${Number(s.video_frames||5)}"></div>
+        <div><label>Reels write gap seconds (8-60)</label><input id="reelswritegap_${esc(user)}" type="number" min="8" max="60" value="${Number(s.reels_write_gap_seconds||8)}"></div>
+        <div><label>Comment-reel analysis seconds (10-30)</label><input id="reelscommentwatch_${esc(user)}" type="number" min="10" max="30" value="${Number(s.reels_comment_watch_seconds||16)}"></div>
+        <div><label>Comment-reel vision frames (3-9)</label><input id="frames_${esc(user)}" type="number" min="3" max="9" value="${Number(s.video_frames||5)}"></div>
         <div><label>Writes / rolling window</label><input id="maxwrites_${esc(user)}" type="number" min="1" max="30" value="${Number(s.max_writes_per_window||8)}"></div>
         <div><label>Rolling window seconds</label><input id="window_${esc(user)}" type="number" min="60" max="7200" value="${Number(s.write_window_seconds||900)}"></div>
         <div><label>Min write gap seconds</label><input id="writegap_${esc(user)}" type="number" min="8" max="600" value="${Number(s.write_min_gap_seconds||22)}"></div>
@@ -14108,7 +14533,7 @@ function cardHtml(user,a){
     <div class="section">
       <b>Manual actions</b>
       <div class="row">
-        <button class="good" ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','reels_demo')">🎞️ Reels Demo · Vision + Act</button>
+        <button class="good" ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','reels_demo')">🎞️ Reels Demo · Deep Comment Analysis</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
         <button ${connected ? "":"disabled"} onclick="clearUploadCooldown('${esc(user)}')">Clear Upload Cooldown</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
@@ -14434,6 +14859,8 @@ function collectBehavior(user){
     engage_repost_percent:Number(document.getElementById(`engagerepost_${user}`).value),
     engage_comment_percent:Number(document.getElementById(`engagecomment_${user}`).value),
     engage_follow_percent:Number(document.getElementById(`engagefollow_${user}`).value),
+    reels_write_gap_seconds:Number(document.getElementById(`reelswritegap_${user}`).value),
+    reels_comment_watch_seconds:Number(document.getElementById(`reelscommentwatch_${user}`).value),
     pace_mode:(latestData.accounts?.[user]?.control?.settings?.pace_mode || "normal"),
     video_frames:Number(document.getElementById(`frames_${user}`).value),
     max_writes_per_window:Number(document.getElementById(`maxwrites_${user}`).value),
@@ -15036,11 +15463,17 @@ def _background_account_workflow(username, conf, next_workflow_at):
     except Exception as exc:
         observe_platform_signal(username,exc,action="workflow")
         update_account_metric(username,"add_history",value=f"❌ Workflow error: {type(exc).__name__}: {str(exc)[:220]}"); result="error"
-    delay, delay_reason = _next_overnight_auto_delay(
-        username,
-        result,
-        manual_run=bool(forced_task),
-    )
+    if forced_task == "reels_demo":
+        # Manual Reels Demo never consumes Auto session-pass quota and should
+        # not impose a long scheduler delay afterward.
+        delay = random.randint(1, 2)
+        delay_reason = "manual Reels Demo; Auto pass quota unchanged"
+    else:
+        delay, delay_reason = _next_overnight_auto_delay(
+            username,
+            result,
+            manual_run=bool(forced_task),
+        )
     update_account_metric(
         username,
         "add_history",
@@ -15110,7 +15543,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reels Finish-All-Actions Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reels Deep Comment Analysis: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
