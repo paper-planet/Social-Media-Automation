@@ -55,7 +55,7 @@ IG_ACCOUNTS_FILE = Path(
 ).expanduser()
 
 
-REELS_BUILD_ID = "reliability-refactor-v7"
+REELS_BUILD_ID = "auto-synergy-action-rail-v8"
 def _safe_account_slug(username):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(username or "").strip().lstrip("@"))
     return value.strip("._-") or "instagram_account"
@@ -278,7 +278,7 @@ BROWSER_FOLLOW_VERIFY_SECONDS = max(
     ),
 )
 BROWSER_LAST_FOLLOW_ACTION = {}
-UPLOAD_COOLDOWN_SECONDS = max(300, int(os.environ.get("IG_UPLOAD_COOLDOWN_SECONDS", "2400")))
+UPLOAD_COOLDOWN_SECONDS = max(300, int(os.environ.get("IG_UPLOAD_COOLDOWN_SECONDS", "1200")))
 DM_REPLY_COOLDOWN_SECONDS = max(30, int(os.environ.get("IG_DM_REPLY_COOLDOWN_SECONDS", "120")))
 DM_MIN_INCOMING_AGE_SECONDS = max(0, int(os.environ.get("IG_DM_MIN_INCOMING_AGE_SECONDS", "90")))
 DM_THREAD_REPLY_COOLDOWN_SECONDS = max(60, int(os.environ.get("IG_DM_THREAD_REPLY_COOLDOWN_SECONDS", "1800")))
@@ -772,7 +772,8 @@ def _default_control_settings(username, conf):
         "engage_clips_per_pass": 12,
         "engage_scroll_steps": 8,
         "engage_like_percent": 75,
-        "engage_repost_percent": 75,
+        "engage_save_percent": 55,
+        "engage_repost_percent": 45,
         "engage_comment_percent": 10,
         "engage_follow_percent": 25,
         "reels_write_gap_seconds": 8,
@@ -796,6 +797,8 @@ def _default_control_settings(username, conf):
         "write_window_seconds": WRITE_WINDOW_SECONDS,
         "write_min_gap_seconds": WRITE_MIN_GAP_SECONDS,
         "upload_cooldown_seconds": UPLOAD_COOLDOWN_SECONDS,
+        "daily_post_limit": 20,
+        "max_posts_per_active_session": 2,
         "max_writes_per_workflow": MAX_WRITES_PER_WORKFLOW,
         "max_dm_replies_per_pass": MAX_DM_REPLIES_PER_PASS,
         "max_comment_replies_per_pass": MAX_COMMENT_REPLIES_PER_PASS,
@@ -909,6 +912,7 @@ def _sanitize_control_settings(username, conf, raw):
         "engage_clips_per_pass": as_int("engage_clips_per_pass", 1, 20),
         "engage_scroll_steps": as_int("engage_scroll_steps", 1, 20),
         "engage_like_percent": as_int("engage_like_percent", 0, 100),
+        "engage_save_percent": as_int("engage_save_percent", 0, 100),
         "engage_repost_percent": as_int("engage_repost_percent", 0, 100),
         "engage_comment_percent": as_int("engage_comment_percent", 0, 100),
         "engage_follow_percent": as_int("engage_follow_percent", 0, 100),
@@ -936,6 +940,8 @@ def _sanitize_control_settings(username, conf, raw):
         "write_window_seconds": as_int("write_window_seconds", 60, 7200),
         "write_min_gap_seconds": as_int("write_min_gap_seconds", 8, 600),
         "upload_cooldown_seconds": as_int("upload_cooldown_seconds", 300, 21600),
+        "daily_post_limit": as_int("daily_post_limit", 1, 50),
+        "max_posts_per_active_session": as_int("max_posts_per_active_session", 1, 5),
         "max_writes_per_workflow": as_int("max_writes_per_workflow", 1, 10),
         "max_dm_replies_per_pass": as_int("max_dm_replies_per_pass", 1, 5),
         "max_comment_replies_per_pass": as_int("max_comment_replies_per_pass", 1, 5),
@@ -10009,6 +10015,7 @@ def _browser_reel_watch_context(
     watch_seconds: float = 4.0,
     analyze_vision: bool = False,
     frame_count: int = 8,
+    expected_reel_key: str = "",
 ) -> str:
     """
     Watch the current reel.
@@ -10110,7 +10117,27 @@ def _browser_reel_watch_context(
 
     captured_marks = set()
 
+    identity_changed = False
+
     while time.monotonic() - started < actual_watch:
+        if expected_reel_key:
+            same_reel, current_key = _browser_reel_identity_matches(
+                page,
+                expected_reel_key,
+            )
+            if not same_reel:
+                identity_changed = True
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🛑 Deep watch stopped immediately because the centered "
+                        f"Reel changed. expected={expected_reel_key} "
+                        f"current={current_key}"
+                    ),
+                )
+                break
+
         problem = _browser_page_problem(page)
         if problem:
             _browser_pause_for_manual_security(username, problem)
@@ -10188,7 +10215,7 @@ def _browser_reel_watch_context(
     # still be using CPU. This is intentional CPU/GPU overlap.
     vision = ""
 
-    if analyze_vision:
+    if analyze_vision and not identity_changed:
         vision = _browser_analyze_reel_frames(
             username,
             frame_paths,
@@ -10202,6 +10229,10 @@ def _browser_reel_watch_context(
             audio_future,
             timeout=150,
         )
+
+        if identity_changed:
+            transcript = ""
+            transcript_backend = ""
 
         # If audio arrived after the first vision pass, run a compact synthesis
         # pass that merges audio with the visual analysis rather than forcing a
@@ -11852,25 +11883,89 @@ def _browser_find_local_comment_submit_control(page, editor):
     return None
 
 
-def _browser_reel_action_plan(include_comment: bool) -> list[str]:
+def _percent_roll(value) -> bool:
+    try:
+        pct = max(0, min(100, int(value)))
+    except Exception:
+        pct = 0
+
+    if pct <= 0:
+        return False
+    if pct >= 100:
+        return True
+    return random.random() < (pct / 100.0)
+
+
+def _browser_reels_auto_action_intents(settings: dict) -> dict:
+    """
+    One immutable action decision per Auto Reel.
+
+    The hub percentages now actually control Auto Reels. Manual Reels Demo
+    still exercises all available actions.
+    """
+    return {
+        "like": _percent_roll(settings.get("engage_like_percent", 75)),
+        "save": _percent_roll(settings.get("engage_save_percent", 55)),
+        "repost": _percent_roll(settings.get("engage_repost_percent", 45)),
+        "follow": _percent_roll(settings.get("engage_follow_percent", 25)),
+        "comment": _percent_roll(settings.get("engage_comment_percent", 10))
+        if settings.get("enable_comments", True)
+        else False,
+    }
+
+def _browser_reel_action_plan(
+    include_comment: bool,
+    action_intents: dict | None = None,
+) -> list[str]:
     """
     Reliability-first action order.
 
-    Repost is always LAST because Instagram's Repost UI is the one action known
-    to sometimes change the centered Reel. It must never prevent Follow or a
-    prepared Comment from running.
+    Follow and Comment happen before potentially disruptive Repost.
+    Like/Save remain randomized. Repost is always last.
 
-    Like/Save remain randomized because those controls are stable.
+    action_intents=None means Manual Demo: all actions are enabled.
     """
-    stable_tail = ["like", "save"]
-    random.shuffle(stable_tail)
+    if action_intents is None:
+        enabled = {
+            "follow": True,
+            "comment": bool(include_comment),
+            "like": True,
+            "save": True,
+            "repost": True,
+        }
+    else:
+        enabled = {
+            "follow": bool(action_intents.get("follow", False)),
+            "comment": bool(
+                include_comment
+                and action_intents.get("comment", False)
+            ),
+            "like": bool(action_intents.get("like", False)),
+            "save": bool(action_intents.get("save", False)),
+            "repost": bool(action_intents.get("repost", False)),
+        }
 
-    actions = ["follow"]
-    if include_comment:
+    actions = []
+
+    if enabled["follow"]:
+        actions.append("follow")
+
+    if enabled["comment"]:
         actions.append("comment")
+
+    stable_tail = [
+        action
+        for action in ("like", "save")
+        if enabled[action]
+    ]
+    random.shuffle(stable_tail)
     actions.extend(stable_tail)
-    actions.append("repost")
+
+    if enabled["repost"]:
+        actions.append("repost")
+
     return actions
+
 
 
 def _browser_reel_protected_priority(action: str) -> int:
@@ -12131,22 +12226,276 @@ def _browser_demo_follow_if_needed(
 
 
 
+def _browser_tag_current_reel_action_rail(page) -> tuple[str, dict]:
+    """
+    Bind action state to the control rail physically nearest the CENTERED video.
+
+    Instagram virtualizes neighboring Reels and can leave their visible SVGs
+    mounted inside a broad article/section. A page/scope-wide `Unlike` search
+    therefore creates false "already liked" results.
+
+    This helper:
+      * finds the largest visible video
+      * collects only Reel action SVGs vertically aligned with that video
+      * clusters them by x-position
+      * selects the cluster nearest the video's right edge with multiple
+        distinct Reel actions
+      * tags only that cluster for subsequent state/click queries
+    """
+    token = f"rail_{int(time.time()*1000)}_{random.randint(1000,9999)}"
+
+    try:
+        result = page.evaluate(
+            """
+            token => {
+              document.querySelectorAll('[data-igch-reel-rail]').forEach(
+                el => el.removeAttribute('data-igch-reel-rail')
+              );
+
+              const vh = window.innerHeight || 1;
+              const vw = window.innerWidth || 1;
+              const videos = [...document.querySelectorAll('video')];
+
+              let video = null;
+              let bestArea = 0;
+
+              for (const candidate of videos) {
+                const r = candidate.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+
+                const left = Math.max(0, r.left);
+                const right = Math.min(vw, r.right);
+                const top = Math.max(0, r.top);
+                const bottom = Math.min(vh, r.bottom);
+                const area =
+                  Math.max(0, right-left) * Math.max(0, bottom-top);
+
+                if (area > bestArea) {
+                  bestArea = area;
+                  video = candidate;
+                }
+              }
+
+              if (!video || bestArea <= 0) {
+                return {ok:false, reason:'no-visible-video'};
+              }
+
+              const vr = video.getBoundingClientRect();
+              const allowed = new Set([
+                'Like','Unlike','Comment','Share',
+                'Save','Remove','Unsave',
+                'Repost','Remove repost','Undo repost','Reposted'
+              ]);
+
+              const rows = [];
+
+              for (const svg of document.querySelectorAll('svg[aria-label]')) {
+                const label = String(svg.getAttribute('aria-label') || '');
+                if (!allowed.has(label)) continue;
+
+                const r = svg.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+
+                const cx = r.left + r.width / 2;
+                const cy = r.top + r.height / 2;
+
+                if (cx < 0 || cx > vw || cy < 0 || cy > vh) continue;
+
+                // Correct action controls should live in/next to the same
+                // vertical card as the centered video.
+                const yMargin = Math.max(100, vr.height * 0.18);
+                if (cy < vr.top - yMargin || cy > vr.bottom + yMargin) {
+                  continue;
+                }
+
+                // Exclude controls far to the left or far beyond the video.
+                if (cx < vr.left + vr.width * 0.42) continue;
+                if (cx > vr.right + Math.max(360, vr.width * 0.55)) continue;
+
+                rows.push({
+                  svg,
+                  label,
+                  cx,
+                  cy,
+                  key: Math.round(cx / 52)
+                });
+              }
+
+              if (!rows.length) {
+                return {ok:false, reason:'no-action-candidates'};
+              }
+
+              const groups = new Map();
+
+              for (const row of rows) {
+                if (!groups.has(row.key)) groups.set(row.key, []);
+                groups.get(row.key).push(row);
+              }
+
+              let best = null;
+              let bestScore = -1e9;
+
+              for (const group of groups.values()) {
+                const labels = [...new Set(group.map(x => x.label))];
+                const core = labels.filter(x =>
+                  ['Like','Unlike','Comment','Save','Remove','Unsave',
+                   'Repost','Remove repost','Undo repost','Reposted'].includes(x)
+                );
+
+                // Require at least two distinct Reel actions. This prevents a
+                // random stale Unlike icon from becoming the "rail".
+                if (core.length < 2) continue;
+
+                const meanX =
+                  group.reduce((sum, x) => sum + x.cx, 0) / group.length;
+                const rightDistance = Math.abs(meanX - vr.right);
+
+                // Distinct action richness matters more than x distance.
+                const score = core.length * 1000 - rightDistance;
+
+                if (score > bestScore) {
+                  bestScore = score;
+                  best = group;
+                }
+              }
+
+              if (!best) {
+                return {ok:false, reason:'no-confident-action-cluster'};
+              }
+
+              for (const row of best) {
+                row.svg.setAttribute('data-igch-reel-rail', token);
+              }
+
+              return {
+                ok: true,
+                labels: [...new Set(best.map(x => x.label))],
+                count: best.length,
+                video: {
+                  left: vr.left,
+                  right: vr.right,
+                  top: vr.top,
+                  bottom: vr.bottom
+                }
+              };
+            }
+            """,
+            token,
+        )
+    except Exception as exc:
+        return "", {
+            "ok": False,
+            "reason": f"evaluate-{type(exc).__name__}",
+        }
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        return "", result if isinstance(result, dict) else {"ok": False}
+
+    return token, result
+
+
+def _browser_current_reel_action_labels(page) -> tuple[set[str], dict]:
+    token, diag = _browser_tag_current_reel_action_rail(page)
+
+    if not token:
+        return set(), diag
+
+    try:
+        labels = page.locator(
+            f"svg[data-igch-reel-rail='{token}'][aria-label]"
+        ).evaluate_all(
+            """els => els.map(e => e.getAttribute('aria-label') || '')
+                         .filter(Boolean)"""
+        )
+    except Exception:
+        labels = []
+
+    return {str(x) for x in labels}, diag
+
+
+def _browser_current_reel_action_svg(page, label: str):
+    token, diag = _browser_tag_current_reel_action_rail(page)
+
+    if not token:
+        return None
+
+    try:
+        locs = page.locator(
+            f"svg[data-igch-reel-rail='{token}']"
+            f"[aria-label='{str(label).replace(chr(39), '')}']"
+        )
+    except Exception:
+        return None
+
+    for i in range(min(locs.count(), 8)):
+        svg = locs.nth(i)
+        try:
+            if svg.is_visible(timeout=120):
+                return svg
+        except Exception:
+            continue
+
+    return None
+
 def _browser_visible_reel_state(page) -> dict:
     """
-    Snapshot the current visible reel's key relationship/action states.
-    Uses exact SVG/button labels only.
-    """
-    scope = _browser_visible_reel_scope(page)
+    Snapshot relationship/action state for the CENTERED Reel only.
 
-    def svg_visible(label):
-        try:
-            locs = scope.locator(f"svg[aria-label='{label}']")
-            for i in range(min(locs.count(), 8)):
-                if locs.nth(i).is_visible(timeout=100):
-                    return True
-        except Exception:
-            pass
-        return False
+    Like/Save/Repost state comes exclusively from the geometry-bound action
+    rail nearest the centered video. This prevents neighboring mounted Reels
+    from producing false `Unlike` / `Remove` / `Reposted` state.
+    """
+    labels, diag = _browser_current_reel_action_labels(page)
+    rail_confident = bool(diag.get("ok")) if isinstance(diag, dict) else False
+
+    has_like = "Like" in labels
+    has_unlike = "Unlike" in labels
+
+    # A state is trusted only when the rail is confident and only one side of
+    # the Like/Unlike pair is present.
+    liked = bool(
+        rail_confident
+        and has_unlike
+        and not has_like
+    )
+    like_available = bool(
+        rail_confident
+        and has_like
+        and not has_unlike
+    )
+
+    saved = bool(
+        rail_confident
+        and (
+            "Remove" in labels
+            or "Unsave" in labels
+        )
+        and "Save" not in labels
+    )
+    save_available = bool(
+        rail_confident
+        and "Save" in labels
+        and not saved
+    )
+
+    reposted = bool(
+        rail_confident
+        and any(
+            label in labels
+            for label in (
+                "Remove repost",
+                "Undo repost",
+                "Reposted",
+            )
+        )
+    )
+    repost_available = bool(
+        rail_confident
+        and "Repost" in labels
+        and not reposted
+    )
+
+    scope = _browser_visible_reel_scope(page)
 
     def button_visible(label):
         try:
@@ -12162,77 +12511,59 @@ def _browser_visible_reel_state(page) -> dict:
         return False
 
     return {
-        "liked": svg_visible("Unlike"),
-        "like_available": svg_visible("Like"),
-        "saved": (
-            svg_visible("Remove")
-            or svg_visible("Unsave")
-        ),
-        "save_available": svg_visible("Save"),
-        "reposted": (
-            svg_visible("Remove repost")
-            or svg_visible("Undo repost")
-            or svg_visible("Reposted")
-        ),
-        "repost_available": svg_visible("Repost"),
+        "rail_confident": rail_confident,
+        "rail_labels": sorted(labels),
+        "liked": liked,
+        "like_available": like_available,
+        "saved": saved,
+        "save_available": save_available,
+        "reposted": reposted,
+        "repost_available": repost_available,
         "following": button_visible("Following"),
         "requested": button_visible("Requested"),
         "follow_available": button_visible("Follow"),
     }
 
 
+
 def _browser_find_strict_reel_svg(page, label: str):
     """
-    Exact action SVG in the CURRENT visible reel only.
+    Exact action SVG from the CENTERED Reel's geometry-bound action rail.
 
-    No page-global fallback. This prevents a neighboring reel or another action
-    container from being clicked by mistake.
+    There is deliberately no broad scope/page fallback.
     """
-    scope = _browser_visible_reel_scope(page)
+    svg = _browser_current_reel_action_svg(page, label)
+
+    if svg is None:
+        return None
 
     try:
-        locs = scope.locator(
-            f"svg[aria-label='{str(label).replace(chr(39), '')}']"
+        clickable = _browser_clickable_from_svg(svg)
+        if not clickable.is_visible(timeout=120):
+            return None
+
+        labels = clickable.locator(
+            "svg[aria-label]"
+        ).evaluate_all(
+            """els => els.map(e => e.getAttribute('aria-label') || '')
+                         .filter(Boolean)"""
         )
+
+        normalized = [str(x) for x in labels]
+
+        if label not in normalized:
+            return None
+
+        if label not in {"Like", "Unlike"} and any(
+            x in {"Like", "Unlike"}
+            for x in normalized
+        ):
+            return None
+
+        return svg
     except Exception:
         return None
 
-    for i in range(min(locs.count(), 10)):
-        svg = locs.nth(i)
-        try:
-            if not svg.is_visible(timeout=120):
-                continue
-
-            clickable = _browser_clickable_from_svg(svg)
-            if not clickable.is_visible(timeout=120):
-                continue
-
-            # Verify the clickable ancestor really contains the requested SVG,
-            # and reject controls that also contain Like/Unlike when targeting
-            # another action.
-            labels = clickable.locator(
-                "svg[aria-label]"
-            ).evaluate_all(
-                """els => els.map(e => e.getAttribute('aria-label') || '')
-                             .filter(Boolean)"""
-            )
-
-            normalized = [str(x) for x in labels]
-
-            if label not in normalized:
-                continue
-
-            if label not in {"Like", "Unlike"} and any(
-                x in {"Like", "Unlike"}
-                for x in normalized
-            ):
-                continue
-
-            return svg
-        except Exception:
-            continue
-
-    return None
 
 
 def _browser_assert_reel_still_liked(
@@ -12546,6 +12877,7 @@ def _browser_run_reel_action_cycle(
     prepared_comment: str,
     *,
     include_comment: bool = True,
+    action_intents: dict | None = None,
     max_cycle_seconds: int = 145,
 ) -> tuple[int, list[str]]:
     """
@@ -12561,7 +12893,7 @@ def _browser_run_reel_action_cycle(
         then continues the remaining actions
       * non-Like actions are guarded against accidentally toggling Like off
     """
-    actions = _browser_reel_action_plan(include_comment)
+    actions = _browser_reel_action_plan(include_comment, action_intents)
 
     budget = _shared_write_budget_status(username)
 
@@ -12570,7 +12902,7 @@ def _browser_run_reel_action_cycle(
         "add_history",
         value=(
             "🧭 Reels reliability action order: "
-            + " → ".join(a.title() for a in actions)
+            + (" → ".join(a.title() for a in actions) if actions else "(no Auto actions selected)")
             + f" · shared write budget {budget['used']}/{budget['max']} "
             + f"({budget['remaining']} slot(s) currently remaining). "
             + (
@@ -12967,8 +13299,8 @@ def _browser_reel_marked_interacted(
 
     state = _browser_visible_reel_state(page)
 
-    if state.get("liked"):
-        return True, "already visibly liked"
+    if state.get("rail_confident") and state.get("liked"):
+        return True, "already visibly liked on the centered Reel's action rail"
 
     if reel_key and reel_key in history["browser_liked_urls"]:
         return True, "already in liked history"
@@ -13151,6 +13483,7 @@ def _browser_run_one_reel(
     history: dict,
     *,
     comment_intent: bool,
+    action_intents: dict | None = None,
     quick_watch_seconds: float = 3.0,
     max_cycle_seconds: int = 145,
 ) -> int:
@@ -13247,6 +13580,7 @@ def _browser_run_one_reel(
             watch_seconds=deep_seconds,
             analyze_vision=True,
             frame_count=frame_count,
+            expected_reel_key=locked_reel_key,
         )
 
         if _browser_engage_security_problem(page, username):
@@ -13304,6 +13638,7 @@ def _browser_run_one_reel(
             watch_seconds=quick_watch_seconds,
             analyze_vision=False,
             frame_count=3,
+            expected_reel_key=locked_reel_key,
         )
 
         if _browser_engage_security_problem(page, username):
@@ -13344,6 +13679,7 @@ def _browser_run_one_reel(
         history,
         prepared_comment,
         include_comment=comment_intent,
+        action_intents=action_intents,
         max_cycle_seconds=max_cycle_seconds,
     )
 
@@ -13532,20 +13868,24 @@ def _browser_auto_reels(username, history, config) -> int:
             if get_account_safety_state(username)["active"]:
                 return 0
 
-            comment_intent = _reels_should_comment_auto(
-                username,
+            action_intents = _browser_reels_auto_action_intents(
                 settings,
             )
+            comment_intent = bool(action_intents.get("comment"))
 
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    "🎯 Auto Reels comment decision: "
+                    "🎯 Auto Reels action decisions: "
+                    + ", ".join(
+                        f"{name.title()}={'yes' if enabled else 'no'}"
+                        for name, enabled in action_intents.items()
+                    )
                     + (
-                        "COMMENT — running deep analysis."
+                        " · deep analysis enabled."
                         if comment_intent
-                        else "NO COMMENT — skipping deep vision analysis."
+                        else " · no comment selected, so expensive vision/audio analysis is skipped."
                     )
                 ),
             )
@@ -13555,6 +13895,7 @@ def _browser_auto_reels(username, history, config) -> int:
                 username,
                 history,
                 comment_intent=comment_intent,
+                action_intents=action_intents,
                 quick_watch_seconds=3.0,
                 max_cycle_seconds=135,
             )
@@ -13704,6 +14045,7 @@ def _browser_reels_demo(username, history, config) -> int:
                 username,
                 history,
                 comment_intent=True,
+                action_intents=None,
                 quick_watch_seconds=3.0,
                 max_cycle_seconds=145,
             )
@@ -14795,10 +15137,76 @@ def _browser_find_new_permalink_after_share(page, username: str, before_links: s
         page.wait_for_timeout(2500)
     return ""
 
+def _browser_post_quota_status(
+    history: dict,
+    settings: dict,
+    *,
+    now: float | None = None,
+) -> tuple[int, int, int]:
+    """
+    Persistent rolling-24h successful Browser Post count.
+
+    Returns: used, limit, retry_seconds_if_full.
+    """
+    now = float(now if now is not None else time.time())
+    cutoff = now - 86400.0
+
+    raw = history.setdefault("browser_post_timestamps", [])
+    times = sorted(
+        float(ts)
+        for ts in raw
+        if isinstance(ts, (int, float))
+        and float(ts) >= cutoff
+        and float(ts) <= now + 60
+    )
+
+    history["browser_post_timestamps"] = times[-200:]
+    limit = max(
+        1,
+        min(
+            50,
+            int(settings.get("daily_post_limit", 20)),
+        ),
+    )
+
+    retry = 0
+    if len(times) >= limit and times:
+        retry = int(max(1, times[0] + 86400.0 - now))
+
+    return len(times), limit, retry
+
+
+def _browser_record_successful_post(history: dict) -> None:
+    settings_stub = {"daily_post_limit": 50}
+    _browser_post_quota_status(history, settings_stub)
+    history.setdefault("browser_post_timestamps", []).append(time.time())
+    history["browser_post_timestamps"] = history["browser_post_timestamps"][-200:]
+
 def _browser_post(username, history, folder_pool, manual=False) -> bool:
     settings = get_account_control_settings(username)
 
     if not manual and not settings.get("enable_posts", False):
+        return False
+
+    posts_used, post_limit, post_retry = _browser_post_quota_status(
+        history,
+        settings,
+    )
+
+    if not manual and posts_used >= post_limit:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"⏳ Browser Post skipped: Auto rolling-24h post cap "
+                f"{posts_used}/{post_limit} reached"
+                + (
+                    f"; next slot in ~{post_retry}s."
+                    if post_retry
+                    else "."
+                )
+            ),
+        )
         return False
 
     update_account_metric(
@@ -14806,7 +15214,9 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
         "add_history",
         value=(
             f"🧰 Browser Post starting ({'manual' if manual else 'Auto'}); "
-            f"media folders discovered={len(folder_pool)}"
+            f"media folders discovered={len(folder_pool)}; "
+            f"posts last 24h={posts_used}/{post_limit}; "
+            f"upload cooldown={int(settings.get('upload_cooldown_seconds', UPLOAD_COOLDOWN_SECONDS))}s"
         ),
     )
 
@@ -15256,6 +15666,7 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                 history["posted_ids"].append(selected["id"])
 
             update_account_metric(username, "total_posts", increment=1)
+            _browser_record_successful_post(history)
 
             record_recent_post(
                 username=username,
@@ -15522,20 +15933,34 @@ def _browser_maybe_run_readonly_listeners(username: str) -> None:
 
 
 
-def _browser_auto_choices(username: str, settings: dict, folder_pool) -> list[str]:
+def _browser_auto_choices(
+    username: str,
+    settings: dict,
+    folder_pool,
+    history: dict,
+) -> list[str]:
     choices = []
 
     if settings.get("enable_follow", False):
         choices.append("networking")
+
     if settings.get("enable_engage", False):
         choices.append("reels")
 
     if settings.get("enable_posts", False) and folder_pool:
-        # Do not let a long upload cooldown stall an active browsing session.
-        if not _shared_write_block_reason(username, "upload"):
-            choices.append("repost")
+        posts_used, post_limit, _ = _browser_post_quota_status(
+            history,
+            settings,
+        )
+
+        if posts_used < post_limit:
+            # Do not let upload cooldown block Reels/networking. Post simply
+            # disappears from Auto choices until its own cooldown reopens.
+            if not _shared_write_block_reason(username, "upload"):
+                choices.append("post")
 
     return choices
+
 
 
 def _run_browser_active_session(
@@ -15565,7 +15990,14 @@ def _run_browser_active_session(
 
     hard_deadline = time.monotonic() + duration
     cycles = 0
-    post_used = False
+    posts_this_session = 0
+    max_posts_this_session = max(
+        1,
+        min(
+            5,
+            int(settings.get("max_posts_per_active_session", 2)),
+        ),
+    )
     max_passes = max(
         1,
         min(
@@ -15598,10 +16030,18 @@ def _run_browser_active_session(
             break
 
         settings = get_account_control_settings(username, conf)
-        choices = _browser_auto_choices(username, settings, folder_pool)
+        choices = _browser_auto_choices(
+            username,
+            settings,
+            folder_pool,
+            history,
+        )
 
-        if post_used and "repost" in choices:
-            choices.remove("repost")
+        if (
+            posts_this_session >= max_posts_this_session
+            and "post" in choices
+        ):
+            choices.remove("post")
 
         if not choices:
             update_account_metric(
@@ -15640,14 +16080,15 @@ def _run_browser_active_session(
                     history,
                     conf,
                 )
-            elif task == "repost":
-                _browser_post(
+            elif task == "post":
+                posted = _browser_post(
                     username,
                     history,
                     folder_pool,
                     manual=False,
                 )
-                post_used = True
+                if posted:
+                    posts_this_session += 1
         except RuntimeError as exc:
             # Security/restriction problems are already classified elsewhere.
             update_account_metric(
@@ -15709,7 +16150,11 @@ def _run_browser_active_session(
     update_account_metric(
         username,
         "add_history",
-        value=f"⚡ {mode.title()} active session finished after {cycles} step(s).",
+        value=(
+            f"⚡ {mode.title()} active session finished after {cycles} step(s); "
+            f"successful posts this session={posts_this_session}/"
+            f"{max_posts_this_session}."
+        ),
     )
 
 def run_browser_profile_workflow(username, conf, folder_pool):
@@ -15785,6 +16230,9 @@ def run_browser_profile_workflow(username, conf, folder_pool):
             "dm_reply_memory": {},
             "browser_liked_urls": [],
             "browser_saved_urls": [],
+            "browser_reposted_urls": [],
+            "browser_commented_urls": [],
+            "browser_post_timestamps": [],
             "browser_pending_uploads": [],
         },
     )
@@ -15848,6 +16296,7 @@ def run_browser_profile_workflow(username, conf, folder_pool):
                     username,
                     settings,
                     folder_pool,
+                    history,
                 )
 
                 if not choices:
@@ -15884,7 +16333,7 @@ def run_browser_profile_workflow(username, conf, folder_pool):
                         history,
                         conf,
                     )
-                elif task == "repost":
+                elif task == "post":
                     _browser_post(
                         username,
                         history,
@@ -17395,7 +17844,7 @@ function cardHtml(user,a){
           <div class="row">
             <label><input id="posts_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_posts?"checked":""}> Posts</label>
             <label><input id="follow_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_follow?"checked":""}> Follow</label>
-            <label><input id="engage_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_engage?"checked":""}> Hashtag / Engage</label>
+            <label><input id="engage_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_engage?"checked":""}> Reels / Engage</label>
             <label><input id="dms_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_dms?"checked":""}> DMs</label>
             <label><input id="comments_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_comments?"checked":""}> Comment Replies</label>
           </div>
@@ -17416,8 +17865,9 @@ function cardHtml(user,a){
         <div><label>Active-session passes (1-20)</label><input id="sessionpasses_${esc(user)}" type="number" min="1" max="20" value="${Number(s.active_session_max_passes||8)}"></div>
         <div><label>Engage clips / pass (1-20)</label><input id="engageclips_${esc(user)}" type="number" min="1" max="20" value="${Number(s.engage_clips_per_pass||12)}"></div>
         <div><label>Engage discovery scrolls (1-20)</label><input id="engagescrolls_${esc(user)}" type="number" min="1" max="20" value="${Number(s.engage_scroll_steps||8)}"></div>
-        <div><label>Engage Like %</label><input id="engagelike_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_like_percent??75)}"></div>
-        <div><label>Engage Repost %</label><input id="engagerepost_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_repost_percent??75)}"></div>
+        <div><label>Auto Reels Like %</label><input id="engagelike_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_like_percent??75)}"></div>
+        <div><label>Auto Reels Save %</label><input id="engagesave_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_save_percent??55)}"></div>
+        <div><label>Auto Reels Repost %</label><input id="engagerepost_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_repost_percent??45)}"></div>
         <div><label>Engage Comment %</label><input id="engagecomment_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_comment_percent??10)}"></div>
         <div><label>Engage Follow-author %</label><input id="engagefollow_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_follow_percent??25)}"></div>
         <div><label>Reels write gap seconds (8-60)</label><input id="reelswritegap_${esc(user)}" type="number" min="8" max="60" value="${Number(s.reels_write_gap_seconds||8)}"></div>
@@ -17430,7 +17880,9 @@ function cardHtml(user,a){
         <div><label>Writes / rolling window</label><input id="maxwrites_${esc(user)}" type="number" min="1" max="30" value="${Number(s.max_writes_per_window||8)}"></div>
         <div><label>Rolling window seconds</label><input id="window_${esc(user)}" type="number" min="60" max="7200" value="${Number(s.write_window_seconds||900)}"></div>
         <div><label>Min write gap seconds</label><input id="writegap_${esc(user)}" type="number" min="8" max="600" value="${Number(s.write_min_gap_seconds||22)}"></div>
-        <div><label>Upload cooldown seconds</label><input id="uploadgap_${esc(user)}" type="number" min="300" max="21600" value="${Number(s.upload_cooldown_seconds||1800)}"></div>
+        <div><label>Upload cooldown seconds (min 300)</label><input id="uploadgap_${esc(user)}" type="number" min="300" max="21600" value="${Number(s.upload_cooldown_seconds||1200)}"></div>
+        <div><label>Auto posts / rolling 24h (1-50)</label><input id="dailypostlimit_${esc(user)}" type="number" min="1" max="50" value="${Number(s.daily_post_limit||20)}"></div>
+        <div><label>Posts / active session (1-5)</label><input id="postspersession_${esc(user)}" type="number" min="1" max="5" value="${Number(s.max_posts_per_active_session||2)}"></div>
       </div>
 
       <label>Target accounts (comma/newline separated)</label>
@@ -17778,6 +18230,7 @@ function collectBehavior(user){
     engage_clips_per_pass:Number(document.getElementById(`engageclips_${user}`).value),
     engage_scroll_steps:Number(document.getElementById(`engagescrolls_${user}`).value),
     engage_like_percent:Number(document.getElementById(`engagelike_${user}`).value),
+    engage_save_percent:Number(document.getElementById(`engagesave_${user}`).value),
     engage_repost_percent:Number(document.getElementById(`engagerepost_${user}`).value),
     engage_comment_percent:Number(document.getElementById(`engagecomment_${user}`).value),
     engage_follow_percent:Number(document.getElementById(`engagefollow_${user}`).value),
@@ -17793,6 +18246,8 @@ function collectBehavior(user){
     write_window_seconds:Number(document.getElementById(`window_${user}`).value),
     write_min_gap_seconds:Number(document.getElementById(`writegap_${user}`).value),
     upload_cooldown_seconds:Number(document.getElementById(`uploadgap_${user}`).value),
+    daily_post_limit:Number(document.getElementById(`dailypostlimit_${user}`).value),
+    max_posts_per_active_session:Number(document.getElementById(`postspersession_${user}`).value),
     target_accounts:splitList(document.getElementById(`targets_${user}`).value),
     target_hashtags:splitList(document.getElementById(`tags_${user}`).value),
     persona_prompt:document.getElementById(`persona_${user}`).value,
@@ -18469,7 +18924,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reels Reliability Refactor: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reels + Auto Synergy Refactor: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
