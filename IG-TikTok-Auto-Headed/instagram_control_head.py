@@ -130,9 +130,109 @@ MEDIA_FOLDER_CACHE_SECONDS = max(10, int(os.environ.get("IG_MEDIA_FOLDER_CACHE_S
 AUTH_RETRY_AFTER = {}  # username -> datetime; prevents rapid login loops
 
 # One-account instances can keep DMs responsive without making posting/actions frequent.
-DM_POLL_SECONDS = max(60, int(os.environ.get("IG_DM_POLL_SECONDS", "90")))
+DM_POLL_SECONDS = max(300, int(os.environ.get("IG_DM_POLL_SECONDS", "1800")))
 WORKFLOW_SLEEP_MIN = max(DM_POLL_SECONDS, int(os.environ.get("IG_WORKFLOW_SLEEP_MIN", "420")))
 WORKFLOW_SLEEP_MAX = max(WORKFLOW_SLEEP_MIN, int(os.environ.get("IG_WORKFLOW_SLEEP_MAX", "1200")))
+
+AUTO_ACTIVE_REST_MIN_SECONDS = max(
+    120,
+    int(os.environ.get("IG_AUTO_ACTIVE_REST_MIN_SECONDS", "180")),
+)
+AUTO_ACTIVE_REST_MAX_SECONDS = max(
+    AUTO_ACTIVE_REST_MIN_SECONDS,
+    int(os.environ.get("IG_AUTO_ACTIVE_REST_MAX_SECONDS", "480")),
+)
+AUTO_LONG_REST_MIN_SECONDS = max(
+    900,
+    int(os.environ.get("IG_AUTO_LONG_REST_MIN_SECONDS", "2700")),
+)
+AUTO_LONG_REST_MAX_SECONDS = max(
+    AUTO_LONG_REST_MIN_SECONDS,
+    int(os.environ.get("IG_AUTO_LONG_REST_MAX_SECONDS", "10800")),
+)
+AUTO_PASSES_BEFORE_LONG_MIN = max(
+    2,
+    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MIN", "3")),
+)
+AUTO_PASSES_BEFORE_LONG_MAX = max(
+    AUTO_PASSES_BEFORE_LONG_MIN,
+    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MAX", "6")),
+)
+AUTO_FOLLOW_BATCH_MIN = max(
+    1,
+    min(5, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MIN", "1"))),
+)
+AUTO_FOLLOW_BATCH_MAX = max(
+    AUTO_FOLLOW_BATCH_MIN,
+    min(5, int(os.environ.get("IG_AUTO_FOLLOW_BATCH_MAX", "5"))),
+)
+
+
+AUTO_SUCCESS_PASSES = {}
+AUTO_LONG_BREAK_TARGET = {}
+
+BURST_UNTIL = {}
+LAST_BROWSER_DM_CHECK = {}
+NEXT_BROWSER_DM_CHECK = {}
+LAST_BROWSER_COMMENT_CHECK = {}
+NEXT_BROWSER_COMMENT_CHECK = {}
+
+ACTIVE_SESSION_MIN_SECONDS = max(
+    60,
+    int(os.environ.get("IG_ACTIVE_SESSION_MIN_SECONDS", "120")),
+)
+ACTIVE_SESSION_MAX_SECONDS = max(
+    ACTIVE_SESSION_MIN_SECONDS,
+    int(os.environ.get("IG_ACTIVE_SESSION_MAX_SECONDS", "300")),
+)
+BURST_SESSION_MIN_SECONDS = max(
+    90,
+    int(os.environ.get("IG_BURST_SESSION_MIN_SECONDS", "180")),
+)
+BURST_SESSION_MAX_SECONDS = max(
+    BURST_SESSION_MIN_SECONDS,
+    int(os.environ.get("IG_BURST_SESSION_MAX_SECONDS", "360")),
+)
+ACTIVE_BROWSE_GAP_MIN_SECONDS = max(
+    3,
+    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MIN_SECONDS", "5")),
+)
+ACTIVE_BROWSE_GAP_MAX_SECONDS = max(
+    ACTIVE_BROWSE_GAP_MIN_SECONDS,
+    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MAX_SECONDS", "12")),
+)
+OVERNIGHT_REST_MIN_SECONDS = max(
+    180,
+    int(os.environ.get("IG_OVERNIGHT_REST_MIN_SECONDS", "300")),
+)
+OVERNIGHT_REST_MAX_SECONDS = max(
+    OVERNIGHT_REST_MIN_SECONDS,
+    int(os.environ.get("IG_OVERNIGHT_REST_MAX_SECONDS", "720")),
+)
+OVERNIGHT_LONG_REST_MIN_SECONDS = max(
+    1800,
+    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MIN_SECONDS", "3600")),
+)
+OVERNIGHT_LONG_REST_MAX_SECONDS = max(
+    OVERNIGHT_LONG_REST_MIN_SECONDS,
+    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MAX_SECONDS", "14400")),
+)
+BROWSER_DM_CHECK_MIN_SECONDS = max(
+    900,
+    int(os.environ.get("IG_BROWSER_DM_CHECK_MIN_SECONDS", "2700")),
+)
+BROWSER_DM_CHECK_MAX_SECONDS = max(
+    BROWSER_DM_CHECK_MIN_SECONDS,
+    int(os.environ.get("IG_BROWSER_DM_CHECK_MAX_SECONDS", "7200")),
+)
+BROWSER_COMMENT_CHECK_MIN_SECONDS = max(
+    1200,
+    int(os.environ.get("IG_BROWSER_COMMENT_CHECK_MIN_SECONDS", "3600")),
+)
+BROWSER_COMMENT_CHECK_MAX_SECONDS = max(
+    BROWSER_COMMENT_CHECK_MIN_SECONDS,
+    int(os.environ.get("IG_BROWSER_COMMENT_CHECK_MAX_SECONDS", "10800")),
+)
 OLLAMA_MODEL = os.environ.get("IG_OLLAMA_MODEL", "llama3.1").strip() or "llama3.1"
 
 
@@ -671,6 +771,8 @@ def _default_control_settings(username, conf):
         "target_accounts": list(conf.get("competitor_accounts") or []),
         "follow_source": "both",
         "follow_limit": 2,
+        "auto_follow_batch_max": 5,
+        "pace_mode": "normal",
         "video_frames": 5,
         "require_video_vision": True,
 
@@ -746,6 +848,10 @@ def _sanitize_control_settings(username, conf, raw):
     if follow_source not in {"followers", "following", "both"}:
         follow_source = "both"
 
+    pace_mode = str(raw.get("pace_mode", base.get("pace_mode", "normal"))).strip().lower()
+    if pace_mode not in {"normal", "overnight"}:
+        pace_mode = "normal"
+
     def as_int(key, lo, hi):
         try:
             v = int(raw.get(key, base[key]))
@@ -789,6 +895,8 @@ def _sanitize_control_settings(username, conf, raw):
         ),
         "follow_source": follow_source,
         "follow_limit": as_int("follow_limit", 1, 20),
+        "auto_follow_batch_max": as_int("auto_follow_batch_max", 1, 5),
+        "pace_mode": pace_mode,
         "video_frames": as_int("video_frames", 3, 9),
         "require_video_vision": bool(raw.get("require_video_vision", base["require_video_vision"])),
 
@@ -2199,34 +2307,220 @@ def can_write_now(username, action_type="write"):
 
 
 
-def wait_for_write_slot(username, action_type="write", max_wait=180):
+def _shared_write_block_reason(username: str, action_type: str = "write") -> str:
+    allowed, reason = account_writes_allowed(username)
+    if not allowed:
+        return reason
+
+    fd = _acquire_shared_pacing_lock()
+    if fd is None:
+        return "shared pacing lock busy"
+
+    try:
+        data = _load_shared_pacing()
+        now = time.time()
+        settings = get_account_control_settings(username)
+        window = int(settings["write_window_seconds"])
+        max_window = int(settings["max_writes_per_window"])
+        account_gap = int(settings["write_min_gap_seconds"])
+        upload_gap = int(settings["upload_cooldown_seconds"])
+
+        row = data.setdefault("accounts", {}).setdefault(
+            username,
+            {
+                "writes": [],
+                "last_write": 0.0,
+                "last_upload": 0.0,
+                "pending_upload_until": 0.0,
+            },
+        )
+
+        cutoff = now - window
+        writes = [
+            float(t)
+            for t in row.get("writes", [])
+            if isinstance(t, (int, float)) and float(t) >= cutoff
+        ]
+
+        if len(writes) >= max_window:
+            wait = int(max(1, writes[0] + window - now))
+            return f"shared rolling budget; retry in ~{wait}s"
+
+        last_write = float(row.get("last_write") or 0.0)
+        if now - last_write < account_gap:
+            wait = int(max(1, account_gap - (now - last_write)))
+            return f"shared account gap; retry in ~{wait}s"
+
+        global_last = float(data.get("global_last") or 0.0)
+        if now - global_last < GLOBAL_WRITE_MIN_GAP_SECONDS:
+            wait = int(max(1, GLOBAL_WRITE_MIN_GAP_SECONDS - (now - global_last)))
+            return f"shared multi-process gap; retry in ~{wait}s"
+
+        if action_type == "upload":
+            pending_until = float(row.get("pending_upload_until") or 0.0)
+            if pending_until > now:
+                wait = int(max(1, pending_until - now))
+                return f"upload attempt already in progress; retry in ~{wait}s"
+
+            last_upload = float(row.get("last_upload") or 0.0)
+            if now - last_upload < upload_gap:
+                wait = int(max(1, upload_gap - (now - last_upload)))
+                return f"shared upload cooldown; retry in ~{wait}s"
+
+        return ""
+    finally:
+        _release_shared_pacing_lock(fd)
+
+
+def _control_clear_upload_cooldown(username: str):
+    username = str(username or "").strip().lstrip("@")
+    if username not in CONTROL_ROSTER:
+        raise ValueError(f"Unknown account @{username}")
+
+    fd = _acquire_shared_pacing_lock()
+    if fd is None:
+        raise RuntimeError("Shared pacing file is busy; try again.")
+
+    try:
+        data = _load_shared_pacing()
+        row = data.setdefault("accounts", {}).setdefault(username, {})
+        previous = float(row.get("last_upload") or 0.0)
+        row["last_upload"] = 0.0
+        row["pending_upload_until"] = 0.0
+        _save_shared_pacing(data)
+    finally:
+        _release_shared_pacing_lock(fd)
+
+    ACCOUNT_LAST_UPLOAD.pop(username, None)
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🧹 Upload cooldown cleared manually. Safety backoffs, generic "
+            "write history, follows, likes, and login state were left intact."
+        ),
+    )
+
+    return {"ok": True, "username": username, "previous_last_upload": previous}
+
+
+def _quick_reopen_live_browser(username: str) -> tuple[bool, str]:
+    if sync_playwright is None:
+        return False, "Playwright is unavailable"
+
+    try:
+        with sync_playwright() as p:
+            browser, context = _browser_launch_live_process(
+                p,
+                username,
+                force_fresh_visible=False,
+            )
+
+            page = context.pages[0] if context.pages else context.new_page()
+
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+            try:
+                if "instagram.com" not in str(page.url or "").lower():
+                    page.goto(
+                        "https://www.instagram.com/",
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    page.wait_for_timeout(700)
+            except Exception:
+                pass
+
+            try:
+                _browser_safe_recover_page(
+                    page,
+                    context,
+                    username,
+                    reason="Quick Login browser recovery",
+                    max_steps=3,
+                )
+            except Exception:
+                pass
+
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if _browser_page_authenticated(page, username):
+                    try:
+                        _browser_refresh_saved_sessionid(context, username)
+                    except Exception:
+                        pass
+                    LIVE_CDP_CONTEXT_IDS.discard(id(context))
+                    BROWSER_HANDLE_BY_CONTEXT.pop(id(context), None)
+                    return True, "authenticated live Chromium reopened"
+
+                problem = _browser_page_problem(page)
+                if problem:
+                    LIVE_CDP_CONTEXT_IDS.discard(id(context))
+                    BROWSER_HANDLE_BY_CONTEXT.pop(id(context), None)
+                    return False, f"manual attention required: {problem}"
+
+                page.wait_for_timeout(500)
+
+            LIVE_CDP_CONTEXT_IDS.discard(id(context))
+            BROWSER_HANDLE_BY_CONTEXT.pop(id(context), None)
+            return False, "Instagram did not reach the authenticated shell within 15s"
+
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:180]}"
+
+def wait_for_write_slot(
+    username,
+    action_type="write",
+    max_wait=180,
+    *,
+    fail_fast=False,
+):
     start = time.monotonic()
     last_reason = ""
 
-    while time.monotonic() - start < max_wait:
+    while True:
         allowed, reason = account_writes_allowed(username)
         if not allowed:
             update_account_metric(
-                username, "add_history",
-                value=f"🛡️ {action_type} blocked: {reason}"
+                username,
+                "add_history",
+                value=f"🛡️ {action_type} blocked: {reason}",
             )
             return False
 
         ok, reason = _reserve_shared_write_slot(username, action_type)
         if ok:
             return True
+
         last_reason = reason
+
+        if fail_fast:
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"⏳ Deferred {action_type}: {last_reason or 'shared pacing budget'}",
+            )
+            return False
 
         if "Safety Backoff" in reason or "Account cooldown" in reason:
             break
+
+        if time.monotonic() - start >= max_wait:
+            break
+
         time.sleep(2.0)
 
     update_account_metric(
         username,
         "add_history",
-        value=f"⏳ Deferred {action_type}: {last_reason or 'shared pacing budget'}"
+        value=f"⏳ Deferred {action_type}: {last_reason or 'shared pacing budget'}",
     )
     return False
+
 
 
 
@@ -3895,6 +4189,11 @@ def _browser_page_problem(page) -> str:
         "help us confirm you own this account",
         "suspicious login attempt",
         "challenge required",
+        "account compromised",
+        "your account has been compromised",
+        "we noticed unusual activity",
+        "unusual activity",
+        "secure your account",
         "try again later",
         "we restrict certain activity",
         "your account has been temporarily",
@@ -5415,22 +5714,75 @@ def _browser_verify_follow_profile(
                 pass
 
 
-def _browser_wait_for_follow_confirmation(
+def _browser_pause_for_manual_security(username: str, reason: str) -> None:
+    """
+    Pause automation on security/restriction UI without trying to bypass it.
+
+    The live Chromium window is intentionally left open so the user can inspect
+    and complete any legitimate Instagram security step manually.
+    """
+    username = str(username or "").strip().lstrip("@")
+    CONTROL_PAUSED_ACCOUNTS.add(username)
+    CONTROL_FORCE_RUN.discard(username)
+    NEXT_TASK_OVERRIDE.pop(username, None)
+
+    update_account_metric(
+        username,
+        "status",
+        status="Browser Verification Needed",
+    )
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🛑 Browser automation paused for manual Instagram security "
+            f"attention: {str(reason or 'security prompt')[:180]}. "
+            "No further follow clicks will be attempted."
+        ),
+    )
+
+
+def _browser_visible_follow_dwell(
     page,
-    context,
+    username: str,
+    seconds: float,
+) -> str:
+    """
+    Keep the headed browser visibly stable while polling for security UI.
+
+    Returns a problem string when Instagram presents a security/restriction
+    message; otherwise returns an empty string.
+    """
+    deadline = time.time() + max(0.0, float(seconds))
+
+    while time.time() < deadline:
+        problem = _browser_page_problem(page)
+        if problem:
+            return problem
+        page.wait_for_timeout(350)
+
+    return _browser_page_problem(page)
+
+
+def _browser_wait_for_follow_confirmation_in_place(
+    page,
     root,
     candidate_name: str,
+    timeout_seconds: int | None = None,
 ) -> tuple[bool | None, str]:
     """
-    Verify a Follow by re-querying the LIVE row instead of reading the stale
-    Locator that was clicked before Instagram rerendered.
+    Verify Follow only from the SAME Followers/Following dialog row.
 
-    Returns:
-      True  -> Following / Requested confirmed
-      False -> both popup and profile explicitly still show Follow
-      None  -> ambiguous; not counted as success or failure
+    No profile navigation, no extra tabs, no refresh, and no alternate
+    relationship-menu clicks. This keeps the browser visibly stable.
     """
-    deadline = time.time() + BROWSER_FOLLOW_VERIFY_SECONDS
+    timeout_seconds = (
+        BROWSER_FOLLOW_VERIFY_SECONDS
+        if timeout_seconds is None
+        else max(2, int(timeout_seconds))
+    )
+
+    deadline = time.time() + timeout_seconds
     last_state = "ambiguous"
     last_detail = ""
 
@@ -5445,27 +5797,971 @@ def _browser_wait_for_follow_confirmation(
         if state in {"following", "requested"}:
             return True, detail
 
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(500)
 
-    profile_ok, profile_detail = _browser_verify_follow_profile(
-        context,
+    if last_state == "follow":
+        return False, last_detail or "Follow"
+
+    return None, last_detail or last_state
+
+def _browser_wait_for_follow_confirmation(
+    page,
+    context,
+    root,
+    candidate_name: str,
+) -> tuple[bool | None, str]:
+    """
+    Compatibility wrapper for visible in-place verification.
+
+    The old secondary profile-navigation verifier is intentionally not used.
+    """
+    return _browser_wait_for_follow_confirmation_in_place(
+        page,
+        root,
         candidate_name,
-        timeout_seconds=6,
+        timeout_seconds=BROWSER_FOLLOW_VERIFY_SECONDS,
     )
 
-    if profile_ok is True:
-        return True, f"profile:{profile_detail}"
 
-    if profile_ok is False and last_state == "follow":
-        return False, (
-            f"popup:{last_detail or 'Follow'}; "
-            f"profile:{profile_detail or 'Follow'}"
+def _browser_dialog_text(dialog) -> str:
+    try:
+        return re.sub(
+            r"\s+",
+            " ",
+            dialog.inner_text(timeout=1200) or "",
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _browser_is_profile_action_menu(dialog) -> bool:
+    text = _browser_dialog_text(dialog).lower()
+    if not text:
+        return False
+
+    markers = (
+        "add to close friends",
+        "add to favorites",
+        "remove from favorites",
+        "mute",
+        "restrict",
+        "unfollow",
+        "about this account",
+    )
+    return sum(marker in text for marker in markers) >= 2
+
+
+def _browser_close_wrong_profile_menu(page, dialog) -> None:
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(250)
+    except Exception:
+        pass
+
+    try:
+        if dialog.count() and dialog.is_visible(timeout=200):
+            close_svg = dialog.locator("svg[aria-label='Close']").first
+            if close_svg.count() and close_svg.is_visible(timeout=200):
+                _browser_clickable_from_svg(close_svg).click(timeout=1500)
+                page.wait_for_timeout(250)
+    except Exception:
+        pass
+
+
+def _browser_network_dialog_valid(dialog, target: str, source: str) -> tuple[bool, str]:
+    if not dialog.count():
+        return False, "no dialog"
+
+    try:
+        if not dialog.is_visible(timeout=500):
+            return False, "dialog not visible"
+    except Exception:
+        return False, "dialog visibility check failed"
+
+    if _browser_is_profile_action_menu(dialog):
+        return False, "profile action menu"
+
+    text = _browser_dialog_text(dialog).lower()
+
+    try:
+        hrefs = dialog.locator("a[href^='/']").evaluate_all(
+            """els => els.map(e => e.getAttribute('href') || '')"""
+        )
+    except Exception:
+        hrefs = []
+
+    usernames = set()
+    for href in hrefs:
+        match = re.fullmatch(r"/([^/?#]+)/?", str(href))
+        if not match:
+            continue
+        candidate = match.group(1).lower()
+        if candidate not in {
+            "accounts", "explore", "reels", "direct",
+            str(target).lower(),
+        }:
+            usernames.add(candidate)
+
+    if usernames:
+        return True, f"people list with {len(usernames)} profile link(s)"
+
+    if source.lower() in text:
+        return True, f"{source} dialog title detected"
+
+    return False, "dialog does not look like a people list"
+
+
+def _browser_stat_text_matches(value: str, source: str) -> bool:
+    """
+    Match only profile-stat style labels such as:
+      1,234 followers
+      82 following
+      1.2K followers
+
+    A bare relationship button reading only "Following" can never match.
+    """
+    value = re.sub(
+        r"\s+",
+        " ",
+        str(value or "").strip(),
+    )
+
+    source = str(source or "").strip().lower()
+
+    if source not in {"followers", "following"}:
+        return False
+
+    pattern = rf"^[0-9][0-9,.\s]*[KMBkmb]?\s+{re.escape(source)}$"
+    return bool(re.fullmatch(pattern, value, re.I))
+
+
+def _browser_profile_stat_triggers(page, target: str, source: str):
+    """
+    Return safely verified Followers/Following stat controls.
+
+    Priority:
+      1. exact /<target>/<source> href
+      2. numeric profile-header stat controls such as "82 following"
+
+    Never returns a bare "Following" relationship button.
+    """
+    target = str(target or "").strip().lstrip("@")
+    source = str(source or "").strip().lower()
+    expected = f"/{target}/{source}".lower()
+
+    matches = []
+    seen = set()
+
+    def _add(locator):
+        try:
+            key = locator.evaluate(
+                """el => {
+                    const r = el.getBoundingClientRect();
+                    return [
+                        el.tagName,
+                        el.getAttribute('href') || '',
+                        el.getAttribute('aria-label') || '',
+                        (el.innerText || el.textContent || '').trim(),
+                        Math.round(r.x), Math.round(r.y),
+                        Math.round(r.width), Math.round(r.height)
+                    ].join('|');
+                }"""
+            )
+        except Exception:
+            key = f"locator:{len(matches)}"
+
+        if key in seen:
+            return
+
+        try:
+            if locator.is_visible(timeout=150):
+                seen.add(key)
+                matches.append(locator)
+        except Exception:
+            pass
+
+    # 1) Exact href match.
+    try:
+        anchors = page.locator("a[href]")
+        for i in range(min(anchors.count(), 300)):
+            anchor = anchors.nth(i)
+
+            try:
+                href = str(anchor.get_attribute("href") or "")
+            except Exception:
+                continue
+
+            normalized = (
+                href.split("?", 1)[0]
+                .split("#", 1)[0]
+                .rstrip("/")
+                .lower()
+            )
+
+            if normalized == expected:
+                _add(anchor)
+    except Exception:
+        pass
+
+    # 2) Current Instagram layouts can render profile stats as buttons/divs
+    # without a useful href. Restrict fallback to header/main controls that
+    # contain a NUMERIC count plus the exact source word.
+    selectors = (
+        "header a, header button, header [role='button'], header li",
+        "main header a, main header button, main header [role='button'], main header li",
+        "main a, main button, main [role='button']",
+    )
+
+    for selector in selectors:
+        try:
+            candidates = page.locator(selector)
+            for i in range(min(candidates.count(), 220)):
+                candidate = candidates.nth(i)
+
+                try:
+                    visible = candidate.is_visible(timeout=100)
+                except Exception:
+                    visible = False
+
+                if not visible:
+                    continue
+
+                try:
+                    inner = str(candidate.inner_text(timeout=250) or "").strip()
+                except Exception:
+                    inner = ""
+
+                try:
+                    aria = str(candidate.get_attribute("aria-label") or "").strip()
+                except Exception:
+                    aria = ""
+
+                try:
+                    title = str(candidate.get_attribute("title") or "").strip()
+                except Exception:
+                    title = ""
+
+                values = (inner, aria, title)
+
+                if any(
+                    _browser_stat_text_matches(value, source)
+                    for value in values
+                ):
+                    _add(candidate)
+        except Exception:
+            pass
+
+    return matches
+
+
+def _browser_try_direct_network_route(
+    page,
+    username: str,
+    target: str,
+    source: str,
+):
+    """
+    Safe fallback: navigate directly to Instagram's normal profile network route
+    and accept it only if a validated people-list dialog appears.
+    """
+    target = str(target or "").strip().lstrip("@")
+    source = str(source or "").strip().lower()
+
+    route = f"https://www.instagram.com/{target}/{source}/"
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🧭 Browser Follow: no usable clickable {source} stat was exposed; "
+            f"trying Instagram's direct /{target}/{source}/ route..."
+        ),
+    )
+
+    try:
+        page.goto(
+            route,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+    except Exception:
+        pass
+
+    deadline = time.time() + 10
+
+    while time.time() < deadline:
+        page.wait_for_timeout(350)
+
+        try:
+            _browser_check_ready(
+                page,
+                page.context,
+                username,
+            )
+        except Exception:
+            # Do not mask a normal dialog just because route navigation is
+            # mid-transition. The caller will validate the dialog strictly.
+            pass
+
+        dialogs = page.locator("[role='dialog']")
+        if dialogs.count():
+            dialog = dialogs.last
+
+            valid, reason = _browser_network_dialog_valid(
+                dialog,
+                target,
+                source,
+            )
+
+            if valid:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"✅ Direct route opened @{target}'s {source} "
+                        f"people list ({reason})."
+                    ),
+                )
+                return dialog
+
+            if reason == "profile action menu":
+                _browser_close_wrong_profile_menu(
+                    page,
+                    dialog,
+                )
+                return None
+
+        # Some layouts render the people list as the main page rather than a
+        # formal role=dialog. Require several profile links plus the source word.
+        try:
+            body = re.sub(
+                r"\s+",
+                " ",
+                page.locator("body").inner_text(timeout=600) or "",
+            ).lower()
+        except Exception:
+            body = ""
+
+        if source in body:
+            try:
+                hrefs = page.locator(
+                    "main a[href^='/']"
+                ).evaluate_all(
+                    """els => els.map(e => e.getAttribute('href') || '')"""
+                )
+            except Exception:
+                hrefs = []
+
+            usernames = set()
+            for href in hrefs:
+                match = re.fullmatch(
+                    r"/([^/?#]+)/?",
+                    str(href),
+                )
+                if not match:
+                    continue
+
+                candidate = match.group(1).lower()
+
+                if candidate not in {
+                    target.lower(),
+                    "accounts",
+                    "explore",
+                    "reels",
+                    "direct",
+                }:
+                    usernames.add(candidate)
+
+            if len(usernames) >= 3:
+                root = page.locator("main").first
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"✅ Direct route opened @{target}'s {source} "
+                        f"network page with {len(usernames)} profile link(s)."
+                    ),
+                )
+                return root
+
+    return None
+
+def _browser_profile_stat_links(page, target: str, source: str):
+    """
+    Compatibility wrapper retained for existing callers.
+
+    The implementation now returns exact href matches OR numeric stat controls
+    such as "82 following", never a bare relationship button.
+    """
+    return _browser_profile_stat_triggers(
+        page,
+        target,
+        source,
+    )
+
+
+
+def _browser_open_network_list(page, username: str, target: str, source: str):
+    """
+    Open and validate the exact Followers/Following people list.
+
+    Safe strategies:
+      1. exact stat href
+      2. numeric profile-stat control ("82 following")
+      3. direct /<target>/<source>/ route
+
+    Never clicks a bare "Following" relationship button.
+    """
+    target = str(target or "").strip().lstrip("@")
+    source = str(source or "").strip().lower()
+
+    triggers = _browser_profile_stat_triggers(
+        page,
+        target,
+        source,
+    )
+
+    last_reason = ""
+
+    if triggers:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🔎 Browser Follow found {len(triggers)} verified "
+                f"{source} stat trigger(s) for @{target}."
+            ),
         )
 
-    return None, (
-        f"popup:{last_detail or last_state}; "
-        f"profile:{profile_detail or 'ambiguous'}"
+    for trigger in triggers[:4]:
+        try:
+            trigger.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+        try:
+            trigger.click(timeout=5000)
+        except Exception:
+            try:
+                trigger.evaluate("(el) => el.click()")
+            except Exception as exc:
+                last_reason = f"click failed: {type(exc).__name__}"
+                continue
+
+        deadline = time.time() + 8
+
+        while time.time() < deadline:
+            page.wait_for_timeout(350)
+
+            dialogs = page.locator("[role='dialog']")
+            if not dialogs.count():
+                continue
+
+            dialog = dialogs.last
+
+            valid, reason = _browser_network_dialog_valid(
+                dialog,
+                target,
+                source,
+            )
+
+            if valid:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"✅ Opened @{target}'s {source} people list "
+                        f"({reason})."
+                    ),
+                )
+                return dialog
+
+            last_reason = reason
+
+            if reason == "profile action menu":
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "⚠️ Instagram opened the relationship menu "
+                        "(Mute/Restrict/Unfollow) instead of the people list; "
+                        "closing it."
+                    ),
+                )
+                _browser_close_wrong_profile_menu(
+                    page,
+                    dialog,
+                )
+                break
+
+    # The direct route is preferable to any broad text/button fallback.
+    direct_root = _browser_try_direct_network_route(
+        page,
+        username,
+        target,
+        source,
     )
+
+    if direct_root is not None:
+        return direct_root
+
+    _browser_follow_debug_snapshot(
+        page,
+        username,
+        f"missing_or_invalid_{source}_network_list",
+    )
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"⚠️ Browser Follow could not open @{target}'s {source} people "
+            "list using exact href, numeric stat, or direct route. "
+            "No generic Following-button click was attempted."
+        ),
+    )
+
+    raise RuntimeError(
+        f"Could not open @{target}'s verified {source} people list "
+        f"({last_reason or 'Instagram layout did not expose a valid list'})."
+    )
+
+
+def _browser_visible_profile_header_text(page) -> str:
+    for selector in ("main header", "header", "main"):
+        try:
+            loc = page.locator(selector).first
+            if loc.count() and loc.is_visible(timeout=250):
+                body = re.sub(
+                    r"\s+",
+                    " ",
+                    loc.inner_text(timeout=900) or "",
+                ).strip()
+                if body:
+                    return body[:700]
+        except Exception:
+            pass
+    return ""
+
+
+def _browser_click_profile_stat_in_place(
+    page,
+    target: str,
+    source: str,
+) -> tuple[bool, str]:
+    """
+    Stay on the target profile and click only a real numeric Followers/Following
+    stat. Bare relationship buttons such as "Following" are rejected.
+    """
+    target = str(target or "").strip().lstrip("@")
+    source = str(source or "").strip().lower()
+
+    if source not in {"followers", "following"}:
+        return False, "unsupported source"
+
+    expected = f"/{target}/{source}".lower()
+
+    # Exact profile-stat href, when present.
+    try:
+        anchors = page.locator("a[href]")
+        for i in range(min(anchors.count(), 300)):
+            anchor = anchors.nth(i)
+            try:
+                href = str(anchor.get_attribute("href") or "")
+            except Exception:
+                continue
+
+            normalized = (
+                href.split("?", 1)[0]
+                .split("#", 1)[0]
+                .rstrip("/")
+                .lower()
+            )
+
+            if normalized != expected:
+                continue
+
+            try:
+                if not anchor.is_visible(timeout=120):
+                    continue
+            except Exception:
+                continue
+
+            try:
+                label = re.sub(
+                    r"\s+",
+                    " ",
+                    anchor.inner_text(timeout=300) or "",
+                ).strip()
+            except Exception:
+                label = source
+
+            anchor.click(timeout=5000)
+            return True, f"exact href stat ({label})"
+    except Exception:
+        pass
+
+    # Current Instagram layouts sometimes expose stats without useful hrefs.
+    # Search only visible profile-header/main controls and require a numeric
+    # count + the exact requested word in the same small clickable container.
+    try:
+        result = page.evaluate(
+            """
+            ({source}) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                       s.visibility !== 'hidden' &&
+                       s.display !== 'none';
+              };
+
+              const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+
+              const numericSource = (txt) => {
+                const t = clean(txt);
+                const re = new RegExp(
+                  '(?:^|\\\\s)(?:\\\\d[\\\\d,.]*|\\\\d+(?:\\\\.\\\\d+)?[KMBkmb])\\\\s+' +
+                  source + '(?:\\\\s|$)',
+                  'i'
+                );
+                return re.test(t);
+              };
+
+              const roots = [
+                document.querySelector('main header'),
+                document.querySelector('header'),
+                document.querySelector('main')
+              ].filter(Boolean);
+
+              for (const root of roots) {
+                const nodes = root.querySelectorAll(
+                  'a, button, [role="button"], li, span, div'
+                );
+
+                for (const node of nodes) {
+                  if (!visible(node)) continue;
+
+                  const own = clean(
+                    node.getAttribute('aria-label') ||
+                    node.getAttribute('title') ||
+                    node.innerText ||
+                    node.textContent
+                  );
+
+                  if (!own.toLowerCase().includes(source)) continue;
+
+                  let cur = node;
+                  for (let depth = 0; depth < 5 && cur; depth++, cur = cur.parentElement) {
+                    if (!visible(cur)) continue;
+
+                    const txt = clean(
+                      cur.getAttribute('aria-label') ||
+                      cur.getAttribute('title') ||
+                      cur.innerText ||
+                      cur.textContent
+                    );
+
+                    if (!numericSource(txt)) continue;
+
+                    const clickable = (
+                      cur.tagName === 'A' ||
+                      cur.tagName === 'BUTTON' ||
+                      cur.getAttribute('role') === 'button' ||
+                      typeof cur.onclick === 'function' ||
+                      getComputedStyle(cur).cursor === 'pointer'
+                    );
+
+                    if (!clickable) continue;
+
+                    const r = cur.getBoundingClientRect();
+
+                    // Reject giant layout containers.
+                    if (r.width > window.innerWidth * 0.8 ||
+                        r.height > window.innerHeight * 0.35) {
+                      continue;
+                    }
+
+                    cur.click();
+                    return {
+                      clicked: true,
+                      text: txt.slice(0, 180),
+                      tag: cur.tagName
+                    };
+                  }
+                }
+              }
+
+              return {clicked: false};
+            }
+            """,
+            {"source": source},
+        )
+    except Exception as exc:
+        return False, f"DOM stat search error: {type(exc).__name__}"
+
+    if isinstance(result, dict) and result.get("clicked"):
+        return True, f"numeric header stat ({result.get('text') or source})"
+
+    return False, "no numeric profile-header stat control found"
+
+
+def _browser_open_network_list_stable(
+    page,
+    username: str,
+    target: str,
+    source: str,
+):
+    """
+    Manual networking opener that never route-hops.
+
+    It clicks one in-place profile stat once and then waits for exactly one
+    validated people-list dialog.
+    """
+    header = _browser_visible_profile_header_text(page)
+    if header:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"👁️ Browser Follow target header: {header[:260]}",
+        )
+
+    clicked, detail = _browser_click_profile_stat_in_place(
+        page,
+        target,
+        source,
+    )
+
+    if not clicked:
+        _browser_follow_debug_snapshot(
+            page,
+            username,
+            f"stable_missing_{source}_stat",
+        )
+        raise RuntimeError(
+            f"Could not locate a visible numeric {source} stat on "
+            f"@{target}'s profile ({detail})."
+        )
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"👆 Clicked @{target}'s {source} stat once: {detail}. "
+            "Waiting in place for the people-list popup."
+        ),
+    )
+
+    deadline = time.time() + 10
+
+    while time.time() < deadline:
+        page.wait_for_timeout(350)
+
+        problem = _browser_page_problem(page)
+        if problem:
+            _browser_pause_for_manual_security(username, problem)
+            raise RuntimeError(
+                f"Instagram requires manual attention: {problem}"
+            )
+
+        dialogs = page.locator("[role='dialog']")
+        if not dialogs.count():
+            continue
+
+        dialog = dialogs.last
+        valid, reason = _browser_network_dialog_valid(
+            dialog,
+            target,
+            source,
+        )
+
+        if valid:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"✅ Opened @{target}'s {source} people list "
+                    f"without leaving the target profile ({reason})."
+                ),
+            )
+            return dialog
+
+        if reason == "profile action menu":
+            _browser_close_wrong_profile_menu(page, dialog)
+            raise RuntimeError(
+                "Instagram opened the relationship menu instead of the "
+                f"{source} people list; stopped without retrying."
+            )
+
+    _browser_follow_debug_snapshot(
+        page,
+        username,
+        f"stable_no_{source}_dialog",
+    )
+
+    raise RuntimeError(
+        f"Clicked @{target}'s {source} stat, but Instagram did not open "
+        "a valid people-list popup within 10s."
+    )
+
+def _reserve_browser_follow_slot(username: str) -> tuple[bool, str]:
+    """
+    Reserve one Browser Follow attempt against the rolling write budget.
+
+    Browser Follow uses BROWSER_FOLLOW_MIN_GAP_SECONDS for its local cadence,
+    but still respects:
+      * safety backoff
+      * configured rolling writes/window
+      * cross-process global minimum gap
+
+    The attempt consumes a rolling-budget slot even if Instagram later leaves
+    the relationship state ambiguous.
+    """
+    allowed, reason = account_writes_allowed(username)
+    if not allowed:
+        return False, reason
+
+    fd = _acquire_shared_pacing_lock()
+    if fd is None:
+        return False, "shared pacing lock busy"
+
+    try:
+        data = _load_shared_pacing()
+        now = time.time()
+        settings = get_account_control_settings(username)
+        window = int(settings["write_window_seconds"])
+        max_window = int(settings["max_writes_per_window"])
+
+        accounts = data.setdefault("accounts", {})
+        row = accounts.setdefault(
+            username,
+            {
+                "writes": [],
+                "last_write": 0.0,
+                "last_upload": 0.0,
+                "pending_upload_until": 0.0,
+            },
+        )
+
+        cutoff = now - window
+        row["writes"] = [
+            float(t)
+            for t in row.get("writes", [])
+            if isinstance(t, (int, float)) and float(t) >= cutoff
+        ]
+
+        if len(row["writes"]) >= max_window:
+            wait = int(max(1, row["writes"][0] + window - now))
+            return False, f"rolling write budget; retry in ~{wait}s"
+
+        global_last = float(data.get("global_last") or 0.0)
+        if now - global_last < GLOBAL_WRITE_MIN_GAP_SECONDS:
+            wait = int(max(1, GLOBAL_WRITE_MIN_GAP_SECONDS - (now - global_last)))
+            return False, f"shared global gap; retry in ~{wait}s"
+
+        row["writes"].append(now)
+        row["last_write"] = now
+        data["global_last"] = now
+        _save_shared_pacing(data)
+
+        return True, ""
+    finally:
+        _release_shared_pacing_lock(fd)
+
+
+def _next_overnight_auto_delay(
+    username: str,
+    result: str,
+    *,
+    manual_run: bool = False,
+) -> tuple[int, str]:
+    if result != "ran":
+        if result in {"disconnected", "paused"}:
+            return max(WORKFLOW_RETRY_IDLE_SECONDS, 300), "idle/disconnected"
+        return WORKFLOW_RETRY_IDLE_SECONDS, "retry"
+
+    if manual_run:
+        return random.randint(60, 150), "short rest after manual action"
+
+    pace_mode = _runtime_pace_mode(username)
+
+    if pace_mode == "burst":
+        # Burst Now is temporary. After the active worker finishes, retire the
+        # request and return to the account's persisted mode.
+        BURST_UNTIL.pop(username, None)
+        persisted = get_account_control_settings(username).get(
+            "pace_mode",
+            "normal",
+        )
+        if persisted == "overnight":
+            delay = random.randint(
+                OVERNIGHT_REST_MIN_SECONDS,
+                OVERNIGHT_REST_MAX_SECONDS,
+            )
+            return delay, "post-burst overnight rest"
+        return random.randint(120, 300), "post-burst rest"
+
+    if pace_mode == "overnight":
+        count = int(AUTO_SUCCESS_PASSES.get(username, 0) or 0) + 1
+        target = int(
+            AUTO_LONG_BREAK_TARGET.get(username, 0)
+            or random.randint(
+                AUTO_PASSES_BEFORE_LONG_MIN,
+                AUTO_PASSES_BEFORE_LONG_MAX,
+            )
+        )
+        AUTO_SUCCESS_PASSES[username] = count
+        AUTO_LONG_BREAK_TARGET[username] = target
+
+        if count >= target:
+            delay = random.randint(
+                OVERNIGHT_LONG_REST_MIN_SECONDS,
+                OVERNIGHT_LONG_REST_MAX_SECONDS,
+            )
+            AUTO_SUCCESS_PASSES[username] = 0
+            AUTO_LONG_BREAK_TARGET[username] = random.randint(
+                AUTO_PASSES_BEFORE_LONG_MIN,
+                AUTO_PASSES_BEFORE_LONG_MAX,
+            )
+            return delay, "scheduled long overnight rest"
+
+        delay = random.randint(
+            OVERNIGHT_REST_MIN_SECONDS,
+            OVERNIGHT_REST_MAX_SECONDS,
+        )
+        return delay, f"overnight rest ({count}/{target} active sessions before long rest)"
+
+    # Normal pace retains the quieter single-pass cadence.
+    count = int(AUTO_SUCCESS_PASSES.get(username, 0) or 0) + 1
+    target = int(
+        AUTO_LONG_BREAK_TARGET.get(username, 0)
+        or random.randint(
+            AUTO_PASSES_BEFORE_LONG_MIN,
+            AUTO_PASSES_BEFORE_LONG_MAX,
+        )
+    )
+    AUTO_SUCCESS_PASSES[username] = count
+    AUTO_LONG_BREAK_TARGET[username] = target
+
+    if count >= target:
+        delay = random.randint(
+            AUTO_LONG_REST_MIN_SECONDS,
+            AUTO_LONG_REST_MAX_SECONDS,
+        )
+        AUTO_SUCCESS_PASSES[username] = 0
+        AUTO_LONG_BREAK_TARGET[username] = random.randint(
+            AUTO_PASSES_BEFORE_LONG_MIN,
+            AUTO_PASSES_BEFORE_LONG_MAX,
+        )
+        return delay, "normal scheduled long rest"
+
+    delay = random.randint(
+        AUTO_ACTIVE_REST_MIN_SECONDS,
+        AUTO_ACTIVE_REST_MAX_SECONDS,
+    )
+    return delay, f"normal rest ({count}/{target} passes before long rest)"
+
 
 def _browser_follow_network(username, history, config, manual=False) -> int:
     settings = get_account_control_settings(username, config)
@@ -5488,21 +6784,35 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
     if source == "both":
         source = random.choice(["followers", "following"])
 
-    limit = min(
+    configured_limit = max(
+        1,
         int(settings.get("follow_limit", 1)),
-        int(settings.get(
-            "max_writes_per_workflow",
-            MAX_WRITES_PER_WORKFLOW,
-        )),
     )
-    limit = max(1, limit)
+
+    if manual:
+        # Manual Network stays one visible action per dashboard click.
+        limit = 1
+    else:
+        # Auto works in a bounded batch while the verified people-list popup
+        # is already open. The batch target varies from 1..N, with N capped at 5.
+        auto_cap = max(
+            1,
+            min(
+                AUTO_FOLLOW_BATCH_MAX,
+                int(settings.get("auto_follow_batch_max", AUTO_FOLLOW_BATCH_MAX)),
+                5,
+            ),
+        )
+        limit = random.randint(AUTO_FOLLOW_BATCH_MIN, auto_cap)
 
     update_account_metric(
         username,
         "add_history",
         value=(
             f"🌐 Browser Follow: @{target} {source}; "
-            f"hard request cap={limit}; "
+            f"batch target={limit}; "
+            f"mode={'visible-manual' if manual else 'visible-auto'}; "
+            f"visible rows only; no list refresh/scroll; "
             f"browser gap≈{BROWSER_FOLLOW_MIN_GAP_SECONDS}s"
         ),
     )
@@ -5525,36 +6835,44 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
-            page.wait_for_timeout(1200)
-            _browser_check_ready(page, context, username)
+            page.wait_for_timeout(1400)
 
-            href = f"/{target}/{source}/"
-            trigger = page.locator(f"a[href='{href}']").first
-            if not trigger.count():
-                trigger = page.locator(
-                    f"a[href*='/{target}/{source}/']"
-                ).first
-
-            if trigger.count():
-                trigger.click(timeout=5000)
-            elif not _browser_click_text_button(
-                page,
-                rf"^{source}$",
-            ):
-                raise RuntimeError(
-                    f"Could not open @{target}'s {source} list."
+            # Recover the normal saved-profile chooser at most once, then
+            # return to the requested target profile once.
+            if _browser_saved_account_resume_visible(page, username):
+                _browser_resume_saved_account(
+                    page,
+                    context,
+                    username,
                 )
+                page.goto(
+                    f"https://www.instagram.com/{target}/",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(1400)
 
-            page.wait_for_timeout(1100)
             _browser_check_ready(page, context, username)
 
-            dialog = page.locator("[role='dialog']").last
-            root = dialog if dialog.count() else page
+            # Manual and Auto both use the stable in-place profile-header
+            # opener. No direct /followers/ route hopping or list refreshes.
+            dialog = _browser_open_network_list_stable(
+                page,
+                username,
+                target,
+                source,
+            )
+
+            page.wait_for_timeout(500)
+            _browser_check_ready(page, context, username)
+
+            # Validated Followers/Following people-list dialog only.
+            root = dialog
 
             idle_rounds = 0
 
             # HARD CAP IS ATTEMPTS, NOT CONFIRMATIONS.
-            while attempt_count < limit and idle_rounds < 8:
+            while attempt_count < limit and idle_rounds < 5:
                 _browser_check_ready(page, context, username)
 
                 buttons = root.get_by_role(
@@ -5621,22 +6939,16 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                     break
 
                 if candidate is None:
-                    idle_rounds += 1
-                    try:
-                        root.evaluate(
-                            "(el) => el.scrollBy("
-                            "0, Math.max(650, el.clientHeight * 0.85))"
-                        )
-                    except Exception:
-                        try:
-                            root.locator("div").last.scroll_into_view_if_needed(
-                                timeout=1000
-                            )
-                        except Exception:
-                            pass
-
-                    page.wait_for_timeout(700)
-                    continue
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            "👁️ Browser Follow: no more currently visible "
+                            "Follow buttons in this open people-list popup; "
+                            "ending the batch without scrolling or refreshing."
+                        ),
+                    )
+                    break
 
                 idle_rounds = 0
 
@@ -5650,16 +6962,43 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                     )
                     break
 
+                slot_ok, slot_reason = _reserve_browser_follow_slot(username)
+                if not slot_ok:
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            "⏳ Browser Follow batch stopped by rolling "
+                            f"write budget: {slot_reason}"
+                        ),
+                    )
+                    break
+
                 attempt_count += 1
                 update_account_metric(
                     username,
                     "add_history",
                     value=(
-                        f"👤 Browser Follow request "
-                        f"{attempt_count}/{limit} -> "
-                        f"@{candidate_name}"
+                        f"👤 Browser Follow candidate "
+                        f"{attempt_count}/{limit}: @{candidate_name}. "
+                        "Keeping the people-list dialog visible before clicking."
                     ),
                 )
+
+                # Let the headed browser visibly settle instead of immediately
+                # jumping/clicking like the old fast routine.
+                preview_seconds = 2.5 if manual else 1.25
+                problem = _browser_visible_follow_dwell(
+                    page,
+                    username,
+                    preview_seconds,
+                )
+                if problem:
+                    _browser_pause_for_manual_security(
+                        username,
+                        problem,
+                    )
+                    break
 
                 try:
                     candidate.click(timeout=4000)
@@ -5667,26 +7006,37 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                     candidate.evaluate("(el) => el.click()")
 
                 BROWSER_LAST_FOLLOW_ACTION[username] = time.monotonic()
-                page.wait_for_timeout(450)
 
-                problem = _browser_page_problem(page)
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"👆 Follow clicked for @{candidate_name}; "
+                        "waiting visibly in the same dialog for Instagram's "
+                        "button state to settle."
+                    ),
+                )
+
+                settle_seconds = 4.0 if manual else 2.0
+                problem = _browser_visible_follow_dwell(
+                    page,
+                    username,
+                    settle_seconds,
+                )
                 if problem:
-                    apply_account_safety_backoff(
+                    _browser_pause_for_manual_security(
                         username,
-                        (
-                            "Instagram Web follow restriction/challenge: "
-                            f"{problem}"
-                        ),
-                        level="restricted",
-                        hours=4,
+                        problem,
                     )
                     break
 
-                confirmed, detail = _browser_wait_for_follow_confirmation(
-                    page,
-                    context,
-                    root,
-                    candidate_name,
+                confirmed, detail = (
+                    _browser_wait_for_follow_confirmation_in_place(
+                        page,
+                        root,
+                        candidate_name,
+                        timeout_seconds=BROWSER_FOLLOW_VERIFY_SECONDS,
+                    )
                 )
 
                 if confirmed is True:
@@ -5730,11 +7080,8 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                         ),
                     )
 
-                # Move down slightly so Instagram loads/repositions rows.
-                try:
-                    root.evaluate("(el) => el.scrollBy(0, 90)")
-                except Exception:
-                    pass
+                # Keep the same people-list viewport fixed for the entire
+                # batch. We only act on Follow buttons that are already visible.
 
             if attempt_count and not confirmed_count:
                 _browser_follow_debug_snapshot(
@@ -5755,9 +7102,9 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                 username,
                 "add_history",
                 value=(
-                    f"🌐 Browser Follow pass finished: "
-                    f"{attempt_count}/{limit} request(s), "
-                    f"{confirmed_count} confirmed."
+                    f"🌐 Browser Follow visible batch finished: "
+                    f"{attempt_count}/{limit} attempt(s), "
+                    f"{confirmed_count} confirmed; popup stayed in place."
                 ),
             )
 
@@ -6323,6 +7670,59 @@ def _browser_prepare_post(username, history, folder_pool):
 
 
 
+def _browser_explicit_share_confirmation(page) -> tuple[bool, str]:
+    """Require Instagram's own explicit successful-share message."""
+    success_phrases = (
+        "your post has been shared",
+        "your reel has been shared",
+        "post shared",
+        "reel shared",
+        "shared successfully",
+    )
+    try:
+        body = re.sub(r"\\s+", " ", page.locator("body").inner_text(timeout=1200) or "").lower()
+    except Exception:
+        body = ""
+    for phrase in success_phrases:
+        if phrase in body:
+            return True, phrase
+    return False, ""
+
+def _browser_upload_failure_signal(page) -> str:
+    """Detect obvious visible share/upload failure messages."""
+    failure_phrases = (
+        "couldn't share",
+        "could not share",
+        "upload failed",
+        "failed to upload",
+        "your post could not be shared",
+        "your reel could not be shared",
+    )
+    try:
+        body = re.sub(r"\\s+", " ", page.locator("body").inner_text(timeout=1200) or "").lower()
+    except Exception:
+        return ""
+    for phrase in failure_phrases:
+        if phrase in body:
+            return phrase
+    return ""
+
+def _browser_find_new_permalink_after_share(page, username: str, before_links: set[str], timeout_seconds: int = 60) -> str:
+    """Resolve a permalink only after Instagram explicitly confirmed the share."""
+    deadline = time.time() + max(10, int(timeout_seconds))
+    while time.time() < deadline:
+        try:
+            page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1200)
+        except Exception:
+            pass
+        current = _browser_collect_profile_media_links(page, username)
+        new_links = current - before_links
+        if new_links:
+            return sorted(new_links)[-1]
+        page.wait_for_timeout(2500)
+    return ""
+
 def _browser_post(username, history, folder_pool, manual=False) -> bool:
     settings = get_account_control_settings(username)
 
@@ -6401,6 +7801,7 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
         username,
         "upload",
         max_wait=180,
+        fail_fast=bool(manual),
     ):
         update_account_metric(
             username,
@@ -6687,16 +8088,20 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
             update_account_metric(
                 username,
                 "add_history",
-                value="⬆️ Browser Post submitted; verifying profile for up to 90s...",
+                value=(
+                    "⬆️ Browser Post submitted; waiting for Instagram's own "
+                    "explicit share confirmation. Existing profile URLs are "
+                    "ignored until that confirmation appears."
+                ),
             )
 
-            confirmed = False
-            final_link = ""
+            share_confirmed = False
+            share_signal = ""
             deadline = time.time() + 90
             last_notice = 0.0
 
             while time.time() < deadline:
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(1500)
 
                 problem = _browser_page_problem(page)
                 if problem:
@@ -6704,83 +8109,97 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                         f"Instagram Web upload interrupted: {problem}"
                     )
 
-                current = _browser_collect_profile_media_links(
-                    page,
-                    username,
-                )
-                new_links = current - before_links
-
-                if new_links:
-                    confirmed = True
-                    final_link = sorted(new_links)[-1]
-                    break
-
-                if time.time() - last_notice >= 15:
-                    remaining = max(
-                        0,
-                        int(deadline - time.time()),
-                    )
+                failure = _browser_upload_failure_signal(page)
+                if failure:
                     update_account_metric(
                         username,
                         "add_history",
-                        value=(
-                            f"⏳ Browser Post verification: {remaining}s remaining; "
-                            "no new profile URL yet."
-                        ),
+                        value=f"❌ Instagram reported upload/share failure: {failure}",
+                    )
+                    break
+
+                share_confirmed, share_signal = _browser_explicit_share_confirmation(page)
+                if share_confirmed:
+                    break
+
+                if time.time() - last_notice >= 15:
+                    remaining = max(0, int(deadline - time.time()))
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=f"⏳ Waiting for Instagram share confirmation: {remaining}s remaining.",
                     )
                     last_notice = time.time()
 
-            if confirmed:
-                record_write(username, "upload")
-
-                if selected["id"] not in history["posted_ids"]:
-                    history["posted_ids"].append(selected["id"])
-
-                update_account_metric(
-                    username,
-                    "total_posts",
-                    increment=1,
+            if not share_confirmed:
+                history.setdefault("browser_pending_uploads", []).append(
+                    {
+                        "folder_id": selected["id"],
+                        "created_ts": time.time(),
+                        "files": [str(p) for p in files],
+                    }
                 )
-
-                record_recent_post(
-                    username=username,
-                    folder_path=selected["path"],
-                    caption=full_caption,
-                    media_id="browser",
-                    permalink=final_link,
-                )
+                history["browser_pending_uploads"] = history["browser_pending_uploads"][-30:]
 
                 update_account_metric(
                     username,
                     "add_history",
-                    value=f"✅ Browser Post confirmed on profile: {final_link}",
+                    value=(
+                        "⚠️ Post was NOT confirmed by Instagram. It was not counted, "
+                        "and no existing or old post URL was accepted as proof. "
+                        "The media folder is held for 24h."
+                    ),
                 )
-                return True
-
-            history.setdefault(
-                "browser_pending_uploads",
-                [],
-            ).append(
-                {
-                    "folder_id": selected["id"],
-                    "created_ts": time.time(),
-                    "files": [str(p) for p in files],
-                }
-            )
-            history["browser_pending_uploads"] = (
-                history["browser_pending_uploads"][-30:]
-            )
+                return False
 
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    "⏳ Browser Post was submitted but no new profile URL "
-                    "appeared in the verification window. It was not counted "
-                    "and the folder is held for 24h to reduce duplicate risk."
+                    f"✅ Instagram explicitly confirmed the share ({share_signal}). "
+                    "Resolving the new permalink..."
                 ),
             )
-            return False
+
+            final_link = _browser_find_new_permalink_after_share(
+                page,
+                username,
+                before_links,
+                timeout_seconds=60,
+            )
+
+            record_write(username, "upload")
+
+            if selected["id"] not in history["posted_ids"]:
+                history["posted_ids"].append(selected["id"])
+
+            update_account_metric(username, "total_posts", increment=1)
+
+            record_recent_post(
+                username=username,
+                folder_path=selected["path"],
+                caption=full_caption,
+                media_id="browser",
+                permalink=final_link,
+            )
+
+            if final_link:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=f"✅ Browser Post confirmed by Instagram: {final_link}",
+                )
+            else:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "✅ Browser Post was explicitly confirmed by Instagram, "
+                        "but the new permalink has not resolved yet. No old post URL was attached."
+                    ),
+                )
+
+            return True
 
         except Exception as exc:
             update_account_metric(
@@ -6815,6 +8234,443 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
 
 
 
+
+def _runtime_pace_mode(username: str) -> str:
+    if float(BURST_UNTIL.get(username, 0.0) or 0.0) > time.time():
+        return "burst"
+    return str(
+        get_account_control_settings(username).get("pace_mode", "normal")
+    ).strip().lower()
+
+
+def _control_set_pace_mode(username: str, mode: str):
+    username = str(username or "").strip().lstrip("@")
+    mode = str(mode or "").strip().lower()
+
+    if username not in CONTROL_ROSTER:
+        raise ValueError(f"Unknown account @{username}")
+    if mode not in {"normal", "overnight"}:
+        raise ValueError("Pace mode must be normal or overnight.")
+
+    settings = update_account_control_settings(
+        username,
+        {"pace_mode": mode},
+    )
+
+    if mode == "normal":
+        BURST_UNTIL.pop(username, None)
+
+    if username not in CONTROL_PAUSED_ACCOUNTS:
+        CONTROL_FORCE_RUN.add(username)
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"⏱️ Pace mode set to {mode.upper()}. "
+            + (
+                "Auto will use multi-minute active sessions with periodic rests."
+                if mode == "overnight"
+                else "Auto returned to normal single-pass scheduling."
+            )
+        ),
+    )
+    return {"ok": True, "pace_mode": settings["pace_mode"]}
+
+
+def _control_burst_now(username: str):
+    username = str(username or "").strip().lstrip("@")
+
+    if username not in CONTROL_ROSTER:
+        raise ValueError(f"Unknown account @{username}")
+
+    if username in BROWSER_LOGIN_IN_PROGRESS:
+        raise RuntimeError("Finish Browser Login before starting a burst.")
+
+    if username in BROWSER_NATIVE_ACCOUNTS and not _browser_live_port_open(username):
+        _mark_browser_login_needed(
+            username,
+            "the live Chromium window is closed",
+        )
+        raise RuntimeError("Live Chromium is closed. Use Quick Login or Browser Login first.")
+
+    state = get_account_safety_state(username)
+    if state["active"]:
+        raise RuntimeError(
+            f"Safety Backoff is active until {state['until']}: "
+            f"{state['reason'][:140]}"
+        )
+
+    duration = random.randint(
+        BURST_SESSION_MIN_SECONDS,
+        BURST_SESSION_MAX_SECONDS,
+    )
+    BURST_UNTIL[username] = time.time() + duration
+
+    CONTROL_PAUSED_ACCOUNTS.discard(username)
+    CONTROL_FORCE_RUN.add(username)
+
+    update_account_metric(
+        username,
+        "status",
+        status="Burst Session Requested",
+    )
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"⚡ Burst Now requested for ~{duration//60}m "
+            f"{duration%60:02d}s. Rolling write budget and safety stops remain active."
+        ),
+    )
+
+    return {
+        "ok": True,
+        "burst_seconds": duration,
+        "burst_until": BURST_UNTIL[username],
+    }
+
+
+def _browser_readonly_dm_check(username: str, context, page) -> bool:
+    settings = get_account_control_settings(username)
+    if not settings.get("enable_dms", False):
+        return False
+
+    now = time.time()
+    due = float(NEXT_BROWSER_DM_CHECK.get(username, 0.0) or 0.0)
+    if due and now < due:
+        return False
+
+    NEXT_BROWSER_DM_CHECK[username] = now + random.randint(
+        BROWSER_DM_CHECK_MIN_SECONDS,
+        BROWSER_DM_CHECK_MAX_SECONDS,
+    )
+    LAST_BROWSER_DM_CHECK[username] = now
+
+    update_account_metric(
+        username,
+        "add_history",
+        value="📥 Browser Mode: performing a low-frequency read-only DM inbox check.",
+    )
+
+    try:
+        page.goto(
+            "https://www.instagram.com/direct/inbox/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.wait_for_timeout(1200)
+        _browser_check_ready(page, context, username)
+
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=1200) or "",
+        ).lower()
+
+        hints = []
+        for phrase in ("message requests", "requests", "new message", "unread"):
+            if phrase in body and phrase not in hints:
+                hints.append(phrase)
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "📥 Browser DM check complete"
+                + (f"; visible hints: {', '.join(hints[:3])}" if hints else "; no obvious unread/request text detected")
+                + ". Browser Mode does not auto-reply to DMs in this build."
+            ),
+        )
+        return True
+    except Exception as exc:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Browser DM read-only check skipped: {type(exc).__name__}: {str(exc)[:120]}",
+        )
+        return False
+
+
+def _browser_readonly_comment_check(username: str, context, page) -> bool:
+    settings = get_account_control_settings(username)
+    if not settings.get("enable_comments", False):
+        return False
+
+    now = time.time()
+    due = float(NEXT_BROWSER_COMMENT_CHECK.get(username, 0.0) or 0.0)
+    if due and now < due:
+        return False
+
+    NEXT_BROWSER_COMMENT_CHECK[username] = now + random.randint(
+        BROWSER_COMMENT_CHECK_MIN_SECONDS,
+        BROWSER_COMMENT_CHECK_MAX_SECONDS,
+    )
+    LAST_BROWSER_COMMENT_CHECK[username] = now
+
+    update_account_metric(
+        username,
+        "add_history",
+        value="💬 Browser Mode: performing a low-frequency read-only comment check.",
+    )
+
+    try:
+        page.goto(
+            f"https://www.instagram.com/{username}/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.wait_for_timeout(1000)
+        _browser_check_ready(page, context, username)
+
+        links = page.locator(
+            "a[href*='/p/'], a[href*='/reel/']"
+        ).evaluate_all(
+            """els => els.map(e => e.href || e.getAttribute('href') || '').filter(Boolean)"""
+        )
+        if not links:
+            update_account_metric(
+                username,
+                "add_history",
+                value="💬 Browser comment check complete; no recent post/reel link was visible.",
+            )
+            return True
+
+        page.goto(
+            str(links[0]).split("?", 1)[0],
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.wait_for_timeout(1000)
+        _browser_check_ready(page, context, username)
+
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=1200) or "",
+        )
+
+        comment_match = re.search(
+            r"View all\s+([0-9,]+)\s+comments?",
+            body,
+            re.I,
+        )
+        summary = (
+            f"visible comment count hint={comment_match.group(1)}"
+            if comment_match
+            else "no comment-count hint detected"
+        )
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"💬 Browser comment check complete; {summary}. "
+                "Browser Mode does not auto-reply to comments in this build."
+            ),
+        )
+        return True
+    except Exception as exc:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Browser comment read-only check skipped: {type(exc).__name__}: {str(exc)[:120]}",
+        )
+        return False
+
+
+def _browser_maybe_run_readonly_listeners(username: str) -> None:
+    settings = get_account_control_settings(username)
+    if not (
+        settings.get("enable_dms", False)
+        or settings.get("enable_comments", False)
+    ):
+        return
+
+    if not _browser_live_port_open(username):
+        return
+
+    with sync_playwright() as p:
+        context = _browser_launch(p, username, headed=None)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            # At most one listener navigation per active-session checkpoint.
+            checks = []
+            if settings.get("enable_dms", False):
+                checks.append("dms")
+            if settings.get("enable_comments", False):
+                checks.append("comments")
+            random.shuffle(checks)
+
+            for check in checks:
+                if check == "dms" and _browser_readonly_dm_check(
+                    username, context, page
+                ):
+                    break
+                if check == "comments" and _browser_readonly_comment_check(
+                    username, context, page
+                ):
+                    break
+        finally:
+            _browser_close_context(context)
+
+
+def _browser_auto_choices(username: str, settings: dict, folder_pool) -> list[str]:
+    choices = []
+
+    if settings.get("enable_follow", False):
+        choices.append("networking")
+    if settings.get("enable_engage", False):
+        choices.append("hashtags")
+
+    if settings.get("enable_posts", False) and folder_pool:
+        # Do not let a long upload cooldown stall an active browsing session.
+        if not _shared_write_block_reason(username, "upload"):
+            choices.append("repost")
+
+    return choices
+
+
+def _run_browser_active_session(
+    username: str,
+    history: dict,
+    conf: dict,
+    folder_pool,
+    settings: dict,
+    mode: str,
+) -> None:
+    """
+    Multi-minute active session with short navigation gaps.
+
+    The rolling write budget remains the hard ceiling. Security/restriction
+    warnings immediately stop the session.
+    """
+    if mode == "burst":
+        duration = random.randint(
+            BURST_SESSION_MIN_SECONDS,
+            BURST_SESSION_MAX_SECONDS,
+        )
+    else:
+        duration = random.randint(
+            ACTIVE_SESSION_MIN_SECONDS,
+            ACTIVE_SESSION_MAX_SECONDS,
+        )
+
+    hard_deadline = time.monotonic() + duration
+    cycles = 0
+    post_used = False
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"⚡ {mode.title()} active session started for up to ~{duration//60}m "
+            f"{duration%60:02d}s; short browsing gaps "
+            f"{ACTIVE_BROWSE_GAP_MIN_SECONDS}-{ACTIVE_BROWSE_GAP_MAX_SECONDS}s."
+        ),
+    )
+
+    # Low-frequency listener checkpoint near the beginning.
+    _browser_maybe_run_readonly_listeners(username)
+
+    while time.monotonic() < hard_deadline:
+        if username in CONTROL_PAUSED_ACCOUNTS:
+            break
+
+        safety = get_account_safety_state(username)
+        if safety["active"]:
+            break
+
+        settings = get_account_control_settings(username, conf)
+        choices = _browser_auto_choices(username, settings, folder_pool)
+
+        if post_used and "repost" in choices:
+            choices.remove("repost")
+
+        if not choices:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "⏳ Active session has no currently eligible outward action; "
+                    "ending this session and entering its scheduled rest."
+                ),
+            )
+            break
+
+        cycle_index = int(
+            history.get("browser_burst_cycle_index", 0) or 0
+        )
+        task = choices[cycle_index % len(choices)]
+        history["browser_burst_cycle_index"] = cycle_index + 1
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚡ Active session step {cycles + 1}: {task}",
+        )
+
+        try:
+            if task == "networking":
+                _browser_follow_network(
+                    username,
+                    history,
+                    conf,
+                    manual=False,
+                )
+            elif task == "hashtags":
+                _browser_engage_hashtag(
+                    username,
+                    history,
+                    conf,
+                    manual=False,
+                )
+            elif task == "repost":
+                _browser_post(
+                    username,
+                    history,
+                    folder_pool,
+                    manual=False,
+                )
+                post_used = True
+        except RuntimeError as exc:
+            # Security/restriction problems are already classified elsewhere.
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"⚠️ Active session step stopped: {str(exc)[:160]}",
+            )
+            if get_account_safety_state(username)["active"]:
+                break
+
+        cycles += 1
+
+        if cycles >= 10:
+            break
+
+        if time.monotonic() >= hard_deadline:
+            break
+
+        gap = random.randint(
+            ACTIVE_BROWSE_GAP_MIN_SECONDS,
+            ACTIVE_BROWSE_GAP_MAX_SECONDS,
+        )
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"… Active-session browsing gap ~{gap}s.",
+        )
+        time.sleep(gap)
+
+        # Listener checks are deliberately sparse and do nothing when not due.
+        if cycles % 3 == 0:
+            _browser_maybe_run_readonly_listeners(username)
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=f"⚡ {mode.title()} active session finished after {cycles} step(s).",
+    )
 
 def run_browser_profile_workflow(username, conf, folder_pool):
     ACCOUNT_COOLDOWNS.pop(username, None)
@@ -6929,55 +8785,68 @@ def run_browser_profile_workflow(username, conf, folder_pool):
             )
 
         else:
-            choices = []
-            if settings.get("enable_follow", False):
-                choices.append("networking")
-            if settings.get("enable_engage", False):
-                choices.append("hashtags")
-            if settings.get("enable_posts", False) and folder_pool:
-                choices.append("repost")
+            pace_mode = _runtime_pace_mode(username)
 
-            if not choices:
+            if pace_mode in {"overnight", "burst"}:
+                _run_browser_active_session(
+                    username,
+                    history,
+                    conf,
+                    folder_pool,
+                    settings,
+                    pace_mode,
+                )
+            else:
+                choices = _browser_auto_choices(
+                    username,
+                    settings,
+                    folder_pool,
+                )
+
+                if not choices:
+                    _browser_maybe_run_readonly_listeners(username)
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value="ℹ️ Browser Mode Auto pass has no currently eligible outward feature.",
+                    )
+                    return "ran"
+
+                cycle_index = int(
+                    history.get("browser_outward_cycle_index", 0) or 0
+                )
+                task = choices[cycle_index % len(choices)]
+                history["browser_outward_cycle_index"] = cycle_index + 1
+
                 update_account_metric(
                     username,
                     "add_history",
-                    value="ℹ️ Browser Mode Auto pass has no enabled outward feature.",
+                    value=f"🔄 Browser Mode Auto selected: {task}",
                 )
-                return "ran"
 
-            cycle_index = int(
-                history.get("browser_outward_cycle_index", 0) or 0
-            )
-            task = choices[cycle_index % len(choices)]
-            history["browser_outward_cycle_index"] = cycle_index + 1
+                if task == "networking":
+                    _browser_follow_network(
+                        username,
+                        history,
+                        conf,
+                        manual=False,
+                    )
+                elif task == "hashtags":
+                    _browser_engage_hashtag(
+                        username,
+                        history,
+                        conf,
+                        manual=False,
+                    )
+                elif task == "repost":
+                    _browser_post(
+                        username,
+                        history,
+                        folder_pool,
+                        manual=False,
+                    )
 
-            update_account_metric(
-                username,
-                "add_history",
-                value=f"🔄 Browser Mode Auto selected: {task}",
-            )
-
-            if task == "networking":
-                _browser_follow_network(
-                    username,
-                    history,
-                    conf,
-                    manual=False,
-                )
-            elif task == "hashtags":
-                _browser_engage_hashtag(
-                    username,
-                    history,
-                    conf,
-                    manual=False,
-                )
-            elif task == "repost":
-                _browser_post(
-                    username,
-                    history,
-                    folder_pool,
-                    manual=False,
-                )
+                _browser_maybe_run_readonly_listeners(username)
 
     finally:
         save_json(conf["history_file"], history)
@@ -7295,6 +9164,11 @@ def _control_metrics_payload():
             "write_budget_used":len(_prune_write_window(username)),"write_budget_max":MAX_WRITES_PER_WINDOW,
             "write_window_seconds":WRITE_WINDOW_SECONDS,"upload_cooldown_seconds":_effective_pacing(username)["upload"],
             "settings":get_account_control_settings(username,conf),"safety":get_account_safety_state(username),
+            "pace_mode":_runtime_pace_mode(username),
+            "burst_remaining_seconds":max(
+                0,
+                int(float(BURST_UNTIL.get(username,0.0) or 0.0)-time.time()),
+            ),
         }
         result[username]=row
     return {"accounts":result,"recent_posts":load_recent_posts()[:25],"media":media_root_payload()}
@@ -7679,57 +9553,135 @@ def _control_quick_login(username):
     conf = _control_conf(username)
     if not conf:
         raise ValueError(f"Unknown account @{username}")
+
     session_p = DOWNLOAD_ROOT / conf["session_file"]
-    live_browser = _browser_live_port_open(username)
+
+    if _browser_live_port_open(username):
+        live_ready, live_reason = _verify_live_browser_ready(username)
+        if live_ready:
+            _activate_browser_native_mode(
+                username,
+                "Quick Login verified the already-running authenticated Instagram Chromium session.",
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value="🌐 Quick Login attached to the existing authenticated live Chromium.",
+            )
+            return {
+                "ok": True,
+                "mode": "browser_native",
+                "browser_mode": True,
+                "private_api_ready": False,
+            }
+
+        _mark_browser_login_needed(
+            username,
+            f"live Chromium exists but is not authenticated ({live_reason})",
+        )
+        raise RuntimeError(
+            "Chromium is open, but Instagram is not authenticated in that window. "
+            "Finish the visible Continue/login/security prompt."
+        )
+
+    if _browser_profile_saved(username):
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🌐 Quick Login: live Chromium is closed; reopening the saved "
+                "browser profile and attempting safe resume..."
+            ),
+        )
+
+        live_ready, live_reason = _quick_reopen_live_browser(username)
+
+        if live_ready:
+            _activate_browser_native_mode(
+                username,
+                "Quick Login reopened and verified the authenticated live Instagram Chromium session.",
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "✅ Quick Login reopened the saved Chromium profile and "
+                    "verified Instagram Web authentication."
+                ),
+            )
+            return {
+                "ok": True,
+                "mode": "browser_native",
+                "browser_mode": True,
+                "private_api_ready": False,
+            }
+
+        _mark_browser_login_needed(
+            username,
+            f"Quick Login reopened Chromium but could not authenticate it ({live_reason})",
+        )
+        raise RuntimeError(
+            "Quick Login reopened Chromium but Instagram still needs manual "
+            f"attention: {live_reason}. Use Browser Login."
+        )
 
     if not session_p.exists():
-        if live_browser:
-            live_ready, live_reason = _verify_live_browser_ready(username)
-            if live_ready:
-                _activate_browser_native_mode(username, "Existing authenticated live Instagram Chromium session verified.")
-                return {"ok":True,"mode":"browser_native","browser_mode":True,"private_api_ready":False}
-            _mark_browser_login_needed(username, f"live Chromium exists but is not authenticated ({live_reason})")
-            raise RuntimeError(
-                "Chromium is open, but Instagram is not authenticated in that live window. "
-                "Click Browser Login and finish the visible login/Continue screen."
-            )
-        if _browser_profile_saved(username):
-            _mark_browser_login_needed(username, "saved browser data exists but the live Chromium window is closed")
-            raise RuntimeError("Saved Browser Login data exists, but the live Chromium window is closed. Click Browser Login to reopen it.")
-        raise RuntimeError("No saved session exists. Use Browser Login.")
+        raise RuntimeError(
+            "No saved browser profile or private session exists. Use Browser Login."
+        )
 
-    cl=Client(); cl.load_settings(session_p); _refresh_instagram_app_profile(cl,username)
+    cl = Client()
+    cl.load_settings(session_p)
+    _refresh_instagram_app_profile(cl, username)
+
     try:
         cl.get_timeline_feed()
     except Exception as exc:
         if is_login_required_error(exc):
-            if live_browser:
-                live_ready, live_reason = _verify_live_browser_ready(username)
-                if live_ready:
-                    _activate_browser_native_mode(username, "Private API rejected the saved session; authenticated live Chromium will be used.")
-                    update_account_metric(username,"add_history",value="🌐 Quick Login: private API returned LoginRequired; verified and attached Browser Mode to the already-running live Chromium.")
-                    return {"ok":True,"mode":"browser_native","browser_mode":True,"private_api_ready":False}
-                _mark_browser_login_needed(username, f"private API is unavailable and live Chromium is not authenticated ({live_reason})")
-                raise RuntimeError(
-                    "Private API is unavailable and the open Chromium window is not authenticated. "
-                    "Click Browser Login and finish the visible login/Continue screen."
-                ) from exc
-            if _browser_profile_saved(username):
-                _mark_browser_login_needed(username, "private API is unavailable and the saved browser profile is not currently running")
-                raise RuntimeError("Private API login is unavailable and the live Chromium window is closed. Click Browser Login to reopen the saved browser profile.") from exc
-            stop_account_for_private_login_required(username,"Quick Login private timeline validation",exc,hours=6)
-            raise RuntimeError("Saved session is not accepted by Instagram's private API and no live Browser Login exists.") from exc
+            stop_account_for_private_login_required(
+                username,
+                "Quick Login private timeline validation",
+                exc,
+                hours=6,
+            )
+            raise RuntimeError(
+                "Saved private-API session is not accepted and there is no reusable "
+                "browser profile. Use Browser Login."
+            ) from exc
         raise
 
-    if not verify_authenticated_identity(cl,username,session_p):
+    if not verify_authenticated_identity(cl, username, session_p):
         raise RuntimeError("Saved session identity does not match this roster account.")
-    patch_obsolete_qe_expose(cl,username); _deactivate_browser_native_mode(username)
+
+    patch_obsolete_qe_expose(cl, username)
+    _deactivate_browser_native_mode(username)
+
     with CONTROL_LOCK:
-        CLIENT_CACHE[username]=cl; CONTROL_DISCONNECTED_ACCOUNTS.discard(username); CONTROL_PAUSED_ACCOUNTS.add(username)
-        AUTH_RETRY_AFTER.pop(username,None); ACCOUNT_COOLDOWNS.pop(username,None); LAST_DM_POLL.pop(username,None); AUTH_EVENT[username]="quick_login"
-    update_account_metric(username,"status",status="Connected / Auto Off")
-    update_account_metric(username,"add_history",value="🔓 Quick Login: private API session connected; background automation remains OFF until Start Automation is pressed.")
-    return {"ok":True,"mode":"saved_session","browser_mode":False,"private_api_ready":True}
+        CLIENT_CACHE[username] = cl
+        CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
+        CONTROL_PAUSED_ACCOUNTS.add(username)
+        AUTH_RETRY_AFTER.pop(username, None)
+        ACCOUNT_COOLDOWNS.pop(username, None)
+        LAST_DM_POLL.pop(username, None)
+        AUTH_EVENT[username] = "quick_login"
+
+    update_account_metric(username, "status", status="Connected / Auto Off")
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🔓 Quick Login: private API session connected; background automation "
+            "remains OFF until Start Automation is pressed."
+        ),
+    )
+
+    return {
+        "ok": True,
+        "mode": "saved_session",
+        "browser_mode": False,
+        "private_api_ready": True,
+    }
+
 
 
 
@@ -7967,6 +9919,9 @@ def _control_pause(username, pause):
                 )
 
         CONTROL_PAUSED_ACCOUNTS.discard(username)
+        # Start Automation should not inherit a stale wait from an earlier
+        # manual action; request one immediate scheduler pass.
+        CONTROL_FORCE_RUN.add(username)
         update_account_metric(
             username,
             "status",
@@ -8028,6 +9983,15 @@ def _control_queue_task(username, task):
 
     if task not in allowed:
         raise ValueError(f"Unsupported task: {task}")
+
+    if task == "repost":
+        pacing_reason = _shared_write_block_reason(username, "upload")
+        if pacing_reason:
+            raise RuntimeError(
+                f"Upload/Repost is pacing-blocked: {pacing_reason}. "
+                "If this came from the known old false-positive verifier, "
+                "click Clear Upload Cooldown once."
+            )
 
     if browser_mode:
         # Do not let a private-API auth cooldown suppress a Web UI task.
@@ -8324,6 +10288,7 @@ function cardHtml(user,a){
       <div class="stat"><b>${Number(a.total_likes||0)}</b><span>Likes</span></div>
     </div>
     <div class="small">Write budget: ${Number(c.write_budget_used||0)}/${Number(c.write_budget_max||0)} per rolling ${Math.round(Number(c.write_window_seconds||0)/60)} min · uploads ≥ ${Math.round(Number(c.upload_cooldown_seconds||0)/60)} min apart</div>
+    <div class="small">Pace: <b>${esc(c.pace_mode||s.pace_mode||"normal")}</b>${Number(c.burst_remaining_seconds||0)>0 ? ` · burst remaining ~${Math.ceil(Number(c.burst_remaining_seconds)/60)}m` : ""}</div>
     ${c.safety?.active ? `<div class="small bad">Safety Backoff until ${esc(c.safety.until||"")} · ${esc(c.safety.reason||"")}</div>` : ""}
 
     <div class="section">
@@ -8339,6 +10304,12 @@ function cardHtml(user,a){
           onclick="pauseAccount('${esc(user)}',${autoEnabled ? "true":"false"})">
           ${autoEnabled ? "Stop Automation":"Start Automation"}
         </button>
+        <button class="good" ${connected ? "":"disabled"}
+          onclick="burstNow('${esc(user)}')">⚡ Burst Now</button>
+        <button ${connected ? "":"disabled"}
+          onclick="setPaceMode('${esc(user)}','overnight')">🌙 Overnight Pace</button>
+        <button ${connected ? "":"disabled"}
+          onclick="setPaceMode('${esc(user)}','normal')">Normal Pace</button>
         <button class="danger" onclick="removeInstagramAccount('${esc(user)}')">
           Remove Account
         </button>
@@ -8393,6 +10364,7 @@ function cardHtml(user,a){
         <div><label>Caption char limit</label><input id="caplim_${esc(user)}" type="number" min="80" max="2200" value="${Number(s.caption_char_limit||420)}"></div>
         <div><label>Reply char limit</label><input id="replim_${esc(user)}" type="number" min="20" max="1000" value="${Number(s.reply_char_limit||280)}"></div>
         <div><label>Follow limit / pass</label><input id="followlim_${esc(user)}" type="number" min="1" max="20" value="${Number(s.follow_limit||2)}"></div>
+        <div><label>Auto follow batch max (1-5 visible rows)</label><input id="autofollowmax_${esc(user)}" type="number" min="1" max="5" value="${Number(s.auto_follow_batch_max||5)}"></div>
         <div><label>Video frames to watch</label><input id="frames_${esc(user)}" type="number" min="3" max="9" value="${Number(s.video_frames||5)}"></div>
         <div><label>Writes / rolling window</label><input id="maxwrites_${esc(user)}" type="number" min="1" max="30" value="${Number(s.max_writes_per_window||8)}"></div>
         <div><label>Rolling window seconds</label><input id="window_${esc(user)}" type="number" min="60" max="7200" value="${Number(s.write_window_seconds||900)}"></div>
@@ -8423,6 +10395,7 @@ function cardHtml(user,a){
       <b>Manual actions</b>
       <div class="row">
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
+        <button ${connected ? "":"disabled"} onclick="clearUploadCooldown('${esc(user)}')">Clear Upload Cooldown</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','networking')">Network</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','hashtags')">Hashtags</button>
@@ -8436,6 +10409,22 @@ function cardHtml(user,a){
   </div>`;
 }
 
+
+
+async function clearUploadCooldown(user){
+  const ok=window.confirm(
+    `Clear only the upload cooldown for @${user}? ` +
+    `Use this only when a previous false-positive upload was recorded. ` +
+    `Safety backoffs and other write pacing are not cleared.`
+  );
+  if(!ok) return;
+
+  try{
+    await api("clear_upload_cooldown",{username:user});
+    toast(`Upload cooldown cleared for @${user}.`);
+    await refreshMetrics();
+  }catch(e){toast(e.message,true)}
+}
 
 function renderRecentPosts(items){
   const box=document.getElementById("recentPosts");
@@ -8700,6 +10689,25 @@ function splitList(v){
   return String(v||"").split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);
 }
 
+
+async function setPaceMode(user,mode){
+  try{
+    await autoSaveBehavior(user,true);
+    await api("set_pace_mode",{username:user,mode});
+    toast(`@${user}: ${mode==="overnight" ? "Overnight Pace" : "Normal Pace"} enabled.`);
+    await refreshMetrics();
+  }catch(e){toast(e.message,true)}
+}
+
+async function burstNow(user){
+  try{
+    await autoSaveBehavior(user,true);
+    const r=await api("burst_now",{username:user});
+    toast(`Burst started for @${user} (~${Math.ceil(Number(r.burst_seconds||0)/60)} min).`);
+    await refreshMetrics();
+  }catch(e){toast(e.message,true)}
+}
+
 function collectBehavior(user){
   return {
     enable_posts:document.getElementById(`posts_${user}`).checked,
@@ -8711,6 +10719,8 @@ function collectBehavior(user){
     caption_char_limit:Number(document.getElementById(`caplim_${user}`).value),
     reply_char_limit:Number(document.getElementById(`replim_${user}`).value),
     follow_limit:Number(document.getElementById(`followlim_${user}`).value),
+    auto_follow_batch_max:Number(document.getElementById(`autofollowmax_${user}`).value),
+    pace_mode:(latestData.accounts?.[user]?.control?.settings?.pace_mode || "normal"),
     video_frames:Number(document.getElementById(`frames_${user}`).value),
     max_writes_per_window:Number(document.getElementById(`maxwrites_${user}`).value),
     write_window_seconds:Number(document.getElementById(`window_${user}`).value),
@@ -8813,6 +10823,17 @@ refreshNow(true);
                     username, str(body.get("task", ""))
                 )
 
+            elif action == "clear_upload_cooldown":
+                result = _control_clear_upload_cooldown(username)
+
+            elif action == "set_pace_mode":
+                result = _control_set_pace_mode(
+                    username,
+                    str(body.get("mode", "normal")),
+                )
+
+            elif action == "burst_now":
+                result = _control_burst_now(username)
 
             elif action == "save_settings":
                 result = _control_save_settings(
@@ -9008,12 +11029,13 @@ ACCOUNT_WORKFLOW_THREADS_LOCK = threading.RLock()
 
 def _background_account_workflow(username, conf, next_workflow_at):
     update_account_metric(username,"add_history",value="🧵 Worker started.")
+    forced_task = NEXT_TASK_OVERRIDE.get(username)
     try:
         if username in BROWSER_NATIVE_ACCOUNTS and not _browser_live_port_open(username):
             _mark_browser_login_needed(username,"the live Chromium window was closed before the worker started")
             result="disconnected"
         else:
-            forced_task=NEXT_TASK_OVERRIDE.get(username); settings=get_account_control_settings(username,conf)
+            settings=get_account_control_settings(username,conf)
             need_media=forced_task=="repost" or (forced_task is None and bool(settings.get("enable_posts",False)))
             if need_media:
                 update_account_metric(username,"add_history",value="🗂️ Worker checking local media library...")
@@ -9027,10 +11049,20 @@ def _background_account_workflow(username, conf, next_workflow_at):
     except Exception as exc:
         observe_platform_signal(username,exc,action="workflow")
         update_account_metric(username,"add_history",value=f"❌ Workflow error: {type(exc).__name__}: {str(exc)[:220]}"); result="error"
-    if result=="ran": delay=random.randint(WORKFLOW_SLEEP_MIN,WORKFLOW_SLEEP_MAX)
-    elif result in {"disconnected","paused"}: delay=max(WORKFLOW_RETRY_IDLE_SECONDS,300)
-    else: delay=WORKFLOW_RETRY_IDLE_SECONDS
-    update_account_metric(username,"add_history",value=f"🧵 Worker finished with result={result}; next Auto eligibility in ~{delay}s.")
+    delay, delay_reason = _next_overnight_auto_delay(
+        username,
+        result,
+        manual_run=bool(forced_task),
+    )
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🧵 Worker finished with result={result}; "
+            f"next Auto eligibility in ~{delay}s "
+            f"({delay_reason})."
+        ),
+    )
     with ACCOUNT_WORKFLOW_THREADS_LOCK:
         next_workflow_at[username]=time.monotonic()+delay; ACCOUNT_WORKFLOW_THREADS.pop(username,None)
 
@@ -9076,17 +11108,29 @@ def main():
     CONTROL_PAUSED_ACCOUNTS.update(active_roster.keys())
     CONTROL_FORCE_RUN.clear()
     LAST_DM_POLL.clear()
+    BURST_UNTIL.clear()
+    LAST_BROWSER_DM_CHECK.clear()
+    NEXT_BROWSER_DM_CHECK.clear()
+    LAST_BROWSER_COMMENT_CHECK.clear()
+    NEXT_BROWSER_COMMENT_CHECK.clear()
 
     for user in active_roster:
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Adaptive Browser Agent: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Active Session Controls: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
     print("Dashboard account cap: 3")
     print("Boot mode: DISCONNECTED / AUTO OFF")
+    print(
+        "Auto cadence: Normal single-pass; Overnight uses "
+        f"{ACTIVE_SESSION_MIN_SECONDS//60}-{ACTIVE_SESSION_MAX_SECONDS//60} min active sessions, "
+        f"{OVERNIGHT_REST_MIN_SECONDS//60}-{OVERNIGHT_REST_MAX_SECONDS//60} min ordinary rests, "
+        f"{OVERNIGHT_LONG_REST_MIN_SECONDS//60}-{OVERNIGHT_LONG_REST_MAX_SECONDS//60} min periodic long rests; "
+        f"Auto Follow batches {AUTO_FOLLOW_BATCH_MIN}-{AUTO_FOLLOW_BATCH_MAX} visible rows max."
+    )
 
     server = ThreadingHTTPServer((IG_HOST, IG_PORT), DashboardAPIHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
