@@ -9,6 +9,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import threading
 import sys
+import socket
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from http.server import SimpleHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from instagrapi import Client
 from instagrapi.exceptions import FeedbackRequired, LoginRequired, ClientError, UserNotFound, PrivateError
@@ -119,6 +121,12 @@ ACCOUNT_COOLDOWNS, NEXT_TASK_OVERRIDE = {}, {}
 AUTH_EVENT = {}  # username -> saved_session / manual_saved / manual_failed / credential_login / throttled / auth_backoff
 CLIENT_CACHE = {}  # username -> authenticated instagrapi Client for this process
 BROWSER_NATIVE_ACCOUNTS = set()  # valid Instagram Web sessions used when private API is blocked
+BROWSER_HANDLE_BY_CONTEXT = {}
+LIVE_CDP_CONTEXT_IDS = set()
+LIVE_BROWSER_PROCESSES = {}
+BROWSER_LOGIN_IN_PROGRESS = set()
+MEDIA_FOLDER_CACHE = {"root":"", "mtime_ns":-1, "cached_at":0.0, "folders":[]}
+MEDIA_FOLDER_CACHE_SECONDS = max(10, int(os.environ.get("IG_MEDIA_FOLDER_CACHE_SECONDS", "60")))
 AUTH_RETRY_AFTER = {}  # username -> datetime; prevents rapid login loops
 
 # One-account instances can keep DMs responsive without making posting/actions frequent.
@@ -176,6 +184,22 @@ BROWSER_LOGIN_FINISH_SECONDS = max(
     min(
         600,
         int(os.environ.get("IG_BROWSER_LOGIN_FINISH_SECONDS", "90")),
+    ),
+)
+
+
+BROWSER_POST_AI_TIMEOUT_SECONDS = max(
+    90,
+    min(
+        600,
+        int(os.environ.get("IG_BROWSER_POST_AI_TIMEOUT_SECONDS", "300")),
+    ),
+)
+BROWSER_POST_VISION_FRAMES = max(
+    3,
+    min(
+        5,
+        int(os.environ.get("IG_BROWSER_POST_VISION_FRAMES", "3")),
     ),
 )
 
@@ -1908,49 +1932,49 @@ def get_authenticated_client(username, conf):
     return None
 
 
-def discover_local_media_folders():
-    """
-    Discover immediate child folders inside the Media Library root.
-
-    Each child folder is treated as one source/post bundle by the existing
-    uploader. Changing the Hub media folder takes effect on the next worker run.
-    """
-    all_folders = []
+def discover_local_media_folders(force: bool = False):
     media_root = get_media_root()
+    try:
+        resolved = media_root.resolve()
+    except Exception:
+        resolved = media_root
 
-    if not media_root.exists() or not media_root.is_dir():
-        print(
-            f"⚠️ Media folder does not exist: {media_root}",
-            flush=True,
-        )
-        return all_folders
+    if not resolved.exists() or not resolved.is_dir():
+        print(f"⚠️ Media folder does not exist: {resolved}", flush=True)
+        MEDIA_FOLDER_CACHE.update({"root":str(resolved),"mtime_ns":-1,"cached_at":time.monotonic(),"folders":[]})
+        return []
 
     try:
-        for item in media_root.iterdir():
-            if not item.is_dir():
-                continue
+        mtime_ns = resolved.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = -1
+    now=time.monotonic()
+    if (
+        not force
+        and MEDIA_FOLDER_CACHE.get("root") == str(resolved)
+        and MEDIA_FOLDER_CACHE.get("mtime_ns") == mtime_ns
+        and now - float(MEDIA_FOLDER_CACHE.get("cached_at",0.0) or 0.0) <= MEDIA_FOLDER_CACHE_SECONDS
+    ):
+        return list(MEDIA_FOLDER_CACHE.get("folders") or [])
 
-            parts = item.name.split("_", 2)
-            source = (
-                parts[1]
-                if len(parts) > 1 and parts[1]
-                else item.name
-            )
-            all_folders.append(
-                {
-                    "id": item.name,
-                    "path": item,
-                    "source": source,
-                }
-            )
-
+    folders=[]
+    try:
+        with os.scandir(resolved) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                item=Path(entry.path)
+                parts=item.name.split("_",2)
+                source=parts[1] if len(parts)>1 and parts[1] else item.name
+                folders.append({"id":item.name,"path":item,"source":source})
     except OSError as exc:
-        print(
-            f"⚠️ Media folder scan failed for {media_root}: {exc}",
-            flush=True,
-        )
+        print(f"⚠️ Media folder scan failed for {resolved}: {exc}", flush=True)
+    MEDIA_FOLDER_CACHE.update({"root":str(resolved),"mtime_ns":mtime_ns,"cached_at":now,"folders":list(folders)})
+    return folders
 
-    return all_folders
 
 
 
@@ -3758,8 +3782,17 @@ def _browser_profile_dir(username: str) -> Path:
 
 
 def _browser_profile_saved(username: str) -> bool:
-    path = _browser_profile_dir(username)
-    return path.exists() and path.is_dir()
+    if _browser_storage_state_available(username):
+        return True
+    live_path = _browser_live_profile_dir(username)
+    if live_path.exists() and live_path.is_dir():
+        return True
+    legacy_path = _browser_profile_dir(username)
+    return legacy_path.exists() and legacy_path.is_dir()
+
+
+
+
 
 
 def _activate_browser_native_mode(username: str, reason: str = "") -> None:
@@ -3867,13 +3900,293 @@ def _browser_page_problem(page) -> str:
     return ""
 
 
+def _browser_page_authenticated(page, username: str) -> bool:
+    """
+    Determine whether the CURRENT live Instagram page looks authenticated.
+
+    This is intentionally separate from sessionid-cookie presence. Instagram
+    can present a working logged-in SPA state or saved-account resume flow while
+    cookie timing/state changes underneath Playwright.
+    """
+    username = str(username or "").strip().lstrip("@")
+
+    try:
+        url = str(page.url or "").lower()
+    except Exception:
+        url = ""
+
+    if any(
+        token in url
+        for token in (
+            "/accounts/login",
+            "/challenge/",
+            "/checkpoint/",
+        )
+    ):
+        return False
+
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=1200) or "",
+        ).lower()
+    except Exception:
+        body = ""
+
+    # Saved-account chooser is not authenticated yet.
+    if (
+        username.lower() in body
+        and "use another account" in body
+        and "continue" in body
+    ):
+        return False
+
+    # Strong positive UI signals from the authenticated Instagram shell.
+    selectors = (
+        "svg[aria-label='Home']",
+        "svg[aria-label='Search']",
+        "svg[aria-label='Explore']",
+        "svg[aria-label='Reels']",
+        "svg[aria-label='Messages']",
+        "svg[aria-label='Notifications']",
+        "svg[aria-label='New post']",
+        "svg[aria-label='Create']",
+        f"a[href='/{username}/']",
+        f"a[href='/{username}']",
+    )
+
+    visible_signals = 0
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() and loc.is_visible(timeout=180):
+                visible_signals += 1
+                if visible_signals >= 1:
+                    return True
+        except Exception:
+            pass
+
+    # Text fallback for layouts where navigation labels are rendered outside
+    # accessible SVG labels.
+    nav_terms = (
+        " home ",
+        " search ",
+        " explore ",
+        " reels ",
+        " messages ",
+        " notifications ",
+        " create ",
+    )
+    padded = f" {body} "
+    if sum(term in padded for term in nav_terms) >= 3:
+        return True
+
+    return False
+
+def _browser_resume_saved_account(page, context, username: str) -> bool:
+    """
+    Handle Instagram Web's saved-account resume screen:
+
+        <username>
+        Continue
+        Use another account
+
+    This is not a security/challenge bypass. It only selects the configured
+    saved account when Instagram explicitly presents that account on its normal
+    resume-login screen.
+    """
+    username = str(username or "").strip().lstrip("@")
+    username_lower = username.lower()
+
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=1500) or "",
+        ).strip()
+    except Exception:
+        return False
+
+    body_lower = body.lower()
+
+    # Be conservative: only act on the saved-account chooser when the exact
+    # configured username AND "Use another account" are both visible.
+    if username_lower not in body_lower:
+        return False
+    if "use another account" not in body_lower:
+        return False
+    if "continue" not in body_lower:
+        return False
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"👤 Instagram presented the saved-account resume screen for "
+            f"@{username}; selecting Continue..."
+        ),
+    )
+
+    clicked = False
+
+    # Prefer an explicit "Continue as <username>" button if Instagram uses it.
+    patterns = (
+        rf"^Continue as\s+@?{re.escape(username)}$",
+        rf"^Continue as\s+{re.escape(username)}$",
+        r"^Continue$",
+    )
+
+    for pattern in patterns:
+        try:
+            candidate = page.get_by_role(
+                "button",
+                name=re.compile(pattern, re.I),
+            ).first
+
+            if candidate.count() and candidate.is_visible(timeout=600):
+                candidate.click(timeout=5000)
+                clicked = True
+                break
+        except Exception:
+            pass
+
+    # Some Instagram layouts render Continue as a div/link instead of button.
+    if not clicked:
+        for pattern in patterns:
+            try:
+                candidate = page.get_by_text(
+                    re.compile(pattern, re.I),
+                    exact=True,
+                ).first
+
+                if candidate.count() and candidate.is_visible(timeout=600):
+                    candidate.click(timeout=5000)
+                    clicked = True
+                    break
+            except Exception:
+                pass
+
+    if not clicked:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "⚠️ Saved-account resume screen detected, but the Continue "
+                "control could not be located."
+            ),
+        )
+        return False
+
+    # Give Instagram time to exchange the saved-account state for a normal
+    # authenticated Web session.
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=15000,
+        )
+    except Exception:
+        pass
+
+    page.wait_for_timeout(1800)
+
+    # Instagram's SPA can show its transient error immediately after Continue.
+    if _browser_transient_load_error(page):
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🔄 Instagram showed a transient page error after Continue; "
+                "performing a normal browser reload..."
+            ),
+        )
+        try:
+            page.reload(
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(1400)
+        except Exception:
+            pass
+
+    if (
+        _browser_context_logged_in(context)
+        or _browser_page_authenticated(page, username)
+    ):
+        _browser_refresh_saved_sessionid(
+            context,
+            username,
+        )
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"✅ Continue succeeded; live Chromium is authenticated as "
+                f"@{username}."
+            ),
+        )
+        return True
+
+    # Cookie/UI shell can appear just after the initial navigation.
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if (
+            _browser_context_logged_in(context)
+            or _browser_page_authenticated(page, username)
+        ):
+            _browser_refresh_saved_sessionid(
+                context,
+                username,
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"✅ Continue succeeded; live Chromium is authenticated as "
+                    f"@{username}."
+                ),
+            )
+            return True
+        page.wait_for_timeout(500)
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "⚠️ Continue was clicked, but Instagram did not create an "
+            "authenticated Web session."
+        ),
+    )
+    return False
+
 def _browser_check_ready(page, context, username: str) -> None:
     """
-    Validate Browser Mode auth while recovering Instagram's transient
-    "Something went wrong / page could not be loaded" Web error.
-    """
-    transient = _browser_transient_load_error(page)
+    Validate Browser Mode against the actual live Instagram page.
 
+    For a live CDP browser, the visible page state is checked before cookie /
+    storage-state fallbacks. Saved-account Continue and transient load errors
+    are handled, but security/challenge prompts are never bypassed.
+    """
+    username = str(username or "").strip().lstrip("@")
+
+    # If Instagram presents the normal saved-account chooser, resume only the
+    # exact configured account.
+    _browser_resume_saved_account(
+        page,
+        context,
+        username,
+    )
+
+    # If the actual live page already shows Instagram's authenticated shell,
+    # accept it even if sessionid visibility is lagging or absent.
+    if _browser_page_authenticated(page, username):
+        _browser_refresh_saved_sessionid(
+            context,
+            username,
+        )
+        return
+
+    transient = _browser_transient_load_error(page)
     if transient:
         update_account_metric(
             username,
@@ -3895,7 +4208,19 @@ def _browser_check_ready(page, context, username: str) -> None:
             except Exception:
                 pass
 
-            if not _browser_transient_load_error(page):
+            _browser_resume_saved_account(
+                page,
+                context,
+                username,
+            )
+
+            if (
+                _browser_page_authenticated(page, username)
+                or (
+                    not _browser_transient_load_error(page)
+                    and _browser_context_logged_in(context)
+                )
+            ):
                 recovered = True
                 update_account_metric(
                     username,
@@ -3907,27 +4232,39 @@ def _browser_check_ready(page, context, username: str) -> None:
                 )
                 break
 
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    f"🔄 Instagram Web still shows the transient error after "
-                    f"reload attempt {attempt}."
-                ),
-            )
-
-        if not recovered:
+        if not recovered and _browser_transient_load_error(page):
             raise RuntimeError(
                 "Instagram Web is still showing its transient load-error screen "
-                "after two normal browser reloads. This transient condition is "
-                "not treated as proof of logout, suspension, or an IP ban."
+                "after two normal browser reloads. This is not treated as proof "
+                "of logout, suspension, or an IP ban."
             )
 
-    if not _browser_context_logged_in(context):
-        restored = _restore_saved_browser_session(
+    # Re-check after reload/resume flow.
+    _browser_resume_saved_account(
+        page,
+        context,
+        username,
+    )
+    if _browser_page_authenticated(page, username):
+        _browser_refresh_saved_sessionid(
             context,
             username,
         )
+        return
+
+    # Live browser: do not mix in old saved-state/cookie restore when the exact
+    # already-open browser is attached. Inspect what Instagram is actually
+    # showing instead.
+    live_context = id(context) in LIVE_CDP_CONTEXT_IDS
+
+    if not live_context and not _browser_context_logged_in(context):
+        restored = False
+
+        if not _browser_storage_state_available(username):
+            restored = _restore_saved_browser_session(
+                context,
+                username,
+            )
 
         if restored:
             try:
@@ -3940,54 +4277,60 @@ def _browser_check_ready(page, context, username: str) -> None:
             except Exception:
                 pass
 
-            if _browser_transient_load_error(page):
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🔄 Restored browser session landed on Instagram's "
-                        "transient error page; reloading normally..."
-                    ),
-                )
-                try:
-                    page.reload(
-                        wait_until="domcontentloaded",
-                        timeout=60000,
-                    )
-                    page.wait_for_timeout(1200)
-                except Exception:
-                    pass
+            _browser_resume_saved_account(
+                page,
+                context,
+                username,
+            )
 
-    if not _browser_context_logged_in(context):
-        raise RuntimeError(
-            "Saved Instagram browser profile/session is no longer authenticated. "
-            "No usable session cookie remains after restore. Use Browser Login again."
-        )
+    if (
+        _browser_context_logged_in(context)
+        or _browser_page_authenticated(page, username)
+    ):
+        problem = _browser_page_problem(page)
+        if problem:
+            CONTROL_PAUSED_ACCOUNTS.add(username)
+            update_account_metric(
+                username,
+                "status",
+                status="Browser Verification Needed",
+            )
+            raise RuntimeError(
+                f"Instagram Web requires manual attention: {problem}. "
+                "Complete the prompt manually in the live Chromium window."
+            )
 
-    problem = _browser_page_problem(page)
-    if problem:
-        CONTROL_PAUSED_ACCOUNTS.add(username)
-        update_account_metric(
+        _browser_refresh_saved_sessionid(
+            context,
             username,
-            "status",
-            status="Browser Verification Needed",
         )
-        raise RuntimeError(
-            f"Instagram Web requires manual attention: {problem}. "
-            "Use Browser Login and complete the prompt manually."
-        )
+        return
 
-    transient = _browser_transient_load_error(page)
-    if transient:
-        raise RuntimeError(
-            "Instagram Web session appears present, but the page is still in "
-            "a transient load-error state after recovery attempts."
-        )
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=1200) or "",
+        ).strip()
+    except Exception:
+        body = ""
 
-    _browser_refresh_saved_sessionid(
-        context,
+    update_account_metric(
         username,
+        "add_history",
+        value=(
+            "⚠️ Live Instagram page is not authenticated yet. "
+            f"Current URL={str(page.url or '')[:160]} | "
+            f"page text={body[:180]}"
+        ),
     )
+
+    raise RuntimeError(
+        "The live Instagram Chromium window is not authenticated yet. "
+        "Finish Browser Login in that same window before running Post/Follow/Engage."
+    )
+
+
 
 
 
@@ -4080,8 +4423,7 @@ def _restore_saved_browser_session(context, username: str) -> bool:
 
 def _browser_refresh_saved_sessionid(context, username: str) -> None:
     """
-    If Instagram rotated the sessionid during normal browser use, persist the
-    newest value for the next Browser Mode launch.
+    Persist rotated sessionid and refresh the complete Playwright storage state.
     """
     try:
         cookies = context.cookies("https://www.instagram.com/")
@@ -4098,15 +4440,369 @@ def _browser_refresh_saved_sessionid(context, username: str) -> None:
     except Exception:
         pass
 
+    try:
+        _save_full_browser_storage_state(context, username)
+    except Exception:
+        pass
+
+
+
+def _browser_live_profile_dir(username: str) -> Path:
+    safe = str(username or "").strip().lstrip("@").replace(".", "_")
+    return DOWNLOAD_ROOT / f"browser_live_{safe}"
+
+def _browser_live_port(username: str) -> int:
+    username = str(username or "").strip().lstrip("@")
+    try:
+        index = list(CONTROL_ROSTER.keys()).index(username)
+    except Exception:
+        index = sum(ord(ch) for ch in username) % 20
+    return 9460 + int(index)
+
+
+def _browser_live_endpoint(username: str) -> str:
+    return f"http://127.0.0.1:{_browser_live_port(username)}"
+
+
+def _browser_connect_live(p, username: str):
+    try:
+        browser = p.chromium.connect_over_cdp(
+            _browser_live_endpoint(username),
+            timeout=2500,
+        )
+        contexts = browser.contexts
+        if not contexts:
+            return None, None
+        context = contexts[0]
+        LIVE_CDP_CONTEXT_IDS.add(id(context))
+        BROWSER_HANDLE_BY_CONTEXT[id(context)] = browser
+        return browser, context
+    except Exception:
+        return None, None
+
+
+def _browser_close_stale_live_process(p, username: str) -> bool:
+    """
+    Browser Login must always give the user a visible Chromium window.
+
+    If a live-CDP Chromium from an earlier bot run is still listening on this
+    account's port, close that stale browser before launching a fresh visible
+    one. Normal Browser Mode actions do NOT call this helper and continue to
+    reuse the live session.
+    """
+    browser = None
+    try:
+        browser = p.chromium.connect_over_cdp(
+            _browser_live_endpoint(username),
+            timeout=2000,
+        )
+    except Exception:
+        return False
+
+    try:
+        # Closing through the CDP browser connection terminates the stale
+        # external Chromium instance that owns this dedicated account port.
+        browser.close()
+    except Exception:
+        return False
+
+    # Give Windows/Linux a moment to release the debugging port and profile.
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        time.sleep(0.25)
+        probe = None
+        try:
+            probe = p.chromium.connect_over_cdp(
+                _browser_live_endpoint(username),
+                timeout=600,
+            )
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
+        except Exception:
+            return True
+
+    return True
+
+def _browser_launch_live_process(
+    p,
+    username: str,
+    *,
+    force_fresh_visible: bool = False,
+):
+    """
+    Launch/reconnect the per-account live Chromium session.
+
+    Important Windows behavior:
+    Chromium can make the initially spawned process exit with code 0 after
+    handing work to another browser process. Therefore an immediate code-0
+    exit is NOT treated as failure; we continue probing the localhost CDP port.
+
+    Browser Login uses a dedicated live profile directory so it cannot collide
+    with the older persistent-profile directory used by legacy builds.
+    """
+    username = str(username or "").strip().lstrip("@")
+
+    if force_fresh_visible:
+        closed = _browser_close_stale_live_process(
+            p,
+            username,
+        )
+        if closed:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🧹 Closed stale live Chromium listener from a previous "
+                    "bot run before launching Browser Login."
+                ),
+            )
+    else:
+        existing_browser, existing_context = _browser_connect_live(
+            p,
+            username,
+        )
+        if existing_context is not None:
+            return existing_browser, existing_context
+
+    executable = p.chromium.executable_path
+
+    # Do NOT reuse the legacy browser_<username> profile here. A previous
+    # Chromium process may still own its SingletonLock on Windows.
+    profile_dir = _browser_live_profile_dir(username)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    port = _browser_live_port(username)
+
+    cmd = [
+        str(executable),
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--start-maximized",
+        "--new-window",
+        "https://www.instagram.com/",
+    ]
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
+    LIVE_BROWSER_PROCESSES[username] = proc
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"🌐 Launching fresh live Chromium with dedicated profile "
+            f"{profile_dir} on localhost port {port}..."
+        ),
+    )
+
+    deadline = time.time() + 20
+    last_exc = None
+    launcher_exit_code = None
+
+    while time.time() < deadline:
+        time.sleep(0.35)
+
+        poll = proc.poll()
+        if poll is not None and launcher_exit_code is None:
+            launcher_exit_code = poll
+
+            # Code 0 is common when Chromium hands off to another process.
+            # Keep probing CDP rather than failing immediately.
+            if poll == 0:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "ℹ️ Chromium launcher process exited with code 0; "
+                        "continuing to look for the live browser process..."
+                    ),
+                )
+            else:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"⚠️ Chromium launcher exited with code {poll}; "
+                        "still probing the debugging port briefly."
+                    ),
+                )
+
+        try:
+            browser = p.chromium.connect_over_cdp(
+                _browser_live_endpoint(username),
+                timeout=1800,
+            )
+            contexts = browser.contexts
+
+            if contexts:
+                context = contexts[0]
+                LIVE_CDP_CONTEXT_IDS.add(id(context))
+                BROWSER_HANDLE_BY_CONTEXT[id(context)] = browser
+
+                page = (
+                    context.pages[0]
+                    if context.pages
+                    else context.new_page()
+                )
+
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "✅ Fresh visible Chromium is running and connected "
+                        f"for Browser Login on localhost port {port}."
+                    ),
+                )
+                return browser, context
+
+        except Exception as exc:
+            last_exc = exc
+
+    # Only terminate the original launcher if it is still alive.
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
+
+    LIVE_BROWSER_PROCESSES.pop(username, None)
+
+    raise RuntimeError(
+        "Could not connect to the fresh Chromium Browser Login session. "
+        f"Launcher exit code={launcher_exit_code!r}; localhost port={port}. "
+        "Close any Chromium window whose profile belongs to this bot and retry. "
+        f"Last connection error: "
+        f"{type(last_exc).__name__ if last_exc else 'none'}: "
+        f"{str(last_exc)[:160] if last_exc else ''}"
+    )
+
+
+
+
+def _browser_live_port_open(username: str, timeout: float = 0.18) -> bool:
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", _browser_live_port(username)),
+            timeout=max(0.05, float(timeout)),
+        ):
+            return True
+    except OSError:
+        return False
+
+
+def _mark_browser_login_needed(username: str, reason: str) -> None:
+    username = str(username or "").strip().lstrip("@")
+    with CONTROL_LOCK:
+        BROWSER_NATIVE_ACCOUNTS.discard(username)
+        CLIENT_CACHE.pop(username, None)
+        CONTROL_DISCONNECTED_ACCOUNTS.add(username)
+        CONTROL_PAUSED_ACCOUNTS.add(username)
+        CONTROL_FORCE_RUN.discard(username)
+        NEXT_TASK_OVERRIDE.pop(username, None)
+        AUTH_EVENT[username] = "browser_login_needed"
+    update_account_metric(username, "status", status="Browser Login Needed")
+    update_account_metric(username, "add_history", value=f"🔌 Browser Login needed: {reason}")
+
+def _browser_live_session_available(username: str) -> bool:
+    return _browser_live_port_open(username)
+
+
+def _browser_storage_state_file(username: str) -> Path:
+    safe = str(username or "").strip().lstrip("@").replace(".", "_")
+    return DOWNLOAD_ROOT / f"browser_storage_{safe}.json"
+
+
+def _browser_storage_state_available(username: str) -> bool:
+    path = _browser_storage_state_file(username)
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return isinstance(data, dict) and isinstance(data.get("cookies"), list)
+    except Exception:
+        return False
+
+
+def _save_full_browser_storage_state(context, username: str) -> bool:
+    path = _browser_storage_state_file(username)
+    try:
+        try:
+            context.storage_state(
+                path=str(path),
+                indexed_db=True,
+            )
+        except TypeError:
+            context.storage_state(
+                path=str(path),
+            )
+        return path.exists()
+    except Exception as exc:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "⚠️ Full browser storage-state save failed: "
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            ),
+        )
+        return False
+
+
+def _browser_close_context(context) -> None:
+    context_id = id(context)
+    browser = BROWSER_HANDLE_BY_CONTEXT.pop(context_id, None)
+
+    if context_id in LIVE_CDP_CONTEXT_IDS:
+        LIVE_CDP_CONTEXT_IDS.discard(context_id)
+        # External live Chromium must remain open. The surrounding Playwright
+        # scope will simply detach this client connection.
+        return
+
+    try:
+        context.close()
+    except Exception:
+        pass
+
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+
 
 def _browser_preflight_login(username: str, *, headed: bool = False) -> bool:
     """
-    Fast Browser Mode auth preflight. Used before expensive AI/media analysis.
+    Fast Browser Mode auth preflight.
+
+    When attached to the exact live Chromium session, inspect the current page
+    first instead of reloading it and potentially forcing Instagram back into a
+    saved-account resume state.
     """
     if sync_playwright is None:
-        raise RuntimeError(
-            "Playwright is required for Browser Mode."
-        )
+        raise RuntimeError("Playwright is required for Browser Mode.")
 
     with sync_playwright() as p:
         context = _browser_launch(
@@ -4115,14 +4811,28 @@ def _browser_preflight_login(username: str, *, headed: bool = False) -> bool:
             headed=headed,
         )
         page = context.pages[0] if context.pages else context.new_page()
+        live_context = id(context) in LIVE_CDP_CONTEXT_IDS
 
         try:
-            page.goto(
-                "https://www.instagram.com/",
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            page.wait_for_timeout(900)
+            if "instagram.com" not in str(page.url or "").lower():
+                page.goto(
+                    "https://www.instagram.com/",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(900)
+            elif live_context:
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                page.wait_for_timeout(500)
+            else:
+                page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(900)
 
             _browser_check_ready(
                 page,
@@ -4133,19 +4843,61 @@ def _browser_preflight_login(username: str, *, headed: bool = False) -> bool:
                 context,
                 username,
             )
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "✅ Browser auth preflight passed against the current "
+                    "live Instagram page."
+                ),
+            )
             return True
 
         finally:
-            try:
-                context.close()
-            except Exception:
-                pass
+            _browser_close_context(context)
+
+
+
 
 def _browser_launch(p, username: str, *, headed: bool | None = None):
     if headed is None:
         headed = os.environ.get(
             "IG_BROWSER_AUTOMATION_HEADED", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
+
+    browser, context = _browser_connect_live(p, username)
+    if context is not None:
+        print(
+            f"🌐 @{username}: attached to existing live Instagram Chromium session.",
+            flush=True,
+        )
+        return context
+
+    state_path = _browser_storage_state_file(username)
+
+    if _browser_storage_state_available(username):
+        browser = p.chromium.launch(
+            headless=not headed,
+        )
+        try:
+            context = browser.new_context(
+                storage_state=str(state_path),
+                viewport={"width": 1280, "height": 900},
+            )
+        except Exception:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            raise
+
+        BROWSER_HANDLE_BY_CONTEXT[id(context)] = browser
+        print(
+            f"🔐 @{username}: loaded full Instagram Web storage state (fallback).",
+            flush=True,
+        )
+        return context
 
     context = p.chromium.launch_persistent_context(
         str(_browser_profile_dir(username)),
@@ -4160,11 +4912,13 @@ def _browser_launch(p, username: str, *, headed: bool | None = None):
         )
         if restored:
             print(
-                f"🔐 @{username}: restored saved Instagram Web session into Chromium.",
+                f"🔐 @{username}: restored legacy Instagram Web session.",
                 flush=True,
             )
 
     return context
+
+
 
 
 
@@ -4821,10 +5575,7 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                 )
             except Exception:
                 pass
-            try:
-                context.close()
-            except Exception:
-                pass
+            _browser_close_context(context)
 
     return confirmed_count
 
@@ -5031,10 +5782,7 @@ def _browser_engage_hashtag(username, history, config, manual=False) -> int:
                 )
             except Exception:
                 pass
-            try:
-                context.close()
-            except Exception:
-                pass
+            _browser_close_context(context)
 
     history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
     history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
@@ -5048,14 +5796,15 @@ def _browser_engage_hashtag(username, history, config, manual=False) -> int:
 
 
 
-def _browser_prepare_post(username, history, folder_pool):
-    settings = get_account_control_settings(username)
+def _browser_select_post_media(username, history, folder_pool):
+    """Fast media selection with no Ollama work."""
     history.setdefault("posted_ids", [])
     history.setdefault("browser_pending_uploads", [])
 
     now = time.time()
     pending = []
     pending_ids = set()
+
     for item in history["browser_pending_uploads"]:
         if not isinstance(item, dict):
             continue
@@ -5063,156 +5812,326 @@ def _browser_prepare_post(username, history, folder_pool):
         if now - created < 24 * 3600:
             pending.append(item)
             pending_ids.add(str(item.get("folder_id") or ""))
+
     history["browser_pending_uploads"] = pending
 
     pool = [
-        folder for folder in folder_pool
+        folder
+        for folder in folder_pool
         if folder["id"] not in history["posted_ids"]
         and folder["id"] not in pending_ids
     ]
     random.shuffle(pool)
 
     valid_exts = {".jpg", ".jpeg", ".png", ".mp4"}
-    selected = None
-    media_files = []
+    checked = 0
 
     for folder in pool:
-        files = sorted(
-            p for p in folder["path"].iterdir()
-            if p.is_file() and p.suffix.lower() in valid_exts
-        )
-        if files:
-            selected = folder
-            media_files = files
-            break
-
-    if not selected:
-        return None
-
-    text_context = ""
-    for txt in sorted(
-        p for p in selected["path"].iterdir()
-        if p.is_file() and p.suffix.lower() in {".txt", ".caption", ".md"}
-    )[:3]:
+        checked += 1
         try:
-            body = txt.read_text(
-                encoding="utf-8",
-                errors="replace",
-            ).strip()
-            if body:
-                text_context += (
-                    ("\n" if text_context else "")
-                    + body[:3000]
+            media_files = sorted(
+                p
+                for p in folder["path"].iterdir()
+                if (
+                    p.is_file()
+                    and p.suffix.lower() in valid_exts
+                    and p.stat().st_size > 0
                 )
+            )
         except OSError:
-            pass
+            continue
 
-    analysis = analyze_media_for_caption(
-        media_files,
-        sidecar_text=text_context,
-        source_account=selected.get("source", ""),
-        frame_count=settings["video_frames"],
-        require_video_vision=settings["require_video_vision"],
+        if not media_files:
+            continue
+
+        videos = [p for p in media_files if p.suffix.lower() == ".mp4"]
+        photos = [
+            p for p in media_files
+            if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        ]
+        upload_files = [videos[0]] if videos else photos[:10]
+        if not upload_files:
+            continue
+
+        text_context = ""
+        try:
+            sidecars = sorted(
+                p
+                for p in folder["path"].iterdir()
+                if p.is_file()
+                and p.suffix.lower() in {".txt", ".caption", ".md"}
+            )[:3]
+        except OSError:
+            sidecars = []
+
+        for txt in sidecars:
+            try:
+                body = txt.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).strip()
+                if body:
+                    text_context += (
+                        ("\n" if text_context else "")
+                        + body[:3000]
+                    )
+            except OSError:
+                pass
+
+        return {
+            "folder": folder,
+            "files": upload_files,
+            "analysis_files": media_files,
+            "text_context": text_context,
+            "checked_candidates": checked,
+            "available_candidates": len(pool),
+        }
+
+    return None
+
+
+def _browser_fallback_caption(username, selection, reason="AI unavailable"):
+    """Guaranteed fallback so AI failure does not cancel a valid upload."""
+    settings = get_account_control_settings(username)
+
+    clean_sidecar = _sanitize_post_context(
+        selection.get("text_context", ""),
+        selection["folder"].get("source", ""),
+    ).strip()
+
+    if clean_sidecar:
+        caption = _clip_chars(clean_sidecar.splitlines()[0].strip(), 220)
+    else:
+        caption = "New post."
+
+    is_video = any(
+        p.suffix.lower() == ".mp4"
+        for p in selection["files"]
     )
+
+    tags = (
+        "#video #reels #creator #explore #daily"
+        if is_video
+        else "#photo #creator #explore #daily #instagood"
+    )
+
+    total_limit = int(settings["caption_char_limit"])
+    caption = _clip_chars(
+        caption,
+        max(20, total_limit - len(tags) - 2),
+    )
+
+    return {
+        "caption": f"{caption}\n\n{tags}".strip(),
+        "used_fallback": True,
+        "reason": str(reason or "AI unavailable"),
+        "analysis": None,
+    }
+
+
+def _browser_generate_post_caption(username, selection):
+    """
+    Slow AI phase after media is already attached in Chromium.
+
+    Uses a small vision-frame cap and one combined text-model call for both
+    caption and hashtags. Any failure falls back instead of cancelling upload.
+    """
+    settings = get_account_control_settings(username)
+
+    try:
+        requested_frames = int(settings.get("video_frames", 5))
+    except Exception:
+        requested_frames = 5
+
+    frame_count = max(
+        3,
+        min(requested_frames, BROWSER_POST_VISION_FRAMES),
+    )
+
+    try:
+        analysis = analyze_media_for_caption(
+            selection["analysis_files"],
+            sidecar_text=selection.get("text_context", ""),
+            source_account=selection["folder"].get("source", ""),
+            frame_count=frame_count,
+            require_video_vision=settings["require_video_vision"],
+        )
+    except Exception as exc:
+        return _browser_fallback_caption(
+            username,
+            selection,
+            reason=f"vision analysis error: {type(exc).__name__}",
+        )
+
     if analysis.get("vision_required_failed"):
-        return None
+        return _browser_fallback_caption(
+            username,
+            selection,
+            reason=(
+                "required video vision unavailable "
+                f"(frames={analysis.get('frames_analyzed', 0)})"
+            ),
+        )
 
-    semantic_context = analysis["context"]
-    caption = generate_rage_bait_caption(
-        semantic_context,
-        perspective=analysis["perspective"],
-        account_username=username,
-    )
-    if not caption:
-        return None
+    semantic_context = str(analysis.get("context") or "").strip()
+    perspective = str(analysis.get("perspective") or "UNKNOWN").upper()
 
-    hashtag_prompt = f"""
-Generate EXACTLY 5 relevant Instagram hashtags based ONLY on this media analysis:
+    if perspective in {"POV_FIRST_PERSON", "SELFIE_VLOG"}:
+        perspective_rule = (
+            "Use natural first-person narration as the fictional filmer/account "
+            "voice without identifying any real person."
+        )
+    elif perspective == "THIRD_PERSON":
+        perspective_rule = (
+            "Use the account voice reacting to the visible scene without "
+            "claiming to literally be an identifiable person shown."
+        )
+    else:
+        perspective_rule = (
+            "Use a natural account voice without inventing identities or events."
+        )
 
+    extra = str(settings.get("caption_prompt", "") or "").strip()
+    persona = str(
+        settings.get("persona_prompt", RAGE_BAIT_PERSONA) or RAGE_BAIT_PERSONA
+    ).strip()
+    char_limit = int(settings["caption_char_limit"])
+
+    prompt = f"""
+Write ONE Instagram caption and EXACTLY 5 relevant hashtags for this exact media.
+
+MEDIA ANALYSIS:
 {semantic_context}
 
-Output only 5 space-separated hashtags.
+PERSPECTIVE:
+{perspective}
+{perspective_rule}
+
+ACCOUNT-SPECIFIC CAPTION INSTRUCTIONS:
+{extra or "(none)"}
+
+Return exactly:
+CAPTION: <caption text>
+HASHTAGS: #tag1 #tag2 #tag3 #tag4 #tag5
+
+Rules:
+- Base the caption on the supplied visual analysis.
+- Never mention source usernames, repost metadata, archive folders, or filenames.
+- Do not invent a location, identity, profession, event, or stock/trading topic.
+- Keep the caption under {char_limit} characters before hashtags.
+- Complete natural sentences.
 """.strip()
 
     try:
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": settings["persona_prompt"],
-                },
-                {
-                    "role": "user",
-                    "content": hashtag_prompt,
-                },
+                {"role": "system", "content": persona},
+                {"role": "user", "content": prompt},
             ],
-            options={"temperature": 0.45, "top_p": 0.9},
+            options={"temperature": 0.55, "top_p": 0.9},
         )
-        raw_tags = _clean_ollama_output(
+
+        raw = _clean_ollama_output(
             response.get("message", {}).get("content", "")
+            if isinstance(response, dict)
+            else getattr(
+                getattr(response, "message", None),
+                "content",
+                "",
+            )
+        ).strip()
+    except Exception as exc:
+        return _browser_fallback_caption(
+            username,
+            selection,
+            reason=f"caption model error: {type(exc).__name__}",
         )
-    except Exception:
-        raw_tags = ""
+
+    caption_match = re.search(
+        r"CAPTION:\s*(.*?)(?:\n\s*HASHTAGS:|\Z)",
+        raw,
+        re.I | re.S,
+    )
+    caption = caption_match.group(1).strip() if caption_match else ""
+
+    hashtag_match = re.search(
+        r"HASHTAGS:\s*(.*)",
+        raw,
+        re.I | re.S,
+    )
+    hashtag_source = hashtag_match.group(1) if hashtag_match else raw
 
     tags = []
-    for token in raw_tags.replace("\n", " ").split():
-        token = token.strip(" ,.;:!?")
-        if token and not token.startswith("#"):
-            token = "#" + token
-        if re.fullmatch(r"#[A-Za-z0-9_]+", token) and token not in tags:
+    for token in re.findall(r"#[A-Za-z0-9_]+", hashtag_source):
+        if token not in tags:
             tags.append(token)
         if len(tags) == 5:
             break
 
-    for fallback in (
-        "#video",
-        "#reels",
-        "#creator",
-        "#explore",
-        "#daily",
-    ):
+    is_video = any(
+        p.suffix.lower() == ".mp4"
+        for p in selection["files"]
+    )
+    fallback_tags = (
+        ("#video", "#reels", "#creator", "#explore", "#daily")
+        if is_video
+        else ("#photo", "#creator", "#explore", "#daily", "#instagood")
+    )
+
+    for tag in fallback_tags:
         if len(tags) >= 5:
             break
-        if fallback not in tags:
-            tags.append(fallback)
+        if tag not in tags:
+            tags.append(tag)
+
+    if not caption:
+        return _browser_fallback_caption(
+            username,
+            selection,
+            reason="caption model returned no usable caption",
+        )
 
     tag_line = " ".join(tags[:5])
-    total_limit = int(settings["caption_char_limit"])
     caption = _clip_chars(
         caption,
-        max(20, total_limit - len(tag_line) - 2),
+        max(20, char_limit - len(tag_line) - 2),
     )
-    full_caption = f"{caption}\n\n{tag_line}".strip()
-
-    videos = [
-        p for p in media_files
-        if p.suffix.lower() == ".mp4"
-    ]
-    photos = [
-        p for p in media_files
-        if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-    ]
-
-    if videos:
-        upload_files = [videos[0]]
-    else:
-        upload_files = photos[:10]
-
-    if not upload_files:
-        return None
 
     return {
-        "folder": selected,
-        "files": upload_files,
-        "caption": full_caption,
+        "caption": f"{caption}\n\n{tag_line}".strip(),
+        "used_fallback": False,
+        "reason": "",
+        "analysis": analysis,
     }
+
+
+def _browser_prepare_post(username, history, folder_pool):
+    """Compatibility wrapper; Browser Post now uses split attach-first flow."""
+    selection = _browser_select_post_media(
+        username,
+        history,
+        folder_pool,
+    )
+    if not selection:
+        return None
+
+    generated = _browser_generate_post_caption(
+        username,
+        selection,
+    )
+
+    return {
+        "folder": selection["folder"],
+        "files": selection["files"],
+        "caption": generated["caption"],
+    }
+
 
 
 def _browser_post(username, history, folder_pool, manual=False) -> bool:
     settings = get_account_control_settings(username)
 
-    # Manual Post is independent of the Auto Posts checkbox.
     if not manual and not settings.get("enable_posts", False):
         return False
 
@@ -5228,7 +6147,7 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
     update_account_metric(
         username,
         "add_history",
-        value="🔐 Browser Post: checking saved Instagram Web login and recovering transient page errors before AI/media prep...",
+        value="🔐 Browser Post: checking live Instagram Web login before media selection...",
     )
 
     preflight_started = time.time()
@@ -5241,58 +6160,46 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
     update_account_metric(
         username,
         "add_history",
-        value=(
-            f"✅ Browser Post login preflight passed in {preflight_elapsed}s; "
-            "starting media/AI preparation."
-        ),
+        value=f"✅ Browser Post login preflight passed in {preflight_elapsed}s.",
     )
 
     if not folder_pool:
         update_account_metric(
             username,
             "add_history",
-            value=(
-                f"⚠️ Browser Post: no media folders found under {get_media_root()}."
-            ),
+            value=f"⚠️ Browser Post: no media folders found under {get_media_root()}.",
         )
         return False
 
-    # Media prep may include video frame extraction + Ollama and can take minutes.
-    update_account_metric(
-        username,
-        "add_history",
-        value="🧠 Browser Post: selecting media and generating AI caption/hashtags...",
-    )
-
-    prep_started = time.time()
-    prepared = _browser_prepare_post(
+    select_started = time.time()
+    selection = _browser_select_post_media(
         username,
         history,
         folder_pool,
     )
-    prep_elapsed = int(time.time() - prep_started)
+    select_elapsed = time.time() - select_started
 
-    if not prepared:
+    if not selection:
         update_account_metric(
             username,
             "add_history",
             value=(
-                f"⚠️ Browser Post found no prepared media after {prep_elapsed}s. "
-                "Check media root, unused-history state, and vision-model logs."
+                "⚠️ Browser Post found no unused uploadable "
+                f".mp4/.jpg/.jpeg/.png media in {select_elapsed:.1f}s."
             ),
         )
         return False
 
-    selected = prepared["folder"]
-    files = prepared["files"]
-    full_caption = prepared["caption"]
+    selected = selection["folder"]
+    files = selection["files"]
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            f"✅ Browser Post prepared in {prep_elapsed}s: "
-            f"{', '.join(p.name for p in files)} from {selected['path']}"
+            f"✅ Browser Post selected media in {select_elapsed:.1f}s: "
+            f"{', '.join(p.name for p in files)} from {selected['path']}. "
+            "Opening Instagram BEFORE AI caption generation."
         ),
     )
 
@@ -5308,12 +6215,17 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
         )
         return False
 
+    ai_executor = None
+    ai_future = None
+    full_caption = None
+
     with sync_playwright() as p:
         update_account_metric(
             username,
             "add_history",
-            value="🌐 Browser Post: launching saved Chromium profile...",
+            value="🌐 Browser Post: attaching to live Chromium session...",
         )
+
         context = _browser_launch(
             p,
             username,
@@ -5336,7 +6248,10 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
             update_account_metric(
                 username,
                 "add_history",
-                value=f"🔎 Browser Post: baseline contains {len(before_links)} profile post/reel URL(s).",
+                value=(
+                    f"🔎 Browser Post: baseline contains "
+                    f"{len(before_links)} profile post/reel URL(s)."
+                ),
             )
 
             page.goto(
@@ -5344,7 +6259,7 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(700)
             _browser_check_ready(page, context, username)
 
             update_account_metric(
@@ -5389,9 +6304,10 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
             )
 
             file_input = page.locator("input[type='file']").first
-            deadline = time.time() + 10
+            deadline = time.time() + 12
+
             while time.time() < deadline and not file_input.count():
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(350)
                 file_input = page.locator("input[type='file']").first
 
             if not file_input.count():
@@ -5402,16 +6318,39 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
             file_input.set_input_files(
                 [str(path) for path in files]
             )
+
             update_account_metric(
                 username,
                 "add_history",
                 value=(
                     f"⬆️ Browser Post attached "
-                    f"{', '.join(p.name for p in files)}"
+                    f"{', '.join(p.name for p in files)}. "
+                    "Instagram is now processing the media."
                 ),
             )
 
-            page.wait_for_timeout(1600)
+            ai_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"ig-caption-{username}",
+            )
+            ai_future = ai_executor.submit(
+                _browser_generate_post_caption,
+                username,
+                selection,
+            )
+            ai_started = time.time()
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🧠 Browser Post AI started AFTER media attachment. "
+                    f"Vision uses up to {BROWSER_POST_VISION_FRAMES} frame(s); "
+                    "caption + hashtags use one text-model call."
+                ),
+            )
+
+            page.wait_for_timeout(1400)
 
             for next_index in range(3):
                 if _browser_click_text_button(
@@ -5422,16 +6361,22 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                     update_account_metric(
                         username,
                         "add_history",
-                        value=f"➡️ Browser Post advanced composer step {next_index + 1}.",
+                        value=(
+                            f"➡️ Browser Post advanced composer step "
+                            f"{next_index + 1} while AI runs."
+                        ),
                     )
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(900)
                 else:
                     break
 
             update_account_metric(
                 username,
                 "add_history",
-                value="✍️ Browser Post: locating caption editor...",
+                value=(
+                    "✍️ Browser Post: locating caption editor; "
+                    "media is already loaded in Chromium."
+                ),
             )
 
             caption_box = None
@@ -5452,6 +6397,74 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
             if caption_box is None:
                 raise RuntimeError(
                     "Instagram Web caption editor was not found."
+                )
+
+            generated = None
+            last_notice = 0.0
+
+            while generated is None:
+                elapsed = time.time() - ai_started
+                remaining = BROWSER_POST_AI_TIMEOUT_SECONDS - elapsed
+
+                if remaining <= 0:
+                    generated = _browser_fallback_caption(
+                        username,
+                        selection,
+                        reason=(
+                            f"AI exceeded "
+                            f"{BROWSER_POST_AI_TIMEOUT_SECONDS}s timeout"
+                        ),
+                    )
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            "⚠️ Browser Post AI timed out; continuing with "
+                            "fallback caption instead of cancelling upload."
+                        ),
+                    )
+                    break
+
+                try:
+                    generated = ai_future.result(
+                        timeout=min(12, max(1, remaining))
+                    )
+                except FutureTimeoutError:
+                    if time.time() - last_notice >= 15:
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value=(
+                                f"🧠 Browser Post AI still working "
+                                f"({int(elapsed)}s); media is already attached "
+                                "and composer is ready."
+                            ),
+                        )
+                        last_notice = time.time()
+                except Exception as exc:
+                    generated = _browser_fallback_caption(
+                        username,
+                        selection,
+                        reason=f"AI worker error: {type(exc).__name__}",
+                    )
+
+            full_caption = generated["caption"]
+
+            if generated.get("used_fallback"):
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "⚠️ Browser Post using fallback caption: "
+                        f"{generated.get('reason', 'AI unavailable')}."
+                    ),
+                )
+            else:
+                ai_elapsed = int(time.time() - ai_started)
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=f"✅ Browser Post AI caption ready in {ai_elapsed}s.",
                 )
 
             try:
@@ -5502,22 +6515,30 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                     username,
                 )
                 new_links = current - before_links
+
                 if new_links:
                     confirmed = True
                     final_link = sorted(new_links)[-1]
                     break
 
                 if time.time() - last_notice >= 15:
-                    remaining = max(0, int(deadline - time.time()))
+                    remaining = max(
+                        0,
+                        int(deadline - time.time()),
+                    )
                     update_account_metric(
                         username,
                         "add_history",
-                        value=f"⏳ Browser Post verification: {remaining}s remaining; no new profile URL yet.",
+                        value=(
+                            f"⏳ Browser Post verification: {remaining}s remaining; "
+                            "no new profile URL yet."
+                        ),
                     )
                     last_notice = time.time()
 
             if confirmed:
                 record_write(username, "upload")
+
                 if selected["id"] not in history["posted_ids"]:
                     history["posted_ids"].append(selected["id"])
 
@@ -5526,6 +6547,7 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                     "total_posts",
                     increment=1,
                 )
+
                 record_recent_post(
                     username=username,
                     folder_path=selected["path"],
@@ -5533,6 +6555,7 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                     media_id="browser",
                     permalink=final_link,
                 )
+
                 update_account_metric(
                     username,
                     "add_history",
@@ -5553,6 +6576,7 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
             history["browser_pending_uploads"] = (
                 history["browser_pending_uploads"][-30:]
             )
+
             update_account_metric(
                 username,
                 "add_history",
@@ -5576,6 +6600,15 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
             raise
 
         finally:
+            if ai_executor is not None:
+                try:
+                    ai_executor.shutdown(
+                        wait=False,
+                        cancel_futures=True,
+                    )
+                except Exception:
+                    pass
+
             try:
                 _browser_refresh_saved_sessionid(
                     context,
@@ -5583,15 +6616,34 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                 )
             except Exception:
                 pass
-            try:
-                context.close()
-            except Exception:
-                pass
+
+            _browser_close_context(context)
+
 
 
 
 def run_browser_profile_workflow(username, conf, folder_pool):
     ACCOUNT_COOLDOWNS.pop(username, None)
+
+    if username in BROWSER_LOGIN_IN_PROGRESS:
+        update_account_metric(
+            username,
+            "status",
+            status="Browser Login In Progress",
+        )
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "⏸️ Browser Mode workflow skipped because Browser Login "
+                "is still waiting for manual completion."
+            ),
+        )
+        return "paused"
+
+    if not _browser_live_port_open(username):
+        _mark_browser_login_needed(username, "the live Chromium process is no longer running")
+        return "disconnected"
 
     forced_task = NEXT_TASK_OVERRIDE.pop(username, None)
 
@@ -6032,60 +7084,61 @@ def _control_remove_account(username):
 
 
 def _control_metrics_payload():
-    metrics = load_analytics()
-    result = {}
-
-    for username, conf in CONTROL_ROSTER.items():
-        row = dict(metrics.get(username, _new_account_metrics()))
-        session_path = DOWNLOAD_ROOT / conf["session_file"]
-        browser_mode = username in BROWSER_NATIVE_ACCOUNTS
-        private_connected = (
-            username in CLIENT_CACHE
-            and username not in CONTROL_DISCONNECTED_ACCOUNTS
-        )
-        connected = private_connected or browser_mode
-
-        row["control"] = {
-            "connected": connected,
-            "disconnected": not connected,
-            "paused": username in CONTROL_PAUSED_ACCOUNTS,
-            "auto_enabled": (
-                connected
-                and username not in CONTROL_PAUSED_ACCOUNTS
-            ),
-            "browser_mode": browser_mode,
-            "browser_profile_saved": _browser_profile_saved(username),
-            "private_api_connected": private_connected,
-            "saved_session": session_path.exists(),
-            "session_file": session_path.name,
-            "queued_task": NEXT_TASK_OVERRIDE.get(username, ""),
-            "auth_event": AUTH_EVENT.get(username, ""),
-            "write_budget_used": len(_prune_write_window(username)),
-            "write_budget_max": MAX_WRITES_PER_WINDOW,
-            "write_window_seconds": WRITE_WINDOW_SECONDS,
-            "upload_cooldown_seconds": _effective_pacing(username)["upload"],
-            "settings": get_account_control_settings(username, conf),
-            "safety": get_account_safety_state(username),
+    metrics=load_analytics(); result={}
+    for username,conf in CONTROL_ROSTER.items():
+        row=dict(metrics.get(username,_new_account_metrics())); session_path=DOWNLOAD_ROOT/conf["session_file"]
+        browser_mode=username in BROWSER_NATIVE_ACCOUNTS; browser_live=_browser_live_port_open(username)
+        private_connected=username in CLIENT_CACHE and username not in CONTROL_DISCONNECTED_ACCOUNTS
+        connected=private_connected or (browser_mode and browser_live)
+        row["control"]={
+            "connected":connected,"disconnected":not connected,"paused":username in CONTROL_PAUSED_ACCOUNTS,
+            "auto_enabled":connected and username not in CONTROL_PAUSED_ACCOUNTS,
+            "browser_mode":browser_mode,"browser_live":browser_live,
+            "browser_login_in_progress":username in BROWSER_LOGIN_IN_PROGRESS,
+            "browser_profile_saved":_browser_profile_saved(username),"private_api_connected":private_connected,
+            "saved_session":session_path.exists(),"session_file":session_path.name,
+            "queued_task":NEXT_TASK_OVERRIDE.get(username,""),"auth_event":AUTH_EVENT.get(username,""),
+            "write_budget_used":len(_prune_write_window(username)),"write_budget_max":MAX_WRITES_PER_WINDOW,
+            "write_window_seconds":WRITE_WINDOW_SECONDS,"upload_cooldown_seconds":_effective_pacing(username)["upload"],
+            "settings":get_account_control_settings(username,conf),"safety":get_account_safety_state(username),
         }
-        result[username] = row
+        result[username]=row
+    return {"accounts":result,"recent_posts":load_recent_posts()[:25],"media":media_root_payload()}
 
-    return {
-        "accounts": result,
-        "recent_posts": load_recent_posts()[:25],
-        "media": media_root_payload(),
-    }
 
 
 
 def _control_browser_login(username, timeout_seconds=600):
-    """
-    Browser bootstrap for accounts whose Instagram Web login works while
-    private-API password login returns needs_upgrade.
+    username = str(username or "").strip().lstrip("@")
+    with ACCOUNT_WORKFLOW_THREADS_LOCK:
+        active_worker = ACCOUNT_WORKFLOW_THREADS.get(username)
+    if active_worker and active_worker.is_alive():
+        raise RuntimeError(
+            f"A workflow is still running for @{username}. Wait for it to finish, "
+            "then click Browser Login."
+        )
 
-    The user completes all login/challenge steps manually. Once Instagram
-    supplies a session cookie, Chromium remains open for a finishing window so
-    post-login prompts such as "Save login info" can be completed before the
-    persistent browser profile is closed and flushed to disk.
+    if username in BROWSER_LOGIN_IN_PROGRESS:
+        if _browser_live_port_open(username):
+            raise RuntimeError(
+                f"Browser Login is already waiting for @{username}. "
+                "Use the existing visible Chromium window and finish the login there."
+            )
+        BROWSER_LOGIN_IN_PROGRESS.discard(username)
+    BROWSER_LOGIN_IN_PROGRESS.add(username)
+    try:
+        return _control_browser_login_impl(username, timeout_seconds=timeout_seconds)
+    finally:
+        BROWSER_LOGIN_IN_PROGRESS.discard(username)
+
+
+def _control_browser_login_impl(username, timeout_seconds=600):
+    """
+    Start or reconnect to one live Chromium process for this account.
+
+    The user completes login/challenges manually. Chromium stays open afterward,
+    and Browser Mode reconnects to the exact same live browser over localhost
+    CDP instead of recreating authenticated state.
 
     No CAPTCHA/challenge is bypassed.
     """
@@ -6101,32 +7154,67 @@ def _control_browser_login(username, timeout_seconds=600):
         )
 
     session_p = DOWNLOAD_ROOT / conf["session_file"]
-    profile_dir = DOWNLOAD_ROOT / f"browser_{username.replace('.', '_')}"
 
-    update_account_metric(username, "status", status="Browser Login Open")
+    update_account_metric(
+        username,
+        "status",
+        status="Browser Login Open",
+    )
     update_account_metric(
         username,
         "add_history",
         value=(
-            "🌐 Browser Login opened. Complete Instagram login and any "
-            "verification manually in Chromium."
+            "🌐 Opening live Chromium. Complete Instagram login and any "
+            "verification manually. Leave this Chromium window open; "
+            "Browser Mode will reuse this exact session."
         ),
     )
 
     sessionid = None
+    live_authenticated = False
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=False,
-            viewport={"width": 1280, "height": 900},
+        browser, context = _browser_launch_live_process(
+            p,
+            username,
+            force_fresh_visible=False,
         )
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(
-            "https://www.instagram.com/",
-            wait_until="domcontentloaded",
-            timeout=60000,
+
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "👀 Browser Login window is open and was brought to the front. "
+                "Log into Instagram manually in that Chromium window."
+            ),
         )
+
+        try:
+            if "instagram.com" not in str(page.url or "").lower():
+                page.goto(
+                    "https://www.instagram.com/",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+        except Exception:
+            pass
+
+        # If this live browser is already at Instagram's saved-account chooser,
+        # select the configured account before waiting for a new sessionid.
+        try:
+            _browser_resume_saved_account(
+                page,
+                context,
+                username,
+            )
+        except Exception:
+            pass
 
         deadline = time.time() + max(120, int(timeout_seconds))
         last_log = 0.0
@@ -6145,7 +7233,18 @@ def _control_browser_login(username, timeout_seconds=600):
             except Exception:
                 sessionid = None
 
-            if sessionid:
+            try:
+                current_url = str(page.url or "").lower()
+            except Exception:
+                current_url = ""
+
+            try:
+                _browser_resume_saved_account(page, context, username)
+            except Exception:
+                pass
+
+            live_authenticated = _browser_page_authenticated(page, username)
+            if live_authenticated:
                 break
 
             now = time.time()
@@ -6154,22 +7253,19 @@ def _control_browser_login(username, timeout_seconds=600):
                     username,
                     "add_history",
                     value=(
-                        "🌐 Waiting for manual Browser Login to complete; "
-                        "finish any Instagram challenge in Chromium."
+                        "🌐 Waiting for manual Browser Login to complete in "
+                        "the live Chromium window..."
                     ),
                 )
                 last_log = now
 
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1000)
 
-        if not sessionid:
-            try:
-                context.close()
-            except Exception:
-                pass
+        if not live_authenticated:
             update_account_metric(username, "status", status="Login Needed")
             raise RuntimeError(
-                "Browser Login timed out before Instagram supplied a sessionid cookie."
+                "Browser Login timed out before the live Instagram page became authenticated. "
+                "Finish login/verification in the visible Chromium window."
             )
 
         finish_seconds = BROWSER_LOGIN_FINISH_SECONDS
@@ -6182,9 +7278,9 @@ def _control_browser_login(username, timeout_seconds=600):
             username,
             "add_history",
             value=(
-                f"🌐 Browser session detected. Chromium will stay open for "
-                f"{finish_seconds}s so you can click Save login info / finish "
-                "post-login prompts. Do not close the window manually."
+                f"🌐 Live session detected. You have {finish_seconds}s to "
+                "finish Save login info / notification / security prompts. "
+                "Chromium will remain OPEN afterward."
             ),
         )
 
@@ -6212,346 +7308,175 @@ def _control_browser_login(username, timeout_seconds=600):
                 update_account_metric(
                     username,
                     "add_history",
-                    value=(
-                        f"🌐 Browser Login finishing window: {remaining}s "
-                        "remaining for Instagram prompts."
-                    ),
+                    value=f"🌐 Live Browser Login: {remaining}s finishing time remaining.",
                 )
                 next_notice = time.time() + 30
 
             page.wait_for_timeout(1000)
 
-        try:
-            page.wait_for_timeout(1200)
-        except Exception:
-            pass
+        _save_browser_sessionid(username, sessionid)
+        _save_full_browser_storage_state(context, username)
 
-        try:
-            context.close()
-        except Exception:
-            pass
-
-    if not sessionid:
-        update_account_metric(username, "status", status="Login Needed")
-        raise RuntimeError(
-            "Instagram browser session disappeared before it could be saved."
-        )
-
-    # Preserve a separate browser-session copy without printing the cookie.
-    _save_browser_sessionid(
-        username,
-        sessionid,
-    )
+        # Do not close the external browser.
+        LIVE_CDP_CONTEXT_IDS.discard(id(context))
+        BROWSER_HANDLE_BY_CONTEXT.pop(id(context), None)
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            "💾 Browser profile/session saved locally. Testing whether "
-            "Instagram also accepts it for private API automation..."
+            "✅ Live Instagram Chromium session is authenticated and left open. "
+            "Browser Mode will reconnect to this exact browser process."
         ),
     )
 
+    private_api_ready = False
     cl = Client()
     _refresh_instagram_app_profile(cl, username)
 
     try:
+        if not sessionid:
+            raise RuntimeError("No browser sessionid was exposed; using Browser Mode only.")
         cl.login_by_sessionid(sessionid)
-    except Exception as exc:
-        if _is_needs_upgrade_error(exc) or is_login_required_error(exc):
-            set_auth_cooldown(username, minutes=360)
-            _activate_browser_native_mode(
-                username,
-                "Instagram Web login is valid, but private API session conversion is blocked.",
-            )
+
+        if verify_authenticated_identity(cl, username, session_p):
+            try:
+                cl.get_timeline_feed()
+                private_api_ready = True
+            except Exception:
+                private_api_ready = False
+
+        if private_api_ready:
+            cl.dump_settings(session_p)
+            patch_obsolete_qe_expose(cl, username)
+            _deactivate_browser_native_mode(username)
+
+            with CONTROL_LOCK:
+                CLIENT_CACHE[username] = cl
+                CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
+                CONTROL_PAUSED_ACCOUNTS.add(username)
+                AUTH_RETRY_AFTER.pop(username, None)
+                ACCOUNT_COOLDOWNS.pop(username, None)
+                AUTH_EVENT[username] = "browser_login_private_ready"
+
             update_account_metric(
                 username,
-                "add_history",
-                value=(
-                    "💾 Browser login is saved, but Instagram rejected the "
-                    "private-API session conversion. Browser profile preserved."
-                ),
+                "status",
+                status="Connected / Auto Off",
             )
-            return {
-                "ok": True,
-                "mode": "browser_saved_private_blocked",
-                "browser_saved": True,
-                "private_api_ready": False,
-                "message": (
-                    "Browser login saved successfully. Instagram is still "
-                    "blocking private-API automation for this account."
-                ),
-            }
-
-        message = str(exc)
-        low = message.lower()
-        if "429" in low or "too many requests" in low or "please wait" in low:
-            set_auth_cooldown(username, minutes=360)
+        else:
             _activate_browser_native_mode(
                 username,
-                "Browser login saved; private API conversion is temporarily throttled.",
-            )
-            return {
-                "ok": True,
-                "mode": "browser_saved_api_cooldown",
-                "browser_saved": True,
-                "private_api_ready": False,
-                "message": (
-                    "Browser login saved successfully. Instagram throttled the "
-                    "private-API conversion attempt; automation remains off."
+                (
+                    "Live Instagram Web session is authenticated. "
+                    "Private API remains unavailable, so Browser Mode will "
+                    "reuse the still-open Chromium process."
                 ),
-            }
+            )
 
+    except Exception as exc:
         _activate_browser_native_mode(
             username,
-            "Browser login saved; private API conversion failed.",
+            (
+                "Live Instagram Web session is authenticated. "
+                "Private API remains unavailable, so Browser Mode will "
+                "reuse the still-open Chromium process."
+            ),
         )
         update_account_metric(
             username,
             "add_history",
             value=(
-                "💾 Browser session remains saved, but instagrapi conversion "
-                f"failed: {type(exc).__name__}: {message[:180]}"
+                "ℹ️ Private API remains unavailable after Browser Login "
+                f"({type(exc).__name__}: {str(exc)[:120]}). "
+                "The live Web session remains usable."
             ),
         )
-        return {
-            "ok": True,
-            "mode": "browser_saved_conversion_failed",
-            "browser_saved": True,
-            "private_api_ready": False,
-            "message": (
-                "Browser login saved, but it could not be converted into an "
-                "instagrapi session."
-            ),
-        }
-
-    if not verify_authenticated_identity(cl, username, session_p):
-        try:
-            cl.logout()
-        except Exception:
-            pass
-        update_account_metric(
-            username,
-            "status",
-            status="Browser Saved / Identity Mismatch",
-        )
-        return {
-            "ok": True,
-            "mode": "browser_saved_identity_mismatch",
-            "browser_saved": True,
-            "private_api_ready": False,
-            "message": (
-                "Browser login was saved, but the converted private session "
-                "did not verify as the configured account."
-            ),
-        }
-
-    cl.dump_settings(session_p)
-    patch_obsolete_qe_expose(cl, username)
-
-    capabilities = probe_browser_import_capabilities(
-        cl,
-        username,
-        conf,
-    )
-
-    if not capabilities.get("timeline"):
-        set_auth_cooldown(username, minutes=360)
-        update_account_metric(
-            username,
-            "status",
-            status="Browser Saved / Private API Blocked",
-        )
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "💾 Browser login/profile saved successfully. Identity conversion "
-                "succeeded, but Instagram still returned LoginRequired for a "
-                "core private timeline read. Browser login is preserved; "
-                "private-API automation remains OFF."
-            ),
-        )
-
-        _activate_browser_native_mode(
-            username,
-            "Browser identity is valid, but Instagram rejects the private timeline endpoint. "
-            "Follow, Engage, and Post will use Instagram Web. Private-API auth cooldowns do not block Browser Mode. Browser sessions are restored from the locally saved Web session when Chromium's persistent profile opens logged out.",
-        )
-
-        return {
-            "ok": True,
-            "mode": "browser_saved_private_blocked",
-            "browser_saved": True,
-            "private_api_ready": False,
-            "capabilities": capabilities,
-            "message": (
-                "Browser login saved. Instagram Web is usable, but private-API "
-                "automation is still blocked for this account."
-            ),
-        }
-
-    capability_note = (
-        "private hashtag feed ready"
-        if capabilities.get("hashtag_private")
-        else (
-            "private hashtag feed blocked; GraphQL hashtag discovery available"
-            if capabilities.get("hashtag_graphql")
-            else "hashtag discovery unavailable"
-        )
-    )
-
-    _deactivate_browser_native_mode(username)
-
-    with CONTROL_LOCK:
-        CLIENT_CACHE[username] = cl
-        CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
-        CONTROL_PAUSED_ACCOUNTS.add(username)
-        AUTH_RETRY_AFTER.pop(username, None)
-        ACCOUNT_COOLDOWNS.pop(username, None)
-        LAST_DM_POLL.pop(username, None)
-        AUTH_EVENT[username] = "browser_login_saved"
-
-    update_account_metric(
-        username,
-        "status",
-        status="Connected / Auto Off",
-    )
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            "🌐 Browser Login saved and private-API readiness passed. "
-            f"Readiness probe: {capability_note}. Background automation "
-            "remains OFF until Start Automation is pressed."
-        ),
-    )
 
     return {
         "ok": True,
-        "mode": "browser_login",
+        "mode": "private_api" if private_api_ready else "live_browser",
         "browser_saved": True,
-        "private_api_ready": True,
-        "capabilities": capabilities,
-        "message": "Browser login saved and private API automation is ready.",
+        "live_browser": True,
+        "private_api_ready": private_api_ready,
+        "message": (
+            "Live Instagram browser is authenticated and remains open. "
+            + (
+                "Private API is also ready."
+                if private_api_ready
+                else "Browser Mode will reuse this exact live Chromium session."
+            )
+        ),
     }
 
 
+
+def _verify_live_browser_ready(username: str) -> tuple[bool, str]:
+    if not _browser_live_port_open(username):
+        return False, "live Chromium is not running"
+    try:
+        _browser_preflight_login(username, headed=True)
+        return True, "authenticated live Chromium verified"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:180]}"
+
 def _control_quick_login(username):
-    """
-    Quick Login prefers the saved instagrapi session. If Instagram rejects the
-    private timeline but this account has a saved Browser Login profile, restore
-    Browser Mode instead.
-    """
     username = str(username or "").strip().lstrip("@")
     conf = _control_conf(username)
     if not conf:
         raise ValueError(f"Unknown account @{username}")
-
     session_p = DOWNLOAD_ROOT / conf["session_file"]
+    live_browser = _browser_live_port_open(username)
 
     if not session_p.exists():
-        if _browser_profile_saved(username):
-            _activate_browser_native_mode(
-                username,
-                "Saved Instagram Web profile restored; no usable private session.",
+        if live_browser:
+            live_ready, live_reason = _verify_live_browser_ready(username)
+            if live_ready:
+                _activate_browser_native_mode(username, "Existing authenticated live Instagram Chromium session verified.")
+                return {"ok":True,"mode":"browser_native","browser_mode":True,"private_api_ready":False}
+            _mark_browser_login_needed(username, f"live Chromium exists but is not authenticated ({live_reason})")
+            raise RuntimeError(
+                "Chromium is open, but Instagram is not authenticated in that live window. "
+                "Click Browser Login and finish the visible login/Continue screen."
             )
-            return {
-                "ok": True,
-                "mode": "browser_native",
-                "browser_mode": True,
-                "private_api_ready": False,
-            }
+        if _browser_profile_saved(username):
+            _mark_browser_login_needed(username, "saved browser data exists but the live Chromium window is closed")
+            raise RuntimeError("Saved Browser Login data exists, but the live Chromium window is closed. Click Browser Login to reopen it.")
+        raise RuntimeError("No saved session exists. Use Browser Login.")
 
-        raise RuntimeError(
-            "No saved session exists for this account. Use Browser Login."
-        )
-
-    cl = Client()
-    cl.load_settings(session_p)
-    _refresh_instagram_app_profile(cl, username)
-
+    cl=Client(); cl.load_settings(session_p); _refresh_instagram_app_profile(cl,username)
     try:
         cl.get_timeline_feed()
     except Exception as exc:
         if is_login_required_error(exc):
+            if live_browser:
+                live_ready, live_reason = _verify_live_browser_ready(username)
+                if live_ready:
+                    _activate_browser_native_mode(username, "Private API rejected the saved session; authenticated live Chromium will be used.")
+                    update_account_metric(username,"add_history",value="🌐 Quick Login: private API returned LoginRequired; verified and attached Browser Mode to the already-running live Chromium.")
+                    return {"ok":True,"mode":"browser_native","browser_mode":True,"private_api_ready":False}
+                _mark_browser_login_needed(username, f"private API is unavailable and live Chromium is not authenticated ({live_reason})")
+                raise RuntimeError(
+                    "Private API is unavailable and the open Chromium window is not authenticated. "
+                    "Click Browser Login and finish the visible login/Continue screen."
+                ) from exc
             if _browser_profile_saved(username):
-                _activate_browser_native_mode(
-                    username,
-                    (
-                        "Saved browser profile restored because Instagram "
-                        "rejected the private timeline endpoint."
-                    ),
-                )
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🌐 Quick Login: private API still returns LoginRequired; "
-                        "restored Browser Mode instead."
-                    ),
-                )
-                return {
-                    "ok": True,
-                    "mode": "browser_native",
-                    "browser_mode": True,
-                    "private_api_ready": False,
-                }
-
-            stop_account_for_private_login_required(
-                username,
-                "Quick Login private timeline validation",
-                exc,
-                hours=6,
-            )
-            raise RuntimeError(
-                "Saved session is not accepted by Instagram's private API and "
-                "no saved Browser Login profile was found."
-            ) from exc
-
+                _mark_browser_login_needed(username, "private API is unavailable and the saved browser profile is not currently running")
+                raise RuntimeError("Private API login is unavailable and the live Chromium window is closed. Click Browser Login to reopen the saved browser profile.") from exc
+            stop_account_for_private_login_required(username,"Quick Login private timeline validation",exc,hours=6)
+            raise RuntimeError("Saved session is not accepted by Instagram's private API and no live Browser Login exists.") from exc
         raise
 
-    if not verify_authenticated_identity(
-        cl,
-        username,
-        session_p,
-    ):
-        raise RuntimeError(
-            "Saved session identity does not match this roster account."
-        )
-
-    patch_obsolete_qe_expose(cl, username)
-    _deactivate_browser_native_mode(username)
-
+    if not verify_authenticated_identity(cl,username,session_p):
+        raise RuntimeError("Saved session identity does not match this roster account.")
+    patch_obsolete_qe_expose(cl,username); _deactivate_browser_native_mode(username)
     with CONTROL_LOCK:
-        CLIENT_CACHE[username] = cl
-        CONTROL_DISCONNECTED_ACCOUNTS.discard(username)
-        CONTROL_PAUSED_ACCOUNTS.add(username)
-        AUTH_RETRY_AFTER.pop(username, None)
-        ACCOUNT_COOLDOWNS.pop(username, None)
-        LAST_DM_POLL.pop(username, None)
-        AUTH_EVENT[username] = "quick_login"
+        CLIENT_CACHE[username]=cl; CONTROL_DISCONNECTED_ACCOUNTS.discard(username); CONTROL_PAUSED_ACCOUNTS.add(username)
+        AUTH_RETRY_AFTER.pop(username,None); ACCOUNT_COOLDOWNS.pop(username,None); LAST_DM_POLL.pop(username,None); AUTH_EVENT[username]="quick_login"
+    update_account_metric(username,"status",status="Connected / Auto Off")
+    update_account_metric(username,"add_history",value="🔓 Quick Login: private API session connected; background automation remains OFF until Start Automation is pressed.")
+    return {"ok":True,"mode":"saved_session","browser_mode":False,"private_api_ready":True}
 
-    update_account_metric(
-        username,
-        "status",
-        status="Connected / Auto Off",
-    )
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            "🔓 Quick Login: private API session connected; background "
-            "automation remains OFF until Start Automation is pressed."
-        ),
-    )
-
-    return {
-        "ok": True,
-        "mode": "saved_session",
-        "browser_mode": False,
-        "private_api_ready": True,
-    }
 
 
 
@@ -6725,7 +7650,16 @@ def _control_pause(username, pause):
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
 
+    if not pause and username in BROWSER_LOGIN_IN_PROGRESS:
+        raise RuntimeError(
+            f"Browser Login is still in progress for @{username}. "
+            "Finish login in Chromium before starting Auto."
+        )
+
     browser_mode = username in BROWSER_NATIVE_ACCOUNTS
+    if (not pause) and browser_mode and not _browser_live_port_open(username):
+        _mark_browser_login_needed(username, 'the live Chromium window was closed')
+        raise RuntimeError('Browser Mode cannot start because its live Chromium window is closed. Click Browser Login first.')
     private_connected = (
         username in CLIENT_CACHE
         and username not in CONTROL_DISCONNECTED_ACCOUNTS
@@ -6810,7 +7744,16 @@ def _control_queue_task(username, task):
     if username not in CONTROL_ROSTER:
         raise ValueError(f"Unknown account @{username}")
 
+    if username in BROWSER_LOGIN_IN_PROGRESS:
+        raise RuntimeError(
+            f"Browser Login is still in progress for @{username}. "
+            "Finish login in Chromium before running manual tasks."
+        )
+
     browser_mode = username in BROWSER_NATIVE_ACCOUNTS
+    if browser_mode and not _browser_live_port_open(username):
+        _mark_browser_login_needed(username, 'the live Chromium window was closed before the manual task')
+        raise RuntimeError('The live Chromium window is closed. Click Browser Login before running this task.')
     private_connected = (
         username in CLIENT_CACHE
         and username not in CONTROL_DISCONNECTED_ACCOUNTS
@@ -7810,68 +8753,33 @@ ACCOUNT_WORKFLOW_THREADS_LOCK = threading.RLock()
 
 
 def _background_account_workflow(username, conf, next_workflow_at):
-    update_account_metric(
-        username,
-        "add_history",
-        value="🧵 Worker started; discovering local media folders...",
-    )
-
+    update_account_metric(username,"add_history",value="🧵 Worker started.")
     try:
-        folder_pool = discover_local_media_folders()
-        update_account_metric(
-            username,
-            "add_history",
-            value=f"🗂️ Worker discovered {len(folder_pool)} local media folder(s).",
-        )
-
-        result = run_profile_workflow(
-            username,
-            conf,
-            folder_pool,
-        )
-
+        if username in BROWSER_NATIVE_ACCOUNTS and not _browser_live_port_open(username):
+            _mark_browser_login_needed(username,"the live Chromium window was closed before the worker started")
+            result="disconnected"
+        else:
+            forced_task=NEXT_TASK_OVERRIDE.get(username); settings=get_account_control_settings(username,conf)
+            need_media=forced_task=="repost" or (forced_task is None and bool(settings.get("enable_posts",False)))
+            if need_media:
+                update_account_metric(username,"add_history",value="🗂️ Worker checking local media library...")
+                folder_pool=discover_local_media_folders()
+                update_account_metric(username,"add_history",value=f"🗂️ Media library ready: {len(folder_pool)} folder(s).")
+            else:
+                folder_pool=[]
+            result=run_profile_workflow(username,conf,folder_pool)
     except FeedbackRequired as exc:
-        apply_account_safety_backoff(
-            username,
-            f"Instagram FeedbackRequired during workflow: {exc}",
-            level="restricted",
-        )
-        result = "throttled"
-
+        apply_account_safety_backoff(username,f"Instagram FeedbackRequired during workflow: {exc}",level="restricted"); result="throttled"
     except Exception as exc:
-        observe_platform_signal(
-            username,
-            exc,
-            action="workflow",
-        )
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                f"❌ Workflow error: {type(exc).__name__}: "
-                f"{str(exc)[:220]}"
-            ),
-        )
-        result = "error"
-
-    delay = (
-        random.randint(WORKFLOW_SLEEP_MIN, WORKFLOW_SLEEP_MAX)
-        if result == "ran"
-        else WORKFLOW_RETRY_IDLE_SECONDS
-    )
-
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            f"🧵 Worker finished with result={result}; "
-            f"next Auto eligibility in ~{delay}s."
-        ),
-    )
-
+        observe_platform_signal(username,exc,action="workflow")
+        update_account_metric(username,"add_history",value=f"❌ Workflow error: {type(exc).__name__}: {str(exc)[:220]}"); result="error"
+    if result=="ran": delay=random.randint(WORKFLOW_SLEEP_MIN,WORKFLOW_SLEEP_MAX)
+    elif result in {"disconnected","paused"}: delay=max(WORKFLOW_RETRY_IDLE_SECONDS,300)
+    else: delay=WORKFLOW_RETRY_IDLE_SECONDS
+    update_account_metric(username,"add_history",value=f"🧵 Worker finished with result={result}; next Auto eligibility in ~{delay}s.")
     with ACCOUNT_WORKFLOW_THREADS_LOCK:
-        next_workflow_at[username] = time.monotonic() + delay
-        ACCOUNT_WORKFLOW_THREADS.pop(username, None)
+        next_workflow_at[username]=time.monotonic()+delay; ACCOUNT_WORKFLOW_THREADS.pop(username,None)
+
 
 
 
@@ -7905,6 +8813,9 @@ def main():
 
     CLIENT_CACHE.clear()
     BROWSER_NATIVE_ACCOUNTS.clear()
+    BROWSER_LOGIN_IN_PROGRESS.clear()
+    LIVE_CDP_CONTEXT_IDS.clear()
+    BROWSER_HANDLE_BY_CONTEXT.clear()
     CONTROL_DISCONNECTED_ACCOUNTS.clear()
     CONTROL_DISCONNECTED_ACCOUNTS.update(active_roster.keys())
     CONTROL_PAUSED_ACCOUNTS.clear()
@@ -7916,7 +8827,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Browser Reload Recovery: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Post Pipeline Optimization: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
@@ -7938,12 +8849,25 @@ def main():
 
             now_mono = time.monotonic()
             for current_user, conf in list(CONTROL_ROSTER.items()):
+                if current_user in BROWSER_LOGIN_IN_PROGRESS:
+                    continue
+
+                if (
+                    current_user in BROWSER_NATIVE_ACCOUNTS
+                    and not _browser_live_port_open(current_user)
+                ):
+                    _mark_browser_login_needed(
+                        current_user,
+                        "the live Chromium window was closed manually",
+                    )
+                    continue
+
                 connected = (
                     (
                         current_user in CLIENT_CACHE
                         and current_user not in CONTROL_DISCONNECTED_ACCOUNTS
                     )
-                    or current_user in BROWSER_NATIVE_ACCOUNTS
+                    or (current_user in BROWSER_NATIVE_ACCOUNTS and _browser_live_port_open(current_user))
                 )
                 if not connected:
                     continue
