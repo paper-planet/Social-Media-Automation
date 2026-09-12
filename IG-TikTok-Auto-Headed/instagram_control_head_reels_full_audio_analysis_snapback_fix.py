@@ -55,7 +55,7 @@ IG_ACCOUNTS_FILE = Path(
 ).expanduser()
 
 
-REELS_BUILD_ID = "skip-scroll-sponsored-topic-v4"
+REELS_BUILD_ID = "reliability-refactor-v7"
 def _safe_account_slug(username):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(username or "").strip().lstrip("@"))
     return value.strip("._-") or "instagram_account"
@@ -7887,12 +7887,34 @@ def _browser_visible_reel_scope(page):
 
 def _browser_reel_stable_key(page, scope=None) -> str:
     """
-    Stable identity for the CURRENT visible reel. Never uses time as identity.
+    Stable identity for the CURRENT visible Reel.
+
+    Priority:
+      1. working tab URL shortcode (strongest; survives UI state changes)
+      2. active Reel container permalink shortcode
+      3. stable fingerprint of media path/poster + creator + duration + text
+
+    Never uses time as identity.
     """
     scope = scope or _browser_visible_reel_scope(page)
 
+    # 1) The single-tab binding makes the working URL the strongest source.
     try:
-        hrefs = scope.locator("a[href*='/reel/']").evaluate_all(
+        current_url = str(page.url or "")
+    except Exception:
+        current_url = ""
+
+    try:
+        shortcode = _instagram_reel_shortcode_from_url(current_url)
+    except Exception:
+        shortcode = ""
+
+    if shortcode:
+        return f"reel-shortcode:{shortcode}"
+
+    # 2) Fallback to a permalink inside the active Reel scope.
+    try:
+        hrefs = scope.locator("a[href*='/reel/'], a[href*='/reels/']").evaluate_all(
             """els => els.map(e => e.href || e.getAttribute('href') || '')
                          .filter(Boolean)"""
         )
@@ -7900,11 +7922,15 @@ def _browser_reel_stable_key(page, scope=None) -> str:
         hrefs = []
 
     for href in hrefs:
-        clean = str(href or "").split("?", 1)[0].rstrip("/") + "/"
-        match = re.search(r"/reel/([^/]+)/", clean)
-        if match:
-            return f"reel-shortcode:{match.group(1)}"
+        try:
+            shortcode = _instagram_reel_shortcode_from_url(str(href or ""))
+        except Exception:
+            shortcode = ""
 
+        if shortcode:
+            return f"reel-shortcode:{shortcode}"
+
+    # 3) Last-resort content/media fingerprint.
     try:
         data = scope.evaluate(
             """
@@ -7970,13 +7996,11 @@ def _browser_reel_stable_key(page, scope=None) -> str:
     )
 
     if len(payload) < 20:
-        try:
-            payload += "|" + str(page.url or "").split("?", 1)[0]
-        except Exception:
-            pass
+        payload += "|" + current_url.split("?", 1)[0]
 
     digest = hashlib.sha256(payload.encode("utf-8", "ignore")).hexdigest()[:24]
     return f"reel-fp:{digest}"
+
 
 
 def _browser_visible_reel_text(page, scope=None, *, limit: int = 5000) -> str:
@@ -9442,16 +9466,75 @@ def _transcribe_reel_audio_worker(
                 pass
 
 
+INSTAGRAM_REEL_RESERVED_SLUGS = {
+    "audio",
+    "reel",
+    "reels",
+    "explore",
+    "direct",
+    "accounts",
+    "stories",
+    "about",
+    "developer",
+    "developers",
+    "privacy",
+    "terms",
+    "web",
+}
+
+
+def _instagram_reel_shortcode_from_url(raw_url: str) -> str:
+    """
+    Extract a real Reel shortcode only from /reel/<code>/ or /reels/<code>/.
+
+    Reject Instagram route words such as /reel/audio/ that can appear inside
+    the Reel UI and are not Reel post identities.
+    """
+    url = str(raw_url or "").strip()
+
+    if not url:
+        return ""
+
+    match = re.search(
+        r"(?:https?://(?:www\.)?instagram\.com)?/"
+        r"reels?/([A-Za-z0-9_-]{5,64})(?:[/?#]|$)",
+        url,
+        re.I,
+    )
+
+    if not match:
+        return ""
+
+    shortcode = match.group(1).strip()
+
+    if shortcode.lower() in INSTAGRAM_REEL_RESERVED_SLUGS:
+        return ""
+
+    # Instagram post shortcodes are opaque IDs, not ordinary route words.
+    if not re.search(r"[A-Z0-9_-]", shortcode):
+        return ""
+
+    return shortcode
+
 def _browser_current_reel_canonical_url(page, scope=None) -> str:
     """
     Return the exact canonical URL for the currently centered Reel.
 
-    This is used only as a fallback for audio acquisition when Instagram plays
-    the media through blob:/MediaSource and no direct HTTP video source exists.
+    Priority is deliberately PAGE URL FIRST. The working tab URL is the
+    strongest binding we have after the single-tab Reel lock. Reel UI links can
+    include unrelated routes such as /reel/audio/, so they are only fallbacks.
     """
     scope = scope or _browser_visible_reel_scope(page)
 
-    # Strongest source: permalink inside the active Reel container.
+    candidates = []
+
+    # 1) Strongest source: the locked working tab's current URL.
+    try:
+        candidates.append(str(page.url or ""))
+    except Exception:
+        pass
+
+    # 2) Current active scope's canonical/permalink-style links.
     try:
         hrefs = scope.locator(
             "a[href*='/reel/'], a[href*='/reels/']"
@@ -9459,39 +9542,26 @@ def _browser_current_reel_canonical_url(page, scope=None) -> str:
             """els => els.map(e => e.href || e.getAttribute('href') || '')
                          .filter(Boolean)"""
         )
-    except Exception:
-        hrefs = []
-
-    candidates = list(hrefs or [])
-
-    try:
-        candidates.append(str(page.url or ""))
+        candidates.extend(list(hrefs or []))
     except Exception:
         pass
 
+    seen = set()
+
     for raw in candidates:
-        url = str(raw or "").strip()
-        match = re.search(
-            r"https?://(?:www\.)?instagram\.com/reels?/([^/?#]+)/?",
-            url,
-            re.I,
-        )
+        raw = str(raw or "").strip()
 
-        if match:
-            shortcode = match.group(1)
-            return f"https://www.instagram.com/reel/{shortcode}/"
+        if not raw or raw in seen:
+            continue
 
-        match = re.search(
-            r"/reels?/([^/?#]+)/?",
-            url,
-            re.I,
-        )
+        seen.add(raw)
+        shortcode = _instagram_reel_shortcode_from_url(raw)
 
-        if match:
-            shortcode = match.group(1)
+        if shortcode:
             return f"https://www.instagram.com/reel/{shortcode}/"
 
     return ""
+
 
 
 def _browser_export_netscape_cookies(
@@ -9500,8 +9570,11 @@ def _browser_export_netscape_cookies(
     username: str,
 ) -> Path | None:
     """
-    Export only the browser cookies needed by yt-dlp into a temporary Netscape
-    cookie file. The file is deleted by the audio worker.
+    Export Instagram cookies into a temporary Netscape cookie file for yt-dlp.
+
+    Playwright/Chromium commonly represents session cookies with expires=-1.
+    Netscape cookie readers expect non-negative epoch values, so session cookies
+    are normalized to 0.
     """
     root = DOWNLOAD_ROOT / "reel_audio_cache"
     root.mkdir(parents=True, exist_ok=True)
@@ -9532,6 +9605,7 @@ def _browser_export_netscape_cookies(
     for cookie in cookies:
         try:
             domain = str(cookie.get("domain") or "").strip()
+
             if not domain:
                 continue
 
@@ -9540,9 +9614,14 @@ def _browser_export_netscape_cookies(
             secure = "TRUE" if cookie.get("secure") else "FALSE"
 
             expires = cookie.get("expires")
+
             try:
                 expires = int(float(expires))
             except Exception:
+                expires = 0
+
+            # Chromium/Playwright session cookie convention.
+            if expires < 0:
                 expires = 0
 
             name = str(cookie.get("name") or "")
@@ -9550,6 +9629,10 @@ def _browser_export_netscape_cookies(
 
             if not name:
                 continue
+
+            # Netscape cookie files are tab-delimited. Avoid malformed rows.
+            name = name.replace("\t", " ").replace("\r", "").replace("\n", "")
+            value = value.replace("\t", " ").replace("\r", "").replace("\n", "")
 
             lines.append(
                 "\t".join(
@@ -9580,6 +9663,28 @@ def _browser_export_netscape_cookies(
         return None
 
 
+
+class _ReelYTDLPLogger:
+    def __init__(self):
+        self.messages = []
+
+    def debug(self, msg):
+        # yt-dlp can route informational text through debug().
+        return None
+
+    def warning(self, msg):
+        value = re.sub(r"\s+", " ", str(msg or "")).strip()
+        if value:
+            self.messages.append(value)
+
+    def error(self, msg):
+        value = re.sub(r"\s+", " ", str(msg or "")).strip()
+        if value:
+            self.messages.append(value)
+
+    def last_message(self) -> str:
+        return self.messages[-1] if self.messages else ""
+
 def _download_exact_reel_media_ytdlp(
     username: str,
     reel_url: str,
@@ -9600,6 +9705,11 @@ def _download_exact_reel_media_ytdlp(
             "(install with: python -m pip install -U yt-dlp)"
         )
 
+    shortcode = _instagram_reel_shortcode_from_url(reel_url)
+    if not shortcode:
+        return None, f"refusing invalid/non-Reel Instagram URL: {reel_url}"
+
+    reel_url = f"https://www.instagram.com/reel/{shortcode}/"
     root = DOWNLOAD_ROOT / "reel_audio_cache"
     root.mkdir(parents=True, exist_ok=True)
 
@@ -9609,9 +9719,12 @@ def _download_exact_reel_media_ytdlp(
     )
     template = str(root / f"{stem}.%(ext)s")
 
+    ytdlp_logger = _ReelYTDLPLogger()
+
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "logger": ytdlp_logger,
         "noplaylist": True,
         # We only need an audio-bearing file. Prefer audio-only where the
         # extractor exposes it, otherwise use the best single-file media.
@@ -9669,7 +9782,12 @@ def _download_exact_reel_media_ytdlp(
         return None, "yt-dlp completed but produced no usable Reel media file"
 
     except Exception as exc:
-        return None, f"yt-dlp exact-Reel download failed: {type(exc).__name__}"
+        detail = ytdlp_logger.last_message()
+        suffix = f" · {detail[:260]}" if detail else ""
+        return None, (
+            f"yt-dlp exact-Reel download failed: "
+            f"{type(exc).__name__}{suffix}"
+        )
 
 
 def _transcribe_exact_reel_ytdlp_worker(
@@ -9787,12 +9905,26 @@ def _start_reel_audio_transcription(
             username,
             "add_history",
             value=(
-                "🎧 Current Reel uses blob/MediaSource and no exact Reel "
-                "permalink could be bound; skipping audio rather than using "
+                "🎧 Current Reel uses blob/MediaSource and no valid exact Reel "
+                "shortcode could be bound; skipping audio rather than using "
                 "audio from a possibly different Reel."
             ),
         )
         return None, None
+
+    shortcode = _instagram_reel_shortcode_from_url(reel_url)
+    if not shortcode:
+        executor.shutdown(wait=False, cancel_futures=True)
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🎧 Refusing invalid exact-Reel audio URL: {reel_url}"
+            ),
+        )
+        return None, None
+
+    reel_url = f"https://www.instagram.com/reel/{shortcode}/"
 
     cookie_file = _browser_export_netscape_cookies(
         page,
@@ -10719,41 +10851,78 @@ def _browser_submit_prepared_reel_comment(
 
     if not comment:
         return False
+
     if href in history["browser_commented_urls"]:
         update_account_metric(
             username,
             "add_history",
-            value="💬 Reels Demo comment already recorded for this reel; not duplicating it.",
+            value=(
+                "💬 Comment already recorded for this locked Reel; "
+                "not duplicating it."
+            ),
         )
         return True
 
-    if not _browser_open_reel_comments_if_needed(page):
-        controls = _browser_visible_action_controls(page)
-        summary = "; ".join(
-            row.get("label", "")
-            for row in controls[:12]
-            if row.get("label")
-        )
+    expected_key = href
+    same, current_key = _browser_reel_identity_matches(page, expected_key)
+
+    if not same:
         update_account_metric(
             username,
             "add_history",
             value=(
-                "↪️ Reels Demo could not open the visible reel's comment "
-                "panel. Visible action controls: "
-                f"{summary[:900] if summary else '(none detected)'}"
+                "🛑 Comment aborted because centered Reel changed before "
+                f"opening comments. expected={expected_key} current={current_key}"
             ),
         )
         return False
 
+    if not _browser_open_reel_comments_if_needed(page):
+        # Retry once after a short UI settle, still on the same Reel.
+        page.wait_for_timeout(500)
+        same, current_key = _browser_reel_identity_matches(page, expected_key)
+
+        if not same:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🛑 Comment panel retry cancelled because Reel changed. "
+                    f"expected={expected_key} current={current_key}"
+                ),
+            )
+            return False
+
+        if not _browser_open_reel_comments_if_needed(page):
+            controls = _browser_visible_action_controls(page)
+            summary = "; ".join(
+                row.get("label", "")
+                for row in controls[:12]
+                if row.get("label")
+            )
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "↪️ Could not open the CURRENT Reel's comment panel. "
+                    f"Visible controls: {summary[:900] if summary else '(none)'}"
+                ),
+            )
+            return False
+
     box = _browser_wait_for_reel_comment_editor(
         page,
-        timeout_seconds=4.0,
+        timeout_seconds=5.0,
     )
+
     if box is None:
         update_account_metric(
             username,
             "add_history",
-            value="↪️ Reels Demo comment panel opened, but no visible comment editor was found.",
+            value=(
+                "↪️ Current Reel's comment panel opened, but no local editor "
+                "was found."
+            ),
         )
         return False
 
@@ -10763,6 +10932,33 @@ def _browser_submit_prepared_reel_comment(
         "comment",
         max_wait=max_wait,
     ):
+        return False
+
+    # The pacing wait can be long enough for UI virtualization to change.
+    same, current_key = _browser_reel_identity_matches(page, expected_key)
+
+    if not same:
+        _finish_shared_write_reservation(username, "comment", False)
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Comment write slot became available after Reel changed; "
+                f"discarding comment. expected={expected_key} current={current_key}"
+            ),
+        )
+        return False
+
+    # Reacquire editor after waiting; never type into a stale locator.
+    box = _browser_find_reel_comment_editor(page)
+
+    if box is None:
+        _finish_shared_write_reservation(username, "comment", False)
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Comment editor disappeared before typing; not posting.",
+        )
         return False
 
     try:
@@ -10782,52 +10978,80 @@ def _browser_submit_prepared_reel_comment(
 
         page.wait_for_timeout(250)
 
-        # Capture the filled state before submission. Instagram frequently
-        # accepts the comment but does not immediately render the new comment
-        # back into the visible DOM.
         try:
             before_value = (
                 box.input_value(timeout=250)
                 if tag in {"textarea", "input"}
-                else str(box.evaluate("(el) => el.innerText || el.textContent || '") or "")
+                else str(
+                    box.evaluate(
+                        "(el) => el.innerText || el.textContent || ''"
+                    )
+                    or ""
+                )
             )
         except Exception:
             before_value = comment
 
-        posted = False
+        # Verify the Reel one last time AFTER typing and BEFORE submit.
+        same, current_key = _browser_reel_identity_matches(
+            page,
+            expected_key,
+        )
 
-        try:
-            buttons = page.get_by_role(
-                "button",
-                name=re.compile(r"^(Post|Submit)$", re.I),
+        if not same:
+            _finish_shared_write_reservation(username, "comment", False)
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🛑 Reel changed after comment text was prepared; "
+                    f"not submitting. expected={expected_key} current={current_key}"
+                ),
             )
-            for i in range(min(buttons.count(), 6)):
-                btn = buttons.nth(i)
-                if btn.is_visible(timeout=120):
-                    btn.click(timeout=3500)
-                    posted = True
-                    break
-        except Exception:
-            pass
+            return False
 
-        if not posted:
+        posted = False
+        submit = _browser_find_local_comment_submit_control(
+            page,
+            box,
+        )
+
+        if submit is not None:
+            submit.click(timeout=3500)
+            posted = True
+        else:
+            # Local editor fallback only; do not use a page-global Post button.
             try:
-                page.keyboard.press("Enter")
+                box.press("Enter")
                 posted = True
             except Exception:
-                posted = False
+                try:
+                    box.click(timeout=1500)
+                    page.keyboard.press("Enter")
+                    posted = True
+                except Exception:
+                    posted = False
 
         if not posted:
             _finish_shared_write_reservation(username, "comment", False)
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "⚠️ Comment editor was filled but no local submit control "
+                    "or editor Enter-submit path succeeded."
+                ),
+            )
             return False
 
         page.wait_for_timeout(900)
+
     except Exception as exc:
         _finish_shared_write_reservation(username, "comment", False)
         update_account_metric(
             username,
             "add_history",
-            value=f"⚠️ Reels Demo Comment failed: {type(exc).__name__}",
+            value=f"⚠️ Reels Comment failed: {type(exc).__name__}",
         )
         return False
 
@@ -10835,20 +11059,33 @@ def _browser_submit_prepared_reel_comment(
         _finish_shared_write_reservation(username, "comment", False)
         return False
 
-    # Confirmation is accepted when either:
-    #   1. the comment is rendered back in the visible DOM, OR
-    #   2. Instagram cleared/closed the editor after a successful submit.
-    confirmed = False
+    same, current_key = _browser_reel_identity_matches(page, expected_key)
+
+    if not same:
+        _finish_shared_write_reservation(username, "comment", False)
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Reel changed during comment submission; not recording "
+                f"success. expected={expected_key} current={current_key}"
+            ),
+        )
+        return False
+
     rendered = False
     cleared_or_closed = False
 
+    # Confirmation remains conservative, but keep it local to the comment UI
+    # when possible.
     try:
-        body = re.sub(
+        scope = _browser_visible_reel_scope(page)
+        visible = re.sub(
             r"\s+",
             " ",
-            page.locator("body").inner_text(timeout=700) or "",
+            scope.inner_text(timeout=700) or "",
         )
-        rendered = comment.lower() in body.lower()
+        rendered = comment.lower() in visible.lower()
     except Exception:
         rendered = False
 
@@ -10888,15 +11125,16 @@ def _browser_submit_prepared_reel_comment(
 
     if confirmed:
         record_write(username, "comment")
-        history["browser_commented_urls"].append(href)
-        history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
+        if href not in history["browser_commented_urls"]:
+            history["browser_commented_urls"].append(href)
+            history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
             value=(
                 f"💬 Reels comment accepted "
                 f"({'rendered' if rendered else 'editor cleared after submit'}): "
-                f"{comment[:120]}"
+                f"{comment[:140]}"
             ),
         )
         return True
@@ -10906,11 +11144,12 @@ def _browser_submit_prepared_reel_comment(
         username,
         "add_history",
         value=(
-            "⚠️ Reels comment submit state remained ambiguous; "
-            "continuing without counting it."
+            "⚠️ Comment submit remained ambiguous on the same locked Reel; "
+            "not counting it as confirmed."
         ),
     )
     return False
+
 
 
 def _browser_demo_save(
@@ -10998,72 +11237,171 @@ def _browser_demo_save(
 
 
 
+def _browser_repost_thought_overlay_open(page) -> bool:
+    """
+    Detect the optional post-Repost 'Add a thought' UI without searching
+    unrelated background Reel content.
+    """
+    try:
+        dialogs = page.locator("[role='dialog']")
+        for i in range(min(dialogs.count(), 12)):
+            dialog = dialogs.nth(i)
+            if not dialog.is_visible(timeout=100):
+                continue
+            txt = re.sub(
+                r"\s+",
+                " ",
+                dialog.inner_text(timeout=250) or "",
+            ).strip()
+            if re.search(r"\bAdd\s+a\s+thought\b", txt, re.I):
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _browser_find_repost_confirmation_in_overlay(page):
+    """
+    Find an explicit Repost confirmation ONLY inside a visible overlay/menu.
+
+    Never searches the entire page, which can contain controls for neighboring
+    mounted Reels.
+    """
+    overlay_selectors = (
+        "[role='dialog']",
+        "[role='menu']",
+        "[data-radix-popper-content-wrapper]",
+    )
+
+    for selector in overlay_selectors:
+        try:
+            overlays = page.locator(selector)
+            count = min(overlays.count(), 20)
+        except Exception:
+            continue
+
+        for i in range(count):
+            overlay = overlays.nth(i)
+
+            try:
+                if not overlay.is_visible(timeout=100):
+                    continue
+            except Exception:
+                continue
+
+            # Prefer semantic controls.
+            for role in ("button", "menuitem"):
+                try:
+                    controls = overlay.get_by_role(
+                        role,
+                        name=re.compile(r"^Repost$", re.I),
+                    )
+                    for j in range(min(controls.count(), 8)):
+                        control = controls.nth(j)
+                        if control.is_visible(timeout=100):
+                            return control
+                except Exception:
+                    pass
+
+            # Last overlay-local fallback: exact text, never page-global.
+            try:
+                items = overlay.get_by_text(
+                    re.compile(r"^Repost$", re.I),
+                    exact=True,
+                )
+                for j in range(min(items.count(), 8)):
+                    item = items.nth(j)
+                    if item.is_visible(timeout=100):
+                        return item
+            except Exception:
+                pass
+
+    return None
+
 def _browser_close_repost_thought_overlay(
     page,
     username: str,
 ) -> bool:
     """
-    Instagram may open an optional "Add a thought" composer after a repost.
-
-    The repost itself does not require adding text. Close the optional composer
-    explicitly before the next reel action so the following click cannot land
-    inside the overlay.
+    Close the optional 'Add a thought' composer using ONLY its own visible
+    controls. Never send Escape, because Escape can alter the Reels navigation
+    stack and expose another Reel.
     """
-    detected = False
-
-    try:
-        body_text = str(
-            page.locator("body").inner_text(timeout=500) or ""
-        )
-        detected = bool(
-            re.search(
-                r"\badd\s+a\s+thought\b",
-                body_text,
-                re.I,
-            )
-        )
-    except Exception:
-        detected = False
-
-    if not detected:
+    if not _browser_repost_thought_overlay_open(page):
         return False
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            "📝 Repost opened optional 'Add a thought'; closing it before "
-            "the next reel action."
+            "📝 Repost opened optional 'Add a thought'; closing only that "
+            "overlay before the next action."
         ),
     )
 
-    # Prefer an explicit Close/X control.
-    for pattern in (
-        r"^Close$",
-        r"^Cancel$",
-        r"^Done$",
-    ):
-        try:
-            buttons = page.get_by_role(
-                "button",
-                name=re.compile(pattern, re.I),
-            )
-            for i in range(min(buttons.count(), 10)):
-                button = buttons.nth(i)
-                if button.is_visible(timeout=120):
-                    button.click(timeout=2500)
-                    page.wait_for_timeout(400)
-                    return True
-        except Exception:
-            pass
-
-    # Escape is safer than clicking a random coordinate.
     try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(450)
-        return True
+        dialogs = page.locator("[role='dialog']")
+        for i in range(min(dialogs.count(), 12)):
+            dialog = dialogs.nth(i)
+            if not dialog.is_visible(timeout=100):
+                continue
+
+            try:
+                txt = re.sub(
+                    r"\s+",
+                    " ",
+                    dialog.inner_text(timeout=250) or "",
+                ).strip()
+            except Exception:
+                txt = ""
+
+            if not re.search(r"\bAdd\s+a\s+thought\b", txt, re.I):
+                continue
+
+            for pattern in (r"^Close$", r"^Cancel$", r"^Done$"):
+                try:
+                    buttons = dialog.get_by_role(
+                        "button",
+                        name=re.compile(pattern, re.I),
+                    )
+                    for j in range(min(buttons.count(), 8)):
+                        button = buttons.nth(j)
+                        if button.is_visible(timeout=100):
+                            button.click(timeout=2500)
+                            page.wait_for_timeout(350)
+                            return True
+                except Exception:
+                    pass
+
+            # Some Instagram dialogs expose an aria-label Close on an SVG.
+            try:
+                closes = dialog.locator(
+                    "svg[aria-label='Close'], [aria-label='Close']"
+                )
+                for j in range(min(closes.count(), 8)):
+                    control = closes.nth(j)
+                    if not control.is_visible(timeout=100):
+                        continue
+                    clickable = _browser_clickable_from_svg(control)
+                    clickable.click(timeout=2500)
+                    page.wait_for_timeout(350)
+                    return True
+            except Exception:
+                pass
     except Exception:
-        return False
+        pass
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "📝 'Add a thought' remained open; leaving it untouched rather "
+            "than using Escape and risking a Reel change."
+        ),
+    )
+    return False
+
 
 def _browser_demo_repost(
     page,
@@ -11075,6 +11413,8 @@ def _browser_demo_repost(
 ) -> bool:
     history.setdefault("browser_reposted_urls", [])
 
+    expected_key = href
+    initial_url = str(page.url or "")
     state = _browser_visible_reel_state(page)
 
     if state["reposted"] or href in history["browser_reposted_urls"]:
@@ -11088,13 +11428,25 @@ def _browser_demo_repost(
         )
         return True
 
+    same, current_key = _browser_reel_identity_matches(page, expected_key)
+    if not same:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Repost aborted before click because centered Reel changed: "
+                f"expected={expected_key} current={current_key}"
+            ),
+        )
+        return False
+
     repost_svg = _browser_find_strict_reel_svg(page, "Repost")
 
     if repost_svg is None:
         update_account_metric(
             username,
             "add_history",
-            value="↪️ Reels Repost control is not visible in the current reel.",
+            value="↪️ Reels Repost control is not visible in the locked reel.",
         )
         return False
 
@@ -11109,46 +11461,96 @@ def _browser_demo_repost(
         return False
 
     try:
+        # Stage 1: click ONLY the locked Reel's exact Repost icon/control.
         _browser_clickable_from_svg(repost_svg).click(timeout=4000)
-        page.wait_for_timeout(450)
+        page.wait_for_timeout(500)
 
-        # Instagram may open a small menu requiring one exact Repost choice.
-        scope = _browser_visible_reel_scope(page)
-        try:
-            exact = page.get_by_text(
-                re.compile(r"^Repost$", re.I),
-                exact=True,
-            )
-            for i in range(min(exact.count(), 8)):
-                item = exact.nth(i)
-                if not item.is_visible(timeout=120):
-                    continue
-
-                # Avoid re-clicking the original reel action itself by only
-                # accepting a visible text/menu item outside the strict SVG
-                # button when Instagram exposes one.
-                try:
-                    tag = str(
-                        item.evaluate("(el) => el.tagName.toLowerCase()")
-                    ).lower()
-                except Exception:
-                    tag = ""
-
-                if tag == "svg":
-                    continue
-
-                item.click(timeout=3000)
-                page.wait_for_timeout(650)
-                break
-        except Exception:
-            pass
-
-        # Repost can open an optional "Add a thought" overlay. The repost has
-        # already been requested; close the overlay before any later action.
-        _browser_close_repost_thought_overlay(
+        same, current_key = _browser_reel_identity_matches(
             page,
-            username,
+            expected_key,
         )
+        if not same:
+            _finish_shared_write_reservation(username, "repost", False)
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🛑 Repost's first click changed the centered Reel; "
+                    "stopping before any confirmation click. "
+                    f"expected={expected_key} current={current_key} "
+                    f"before_url={initial_url[:180]} "
+                    f"now_url={str(page.url or '')[:180]}"
+                ),
+            )
+            return False
+
+        # Some Instagram variants repost immediately on the first click.
+        first_state = _browser_visible_reel_state(page)
+        thought_open = _browser_repost_thought_overlay_open(page)
+
+        # Stage 2: only if still not reposted and no success/thought UI,
+        # click an exact Repost choice INSIDE a visible overlay/menu.
+        if not first_state["reposted"] and not thought_open:
+            confirm = _browser_find_repost_confirmation_in_overlay(page)
+
+            if confirm is not None:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🔁 Repost menu opened on the locked Reel; clicking "
+                        "its overlay-local Repost confirmation."
+                    ),
+                )
+                confirm.click(timeout=3000)
+                page.wait_for_timeout(650)
+            else:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🔁 Repost icon clicked, but no reel-bound confirmation "
+                        "menu was found; checking final state without any "
+                        "page-global click."
+                    ),
+                )
+
+        # Never continue if Instagram switched Reels during confirmation.
+        same, current_key = _browser_reel_identity_matches(
+            page,
+            expected_key,
+        )
+        if not same:
+            _finish_shared_write_reservation(username, "repost", False)
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🛑 Repost confirmation changed the centered Reel; "
+                    "ending Repost without touching the new Reel. "
+                    f"expected={expected_key} current={current_key} "
+                    f"now_url={str(page.url or '')[:180]}"
+                ),
+            )
+            return False
+
+        thought_open = _browser_repost_thought_overlay_open(page)
+
+        # Instagram opening Add-a-thought is itself strong evidence that Repost
+        # was accepted on this exact locked Reel.
+        if thought_open:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🔁 Repost accepted: Instagram opened the optional "
+                    "'Add a thought' composer on the same locked Reel."
+                ),
+            )
+            _browser_close_repost_thought_overlay(
+                page,
+                username,
+            )
 
     except Exception as exc:
         _finish_shared_write_reservation(username, "repost", False)
@@ -11156,6 +11558,23 @@ def _browser_demo_repost(
             username,
             "add_history",
             value=f"⚠️ Reels Repost failed: {type(exc).__name__}",
+        )
+        return False
+
+    # Same Reel must still be centered after optional overlay cleanup.
+    same, current_key = _browser_reel_identity_matches(
+        page,
+        expected_key,
+    )
+    if not same:
+        _finish_shared_write_reservation(username, "repost", False)
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Repost cleanup changed the centered Reel; ending pass. "
+                f"expected={expected_key} current={current_key}"
+            ),
         )
         return False
 
@@ -11169,30 +11588,44 @@ def _browser_demo_repost(
 
     state = _browser_visible_reel_state(page)
 
-    if state["reposted"]:
+    # Re-check thought state too; it may still be open if no close control was
+    # available, but that is still evidence of a successful same-Reel repost.
+    thought_open = _browser_repost_thought_overlay_open(page)
+
+    if state["reposted"] or thought_open:
         record_write(username, "repost")
-        history["browser_reposted_urls"].append(href)
-        history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+        if href not in history["browser_reposted_urls"]:
+            history["browser_reposted_urls"].append(href)
+            history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
-            value="🔁 Reels Repost confirmed.",
+            value=(
+                "🔁 Reels Repost confirmed on the same locked Reel"
+                + (
+                    " by the Add-a-thought composer."
+                    if thought_open
+                    else "."
+                )
+            ),
         )
         return True
 
-    # Text confirmation fallback.
+    # Conservative overlay-local text/state fallback only. Never scan the whole
+    # page for repost text, because neighboring Reels remain mounted.
     try:
-        body = re.sub(
+        scope = _browser_visible_reel_scope(page)
+        scoped_text = re.sub(
             r"\s+",
             " ",
-            page.locator("body").inner_text(timeout=500) or "",
+            scope.inner_text(timeout=500) or "",
         ).lower()
         confirmed = any(
-            phrase in body
+            phrase in scoped_text
             for phrase in (
-                "reposted",
                 "remove repost",
                 "undo repost",
+                "reposted",
             )
         )
     except Exception:
@@ -11200,12 +11633,13 @@ def _browser_demo_repost(
 
     if confirmed:
         record_write(username, "repost")
-        history["browser_reposted_urls"].append(href)
-        history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+        if href not in history["browser_reposted_urls"]:
+            history["browser_reposted_urls"].append(href)
+            history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
-            value="🔁 Reels Repost confirmed by Instagram text/state.",
+            value="🔁 Reels Repost confirmed by locked-Reel state.",
         )
         return True
 
@@ -11213,11 +11647,307 @@ def _browser_demo_repost(
     update_account_metric(
         username,
         "add_history",
-        value="⚠️ Reels Repost was not visibly confirmed.",
+        value=(
+            "⚠️ Reels Repost was not confirmed on the locked Reel; "
+            "no additional page-global click was attempted."
+        ),
     )
     return False
 
 
+
+
+def _browser_reel_follow_status(page) -> str:
+    """
+    Return one of: following, requested, follow, unknown.
+
+    Search ONLY inside the active Reel container and accept the DOM shapes
+    Instagram currently uses for relationship controls.
+    """
+    scope = _browser_visible_reel_scope(page)
+
+    def exact_visible_text(label: str) -> bool:
+        # Semantic buttons.
+        try:
+            locs = scope.get_by_role(
+                "button",
+                name=re.compile(rf"^{re.escape(label)}$", re.I),
+            )
+            for i in range(min(locs.count(), 12)):
+                if locs.nth(i).is_visible(timeout=100):
+                    return True
+        except Exception:
+            pass
+
+        # role=button div/span wrappers.
+        try:
+            locs = scope.locator("[role='button']")
+            for i in range(min(locs.count(), 40)):
+                loc = locs.nth(i)
+                if not loc.is_visible(timeout=80):
+                    continue
+                try:
+                    value = re.sub(
+                        r"\s+",
+                        " ",
+                        loc.inner_text(timeout=120) or "",
+                    ).strip()
+                except Exception:
+                    value = ""
+                if value.lower() == label.lower():
+                    return True
+        except Exception:
+            pass
+
+        # Exact visible text as a final scope-local read-only check.
+        try:
+            locs = scope.get_by_text(
+                re.compile(rf"^{re.escape(label)}$", re.I),
+                exact=True,
+            )
+            for i in range(min(locs.count(), 20)):
+                if locs.nth(i).is_visible(timeout=80):
+                    return True
+        except Exception:
+            pass
+
+        return False
+
+    if exact_visible_text("Following"):
+        return "following"
+    if exact_visible_text("Requested"):
+        return "requested"
+    if exact_visible_text("Follow"):
+        return "follow"
+    return "unknown"
+
+
+def _browser_find_reel_follow_control(page):
+    """
+    Find the current Reel author's Follow control without leaving the Reel.
+
+    No page-global fallback is allowed.
+    """
+    scope = _browser_visible_reel_scope(page)
+
+    # 1) Native semantic button.
+    try:
+        locs = scope.get_by_role(
+            "button",
+            name=re.compile(r"^Follow$", re.I),
+        )
+        for i in range(min(locs.count(), 12)):
+            candidate = locs.nth(i)
+            if candidate.is_visible(timeout=120):
+                return candidate
+    except Exception:
+        pass
+
+    # 2) Instagram often uses div[role=button].
+    try:
+        locs = scope.locator("[role='button']")
+        for i in range(min(locs.count(), 50)):
+            candidate = locs.nth(i)
+            if not candidate.is_visible(timeout=80):
+                continue
+            try:
+                value = re.sub(
+                    r"\s+",
+                    " ",
+                    candidate.inner_text(timeout=120) or "",
+                ).strip()
+            except Exception:
+                value = ""
+            if value.lower() == "follow":
+                return candidate
+    except Exception:
+        pass
+
+    # 3) Exact Follow text -> climb only to a local clickable ancestor.
+    try:
+        texts = scope.get_by_text(
+            re.compile(r"^Follow$", re.I),
+            exact=True,
+        )
+        for i in range(min(texts.count(), 20)):
+            node = texts.nth(i)
+            if not node.is_visible(timeout=80):
+                continue
+
+            try:
+                clickable = node.locator(
+                    "xpath=ancestor-or-self::*[self::button or @role='button'][1]"
+                )
+                if clickable.count() and clickable.first.is_visible(timeout=80):
+                    return clickable.first
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return None
+
+
+def _browser_find_local_comment_submit_control(page, editor):
+    """
+    Find Post/Submit only inside the editor's own composer/dialog/form.
+
+    Never search the whole Instagram page for a generic Post button.
+    """
+    containers = []
+
+    for xpath in (
+        "xpath=ancestor::*[@role='dialog'][1]",
+        "xpath=ancestor::form[1]",
+        "xpath=ancestor::*[@role='presentation'][1]",
+    ):
+        try:
+            loc = editor.locator(xpath)
+            if loc.count() and loc.first.is_visible(timeout=80):
+                containers.append(loc.first)
+        except Exception:
+            pass
+
+    # The editor parent/grandparent is a conservative local fallback.
+    for xpath in ("xpath=..", "xpath=../.."):
+        try:
+            loc = editor.locator(xpath)
+            if loc.count() and loc.first.is_visible(timeout=80):
+                containers.append(loc.first)
+        except Exception:
+            pass
+
+    for container in containers:
+        try:
+            buttons = container.get_by_role(
+                "button",
+                name=re.compile(r"^(Post|Submit)$", re.I),
+            )
+            for i in range(min(buttons.count(), 8)):
+                button = buttons.nth(i)
+                if button.is_visible(timeout=100):
+                    return button
+        except Exception:
+            pass
+
+        try:
+            controls = container.locator("[role='button']")
+            for i in range(min(controls.count(), 20)):
+                control = controls.nth(i)
+                if not control.is_visible(timeout=80):
+                    continue
+                try:
+                    label = re.sub(
+                        r"\s+",
+                        " ",
+                        control.inner_text(timeout=100) or "",
+                    ).strip()
+                except Exception:
+                    label = ""
+                if label.lower() in {"post", "submit"}:
+                    return control
+        except Exception:
+            pass
+
+    return None
+
+
+def _browser_reel_action_plan(include_comment: bool) -> list[str]:
+    """
+    Reliability-first action order.
+
+    Repost is always LAST because Instagram's Repost UI is the one action known
+    to sometimes change the centered Reel. It must never prevent Follow or a
+    prepared Comment from running.
+
+    Like/Save remain randomized because those controls are stable.
+    """
+    stable_tail = ["like", "save"]
+    random.shuffle(stable_tail)
+
+    actions = ["follow"]
+    if include_comment:
+        actions.append("comment")
+    actions.extend(stable_tail)
+    actions.append("repost")
+    return actions
+
+
+def _browser_reel_protected_priority(action: str) -> int:
+    # Lower number = protect earlier when the rolling budget is tight.
+    return {
+        "comment": 0,
+        "follow": 1,
+        "like": 2,
+        "save": 2,
+        "repost": 3,
+    }.get(action, 9)
+
+
+def _browser_reel_reorder_for_budget(
+    username: str,
+    pending: list[str],
+) -> list[str]:
+    """
+    Keep reliability priorities when budget gets tight.
+
+    Comment and Follow are protected. Repost remains last because it may change
+    Reel navigation. This does not raise/reset/bypass any pacing limit.
+    """
+    items = list(pending or [])
+    if not items:
+        return items
+
+    budget = _shared_write_budget_status(username)
+    remaining = int(budget.get("remaining") or 0)
+
+    # Under comfortable budget, preserve the reliability action plan order.
+    if remaining > 2:
+        return items
+
+    indexed = list(enumerate(items))
+    indexed.sort(
+        key=lambda row: (
+            _browser_reel_protected_priority(row[1]),
+            row[0],
+        )
+    )
+    return [action for _, action in indexed]
+
+
+def _browser_reel_should_defer_for_protected_action(
+    username: str,
+    action: str,
+    pending: list[str],
+) -> tuple[bool, str]:
+    """
+    Reserve the final available rolling slot for the highest-priority pending
+    action (Comment first, then Follow), never automatically for Repost.
+    """
+    budget = _shared_write_budget_status(username)
+    remaining = int(budget.get("remaining") or 0)
+
+    if remaining > 1:
+        return False, ""
+
+    other = [
+        item
+        for item in (pending or [])
+        if item != action
+    ]
+
+    if not other:
+        return False, ""
+
+    best = min(
+        other,
+        key=_browser_reel_protected_priority,
+    )
+
+    if _browser_reel_protected_priority(best) < _browser_reel_protected_priority(action):
+        return True, best
+
+    return False, ""
 
 def _browser_demo_follow_if_needed(
     page,
@@ -11236,10 +11966,23 @@ def _browser_demo_follow_if_needed(
         )
         return False
 
-    scope = _browser_visible_reel_scope(page)
-    state = _browser_visible_reel_state(page)
+    expected_key = href
+    same, current_key = _browser_reel_identity_matches(page, expected_key)
 
-    if state["following"]:
+    if not same:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Follow aborted because centered Reel changed before lookup. "
+                f"expected={expected_key} current={current_key}"
+            ),
+        )
+        return False
+
+    status = _browser_reel_follow_status(page)
+
+    if status == "following":
         update_account_metric(
             username,
             "add_history",
@@ -11247,7 +11990,7 @@ def _browser_demo_follow_if_needed(
         )
         return True
 
-    if state["requested"]:
+    if status == "requested":
         update_account_metric(
             username,
             "add_history",
@@ -11255,33 +11998,40 @@ def _browser_demo_follow_if_needed(
         )
         return True
 
-    button = None
-
-    try:
-        follows = scope.get_by_role(
-            "button",
-            name=re.compile(r"^Follow$", re.I),
-        )
-        for i in range(min(follows.count(), 8)):
-            candidate = follows.nth(i)
-            if candidate.is_visible(timeout=150):
-                button = candidate
-                break
-    except Exception:
-        button = None
+    # Allow the Reel UI a short settle before declaring Follow unavailable.
+    button = _browser_find_reel_follow_control(page)
 
     if button is None:
+        page.wait_for_timeout(550)
+
+        same, current_key = _browser_reel_identity_matches(page, expected_key)
+        if not same:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    "🛑 Follow lookup stopped because the Reel changed during "
+                    f"UI settle. expected={expected_key} current={current_key}"
+                ),
+            )
+            return False
+
+        button = _browser_find_reel_follow_control(page)
+
+    if button is None:
+        status = _browser_reel_follow_status(page)
+
         update_account_metric(
             username,
             "add_history",
             value=(
-                "↪️ Reels found no exact visible Follow button in the current "
-                "reel; no follow action is needed/available."
+                "↪️ Reels Follow unavailable in the CURRENT locked Reel "
+                f"(relationship state={status}); no navigation fallback used."
             ),
         )
-        return False
+        return status in {"following", "requested"}
 
-    liked_before = state["liked"]
+    liked_before = _browser_visible_reel_state(page)["liked"]
 
     if not _browser_demo_wait_follow_slot(
         page,
@@ -11290,14 +12040,53 @@ def _browser_demo_follow_if_needed(
     ):
         return False
 
+    # Revalidate after waiting for the write slot.
+    same, current_key = _browser_reel_identity_matches(page, expected_key)
+    if not same:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Follow write slot became available after Reel changed; "
+                f"not clicking. expected={expected_key} current={current_key}"
+            ),
+        )
+        return False
+
+    # Re-find the control after pacing wait; do not click a stale Locator.
+    button = _browser_find_reel_follow_control(page)
+
+    if button is None:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "↪️ Follow control disappeared before click; leaving the Reel "
+                "untouched."
+            ),
+        )
+        return False
+
     try:
         button.click(timeout=4000)
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(700)
     except Exception as exc:
         update_account_metric(
             username,
             "add_history",
             value=f"⚠️ Reels Follow click failed: {type(exc).__name__}",
+        )
+        return False
+
+    same, current_key = _browser_reel_identity_matches(page, expected_key)
+    if not same:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🛑 Follow click changed the centered Reel; ending Follow "
+                f"verification. expected={expected_key} current={current_key}"
+            ),
         )
         return False
 
@@ -11309,18 +12098,22 @@ def _browser_demo_follow_if_needed(
     ):
         return False
 
-    state = _browser_visible_reel_state(page)
+    # Give relationship text one brief retry window.
+    final_status = _browser_reel_follow_status(page)
 
-    if state["following"] or state["requested"]:
+    if final_status not in {"following", "requested"}:
+        page.wait_for_timeout(650)
+        final_status = _browser_reel_follow_status(page)
+
+    if final_status in {"following", "requested"}:
         record_write(username, "follow")
         update_account_metric(username, "total_follows", increment=1)
         used_after, cap_after = _daily_follow_attempts_status(username)
-        status = "Following" if state["following"] else "Requested"
         update_account_metric(
             username,
             "add_history",
             value=(
-                f"✅ Reels Follow confirmed [{status}]; "
+                f"✅ Reels Follow confirmed [{final_status.title()}]; "
                 f"daily follows={used_after}/{cap_after}."
             ),
         )
@@ -11329,9 +12122,13 @@ def _browser_demo_follow_if_needed(
     update_account_metric(
         username,
         "add_history",
-        value="⚠️ Reels Follow state ambiguous; not counted confirmed.",
+        value=(
+            "⚠️ Follow was clicked on the locked Reel but relationship state "
+            "did not resolve to Following/Requested; not counting confirmed."
+        ),
     )
     return False
+
 
 
 def _browser_visible_reel_state(page) -> dict:
@@ -11764,10 +12561,7 @@ def _browser_run_reel_action_cycle(
         then continues the remaining actions
       * non-Like actions are guarded against accidentally toggling Like off
     """
-    actions = ["like", "save", "repost", "follow"]
-    if include_comment:
-        actions.append("comment")
-    random.shuffle(actions)
+    actions = _browser_reel_action_plan(include_comment)
 
     budget = _shared_write_budget_status(username)
 
@@ -11775,7 +12569,7 @@ def _browser_run_reel_action_cycle(
         username,
         "add_history",
         value=(
-            "🎲 Reels action order: "
+            "🧭 Reels reliability action order: "
             + " → ".join(a.title() for a in actions)
             + f" · shared write budget {budget['used']}/{budget['max']} "
             + f"({budget['remaining']} slot(s) currently remaining). "
@@ -11834,19 +12628,22 @@ def _browser_run_reel_action_cycle(
                 )
                 return confirmed, completed
 
-            if _browser_visible_reel_is_ad(
-                page,
-                _browser_visible_reel_scope(page),
-            ):
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🛑 Current reel is Sponsored; stopping actions and "
-                        "leaving it for the skip gate."
-                    ),
+            current_scope = _browser_visible_reel_scope(page)
+            if _browser_visible_reel_is_ad(page, current_scope):
+                sponsored_topic = _browser_sponsored_reel_allowed_topic(
+                    page,
+                    current_scope,
                 )
-                return confirmed, completed
+                if not sponsored_topic:
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            "🛑 Current locked Reel is an unrelated Sponsored "
+                            "reel; stopping actions."
+                        ),
+                    )
+                    return confirmed, completed
 
             if _browser_engage_security_problem(page, username):
                 next_pending.extend(
@@ -11868,18 +12665,22 @@ def _browser_run_reel_action_cycle(
                 completed.append(action)
                 continue
 
-            if _browser_reel_reserve_final_slot_for_repost(
-                username,
-                action,
-                pending,
-            ):
+            defer_for_priority, protected_action = (
+                _browser_reel_should_defer_for_protected_action(
+                    username,
+                    action,
+                    pending,
+                )
+            )
+            if defer_for_priority:
                 next_pending.append(action)
                 update_account_metric(
                     username,
                     "add_history",
                     value=(
                         f"⏸️ Reels {action.title()} deferred so the final "
-                        "available rolling-budget slot is preserved for Repost."
+                        f"available rolling-budget slot is preserved for "
+                        f"{protected_action.title()}."
                     ),
                 )
                 continue
@@ -17668,7 +18469,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reel Skip/Scroll + Sponsored Topic Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reels Reliability Refactor: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
