@@ -3806,6 +3806,30 @@ def _browser_context_logged_in(context) -> bool:
         return False
 
 
+def _browser_transient_load_error(page) -> str:
+    """Detect Instagram Web's transient SPA error page."""
+    phrases = (
+        "something went wrong",
+        "there's an issue and the page could not be loaded",
+        "there is an issue and the page could not be loaded",
+        "page could not be loaded",
+    )
+
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=1200) or "",
+        ).lower()
+    except Exception:
+        return ""
+
+    for phrase in phrases:
+        if phrase in body:
+            return phrase
+
+    return ""
+
 def _browser_page_problem(page) -> str:
     """
     Detect login/challenge/restriction UI. Never attempts to bypass it.
@@ -3844,10 +3868,100 @@ def _browser_page_problem(page) -> str:
 
 
 def _browser_check_ready(page, context, username: str) -> None:
+    """
+    Validate Browser Mode auth while recovering Instagram's transient
+    "Something went wrong / page could not be loaded" Web error.
+    """
+    transient = _browser_transient_load_error(page)
+
+    if transient:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🔄 Instagram Web showed a transient load error "
+                f"({transient}); performing a normal browser reload..."
+            ),
+        )
+
+        recovered = False
+        for attempt in range(1, 3):
+            try:
+                page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
+
+            if not _browser_transient_load_error(page):
+                recovered = True
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"✅ Instagram Web recovered after browser reload "
+                        f"(attempt {attempt})."
+                    ),
+                )
+                break
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"🔄 Instagram Web still shows the transient error after "
+                    f"reload attempt {attempt}."
+                ),
+            )
+
+        if not recovered:
+            raise RuntimeError(
+                "Instagram Web is still showing its transient load-error screen "
+                "after two normal browser reloads. This transient condition is "
+                "not treated as proof of logout, suspension, or an IP ban."
+            )
+
+    if not _browser_context_logged_in(context):
+        restored = _restore_saved_browser_session(
+            context,
+            username,
+        )
+
+        if restored:
+            try:
+                page.goto(
+                    "https://www.instagram.com/",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+            if _browser_transient_load_error(page):
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🔄 Restored browser session landed on Instagram's "
+                        "transient error page; reloading normally..."
+                    ),
+                )
+                try:
+                    page.reload(
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+
     if not _browser_context_logged_in(context):
         raise RuntimeError(
-            "Saved Instagram browser profile is no longer logged in. "
-            "Use Browser Login again."
+            "Saved Instagram browser profile/session is no longer authenticated. "
+            "No usable session cookie remains after restore. Use Browser Login again."
         )
 
     problem = _browser_page_problem(page)
@@ -3863,6 +3977,169 @@ def _browser_check_ready(page, context, username: str) -> None:
             "Use Browser Login and complete the prompt manually."
         )
 
+    transient = _browser_transient_load_error(page)
+    if transient:
+        raise RuntimeError(
+            "Instagram Web session appears present, but the page is still in "
+            "a transient load-error state after recovery attempts."
+        )
+
+    _browser_refresh_saved_sessionid(
+        context,
+        username,
+    )
+
+
+
+
+def _browser_session_cookie_file(username: str) -> Path:
+    safe = str(username or "").strip().lstrip("@").replace(".", "_")
+    return DOWNLOAD_ROOT / f"browser_session_{safe}.json"
+
+
+def _load_saved_browser_sessionid(username: str) -> str:
+    path = _browser_session_cookie_file(username)
+    if not path.exists():
+        return ""
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return str(data.get("sessionid", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _save_browser_sessionid(username: str, sessionid: str) -> None:
+    sessionid = str(sessionid or "").strip()
+    if not sessionid:
+        return
+
+    path = _browser_session_cookie_file(username)
+    try:
+        path.write_text(
+            json.dumps({"sessionid": sessionid}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _restore_saved_browser_session(context, username: str) -> bool:
+    """
+    Restore the locally saved Instagram Web session cookie into the Playwright
+    context if the persistent Chromium profile itself came up logged out.
+
+    This uses only the session cookie captured from the user's own successful
+    Browser Login. It does not bypass login challenges or verification.
+    """
+    if _browser_context_logged_in(context):
+        return True
+
+    sessionid = _load_saved_browser_sessionid(username)
+    if not sessionid:
+        return False
+
+    cookie_variants = (
+        {
+            "name": "sessionid",
+            "value": sessionid,
+            "domain": ".instagram.com",
+            "path": "/",
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Lax",
+        },
+        {
+            "name": "sessionid",
+            "value": sessionid,
+            "url": "https://www.instagram.com/",
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Lax",
+        },
+    )
+
+    for cookie in cookie_variants:
+        try:
+            context.add_cookies([cookie])
+            if _browser_context_logged_in(context):
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "🔐 Restored saved Instagram browser session into "
+                        "Chromium because the persistent profile opened logged out."
+                    ),
+                )
+                return True
+        except Exception:
+            continue
+
+    return _browser_context_logged_in(context)
+
+
+def _browser_refresh_saved_sessionid(context, username: str) -> None:
+    """
+    If Instagram rotated the sessionid during normal browser use, persist the
+    newest value for the next Browser Mode launch.
+    """
+    try:
+        cookies = context.cookies("https://www.instagram.com/")
+        sessionid = next(
+            (
+                c.get("value")
+                for c in cookies
+                if c.get("name") == "sessionid" and c.get("value")
+            ),
+            None,
+        )
+        if sessionid:
+            _save_browser_sessionid(username, sessionid)
+    except Exception:
+        pass
+
+
+def _browser_preflight_login(username: str, *, headed: bool = False) -> bool:
+    """
+    Fast Browser Mode auth preflight. Used before expensive AI/media analysis.
+    """
+    if sync_playwright is None:
+        raise RuntimeError(
+            "Playwright is required for Browser Mode."
+        )
+
+    with sync_playwright() as p:
+        context = _browser_launch(
+            p,
+            username,
+            headed=headed,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(900)
+
+            _browser_check_ready(
+                page,
+                context,
+                username,
+            )
+            _browser_refresh_saved_sessionid(
+                context,
+                username,
+            )
+            return True
+
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
 
 def _browser_launch(p, username: str, *, headed: bool | None = None):
     if headed is None:
@@ -3870,11 +4147,25 @@ def _browser_launch(p, username: str, *, headed: bool | None = None):
             "IG_BROWSER_AUTOMATION_HEADED", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
 
-    return p.chromium.launch_persistent_context(
+    context = p.chromium.launch_persistent_context(
         str(_browser_profile_dir(username)),
         headless=not headed,
         viewport={"width": 1280, "height": 900},
     )
+
+    if not _browser_context_logged_in(context):
+        restored = _restore_saved_browser_session(
+            context,
+            username,
+        )
+        if restored:
+            print(
+                f"🔐 @{username}: restored saved Instagram Web session into Chromium.",
+                flush=True,
+            )
+
+    return context
+
 
 
 def _browser_clickable_from_svg(svg):
@@ -4524,6 +4815,13 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
 
         finally:
             try:
+                _browser_refresh_saved_sessionid(
+                    context,
+                    username,
+                )
+            except Exception:
+                pass
+            try:
                 context.close()
             except Exception:
                 pass
@@ -4727,6 +5025,13 @@ def _browser_engage_hashtag(username, history, config, manual=False) -> int:
 
         finally:
             try:
+                _browser_refresh_saved_sessionid(
+                    context,
+                    username,
+                )
+            except Exception:
+                pass
+            try:
                 context.close()
             except Exception:
                 pass
@@ -4917,6 +5222,28 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
         value=(
             f"🧰 Browser Post starting ({'manual' if manual else 'Auto'}); "
             f"media folders discovered={len(folder_pool)}"
+        ),
+    )
+
+    update_account_metric(
+        username,
+        "add_history",
+        value="🔐 Browser Post: checking saved Instagram Web login and recovering transient page errors before AI/media prep...",
+    )
+
+    preflight_started = time.time()
+    _browser_preflight_login(
+        username,
+        headed=True if manual else False,
+    )
+    preflight_elapsed = int(time.time() - preflight_started)
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"✅ Browser Post login preflight passed in {preflight_elapsed}s; "
+            "starting media/AI preparation."
         ),
     )
 
@@ -5249,6 +5576,13 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
             raise
 
         finally:
+            try:
+                _browser_refresh_saved_sessionid(
+                    context,
+                    username,
+                )
+            except Exception:
+                pass
             try:
                 context.close()
             except Exception:
@@ -5904,16 +6238,10 @@ def _control_browser_login(username, timeout_seconds=600):
         )
 
     # Preserve a separate browser-session copy without printing the cookie.
-    browser_cookie_file = DOWNLOAD_ROOT / (
-        f"browser_session_{username.replace('.', '_')}.json"
+    _save_browser_sessionid(
+        username,
+        sessionid,
     )
-    try:
-        browser_cookie_file.write_text(
-            json.dumps({"sessionid": sessionid}),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
 
     update_account_metric(
         username,
@@ -6048,7 +6376,7 @@ def _control_browser_login(username, timeout_seconds=600):
         _activate_browser_native_mode(
             username,
             "Browser identity is valid, but Instagram rejects the private timeline endpoint. "
-            "Follow, Engage, and Post will use Instagram Web. Private-API auth cooldowns do not block Browser Mode. Browser Follow uses live-row/profile verification and a hard request cap.",
+            "Follow, Engage, and Post will use Instagram Web. Private-API auth cooldowns do not block Browser Mode. Browser sessions are restored from the locally saved Web session when Chromium's persistent profile opens logged out.",
         )
 
         return {
@@ -7588,7 +7916,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Media Folder Hub: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Browser Reload Recovery: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
