@@ -55,7 +55,6 @@ IG_ACCOUNTS_FILE = Path(
 ).expanduser()
 
 
-REELS_BUILD_ID = "hashtag-relevance-v10"
 def _safe_account_slug(username):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(username or "").strip().lstrip("@"))
     return value.strip("._-") or "instagram_account"
@@ -138,28 +137,28 @@ WORKFLOW_SLEEP_MIN = max(DM_POLL_SECONDS, int(os.environ.get("IG_WORKFLOW_SLEEP_
 WORKFLOW_SLEEP_MAX = max(WORKFLOW_SLEEP_MIN, int(os.environ.get("IG_WORKFLOW_SLEEP_MAX", "1200")))
 
 AUTO_ACTIVE_REST_MIN_SECONDS = max(
-    120,
-    int(os.environ.get("IG_AUTO_ACTIVE_REST_MIN_SECONDS", "180")),
+    45,
+    int(os.environ.get("IG_AUTO_ACTIVE_REST_MIN_SECONDS", "75")),
 )
 AUTO_ACTIVE_REST_MAX_SECONDS = max(
     AUTO_ACTIVE_REST_MIN_SECONDS,
-    int(os.environ.get("IG_AUTO_ACTIVE_REST_MAX_SECONDS", "480")),
+    int(os.environ.get("IG_AUTO_ACTIVE_REST_MAX_SECONDS", "180")),
 )
 AUTO_LONG_REST_MIN_SECONDS = max(
-    900,
-    int(os.environ.get("IG_AUTO_LONG_REST_MIN_SECONDS", "2700")),
+    600,
+    int(os.environ.get("IG_AUTO_LONG_REST_MIN_SECONDS", "900")),
 )
 AUTO_LONG_REST_MAX_SECONDS = max(
     AUTO_LONG_REST_MIN_SECONDS,
-    int(os.environ.get("IG_AUTO_LONG_REST_MAX_SECONDS", "10800")),
+    int(os.environ.get("IG_AUTO_LONG_REST_MAX_SECONDS", "2700")),
 )
 AUTO_PASSES_BEFORE_LONG_MIN = max(
-    2,
-    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MIN", "3")),
+    3,
+    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MIN", "4")),
 )
 AUTO_PASSES_BEFORE_LONG_MAX = max(
     AUTO_PASSES_BEFORE_LONG_MIN,
-    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MAX", "6")),
+    int(os.environ.get("IG_AUTO_PASSES_BEFORE_LONG_MAX", "7")),
 )
 AUTO_FOLLOW_BATCH_MIN = max(
     1,
@@ -182,36 +181,36 @@ LAST_BROWSER_COMMENT_CHECK = {}
 NEXT_BROWSER_COMMENT_CHECK = {}
 
 ACTIVE_SESSION_MIN_SECONDS = max(
-    60,
-    int(os.environ.get("IG_ACTIVE_SESSION_MIN_SECONDS", "120")),
+    120,
+    int(os.environ.get("IG_ACTIVE_SESSION_MIN_SECONDS", "180")),
 )
 ACTIVE_SESSION_MAX_SECONDS = max(
     ACTIVE_SESSION_MIN_SECONDS,
-    int(os.environ.get("IG_ACTIVE_SESSION_MAX_SECONDS", "300")),
+    int(os.environ.get("IG_ACTIVE_SESSION_MAX_SECONDS", "420")),
 )
 ACTIVE_BROWSE_GAP_MIN_SECONDS = max(
-    3,
-    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MIN_SECONDS", "5")),
+    2,
+    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MIN_SECONDS", "3")),
 )
 ACTIVE_BROWSE_GAP_MAX_SECONDS = max(
     ACTIVE_BROWSE_GAP_MIN_SECONDS,
-    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MAX_SECONDS", "12")),
+    int(os.environ.get("IG_ACTIVE_BROWSE_GAP_MAX_SECONDS", "7")),
 )
 OVERNIGHT_REST_MIN_SECONDS = max(
-    180,
-    int(os.environ.get("IG_OVERNIGHT_REST_MIN_SECONDS", "300")),
+    90,
+    int(os.environ.get("IG_OVERNIGHT_REST_MIN_SECONDS", "120")),
 )
 OVERNIGHT_REST_MAX_SECONDS = max(
     OVERNIGHT_REST_MIN_SECONDS,
-    int(os.environ.get("IG_OVERNIGHT_REST_MAX_SECONDS", "720")),
+    int(os.environ.get("IG_OVERNIGHT_REST_MAX_SECONDS", "300")),
 )
 OVERNIGHT_LONG_REST_MIN_SECONDS = max(
-    1800,
-    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MIN_SECONDS", "3600")),
+    1200,
+    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MIN_SECONDS", "1800")),
 )
 OVERNIGHT_LONG_REST_MAX_SECONDS = max(
     OVERNIGHT_LONG_REST_MIN_SECONDS,
-    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MAX_SECONDS", "14400")),
+    int(os.environ.get("IG_OVERNIGHT_LONG_REST_MAX_SECONDS", "5400")),
 )
 BROWSER_DM_CHECK_MIN_SECONDS = max(
     900,
@@ -278,7 +277,7 @@ BROWSER_FOLLOW_VERIFY_SECONDS = max(
     ),
 )
 BROWSER_LAST_FOLLOW_ACTION = {}
-UPLOAD_COOLDOWN_SECONDS = max(300, int(os.environ.get("IG_UPLOAD_COOLDOWN_SECONDS", "1200")))
+UPLOAD_COOLDOWN_SECONDS = max(300, int(os.environ.get("IG_UPLOAD_COOLDOWN_SECONDS", "2400")))
 DM_REPLY_COOLDOWN_SECONDS = max(30, int(os.environ.get("IG_DM_REPLY_COOLDOWN_SECONDS", "120")))
 DM_MIN_INCOMING_AGE_SECONDS = max(0, int(os.environ.get("IG_DM_MIN_INCOMING_AGE_SECONDS", "90")))
 DM_THREAD_REPLY_COOLDOWN_SECONDS = max(60, int(os.environ.get("IG_DM_THREAD_REPLY_COOLDOWN_SECONDS", "1800")))
@@ -307,10 +306,10 @@ BROWSER_POST_AI_TIMEOUT_SECONDS = max(
     ),
 )
 BROWSER_POST_VISION_FRAMES = max(
-    3,
+    6,
     min(
-        5,
-        int(os.environ.get("IG_BROWSER_POST_VISION_FRAMES", "3")),
+        12,
+        int(os.environ.get("IG_BROWSER_POST_VISION_FRAMES", "10")),
     ),
 )
 
@@ -768,12 +767,11 @@ def _default_control_settings(username, conf):
         "follow_source": "both",
         "follow_limit": 2,
         "auto_follow_batch_max": 12,
-        "active_session_max_passes": 8,
+        "active_session_max_passes": 12,
         "engage_clips_per_pass": 12,
         "engage_scroll_steps": 8,
         "engage_like_percent": 75,
-        "engage_save_percent": 55,
-        "engage_repost_percent": 45,
+        "engage_repost_percent": 75,
         "engage_comment_percent": 10,
         "engage_follow_percent": 25,
         "reels_write_gap_seconds": 8,
@@ -783,7 +781,7 @@ def _default_control_settings(username, conf):
         "reels_audio_transcription": True,
         "whisper_model": os.environ.get("IG_WHISPER_MODEL", "small").strip() or "small",
         "pace_mode": "normal",
-        "video_frames": 8,
+        "video_frames": 10,
         "require_video_vision": True,
 
         # Independent behavior switches. There is no hidden mode routing.
@@ -797,8 +795,6 @@ def _default_control_settings(username, conf):
         "write_window_seconds": WRITE_WINDOW_SECONDS,
         "write_min_gap_seconds": WRITE_MIN_GAP_SECONDS,
         "upload_cooldown_seconds": UPLOAD_COOLDOWN_SECONDS,
-        "daily_post_limit": 20,
-        "max_posts_per_active_session": 2,
         "max_writes_per_workflow": MAX_WRITES_PER_WORKFLOW,
         "max_dm_replies_per_pass": MAX_DM_REPLIES_PER_PASS,
         "max_comment_replies_per_pass": MAX_COMMENT_REPLIES_PER_PASS,
@@ -912,7 +908,6 @@ def _sanitize_control_settings(username, conf, raw):
         "engage_clips_per_pass": as_int("engage_clips_per_pass", 1, 20),
         "engage_scroll_steps": as_int("engage_scroll_steps", 1, 20),
         "engage_like_percent": as_int("engage_like_percent", 0, 100),
-        "engage_save_percent": as_int("engage_save_percent", 0, 100),
         "engage_repost_percent": as_int("engage_repost_percent", 0, 100),
         "engage_comment_percent": as_int("engage_comment_percent", 0, 100),
         "engage_follow_percent": as_int("engage_follow_percent", 0, 100),
@@ -940,8 +935,6 @@ def _sanitize_control_settings(username, conf, raw):
         "write_window_seconds": as_int("write_window_seconds", 60, 7200),
         "write_min_gap_seconds": as_int("write_min_gap_seconds", 8, 600),
         "upload_cooldown_seconds": as_int("upload_cooldown_seconds", 300, 21600),
-        "daily_post_limit": as_int("daily_post_limit", 1, 50),
-        "max_posts_per_active_session": as_int("max_posts_per_active_session", 1, 5),
         "max_writes_per_workflow": as_int("max_writes_per_workflow", 1, 10),
         "max_dm_replies_per_pass": as_int("max_dm_replies_per_pass", 1, 5),
         "max_comment_replies_per_pass": as_int("max_comment_replies_per_pass", 1, 5),
@@ -1170,11 +1163,30 @@ def analyze_context_topic(text):
     return "general"
 
 
+def _strip_generation_edge_quotes(value):
+    """Remove accidental model wrapper quotes without touching apostrophes inside text."""
+    text = str(value or "").strip()
+    pairs = (('"', '"'), ("“", "”"), ("‘", "’"), ("'", "'"))
+    changed = True
+    while text and changed:
+        changed = False
+        for left, right in pairs:
+            if len(text) >= 2 and text.startswith(left) and text.endswith(right):
+                text = text[len(left):len(text)-len(right)].strip()
+                changed = True
+                break
+    # Models sometimes leave only the closing quote after labels/format parsing.
+    text = re.sub(r'[\s\u00a0]+$', '', text)
+    text = re.sub(r'["”]+$', '', text).rstrip()
+    return text
+
+
 def _clean_ollama_output(raw):
-    text = str(raw or "").strip().strip('"').strip()
+    text = _strip_generation_edge_quotes(str(raw or "").strip())
     for prefix in ("Caption:", "Reply:", "Response:", "Assistant:"):
         if text.lower().startswith(prefix.lower()):
             text = text[len(prefix):].strip()
+    text = _strip_generation_edge_quotes(text)
     return " ".join(text.split())
 
 
@@ -1352,7 +1364,7 @@ def _video_duration_seconds(video_path):
 
 def extract_video_story_frames(video_path, count=5):
     video_path=Path(video_path)
-    count=max(3,min(9,int(count)))
+    count=max(3,min(12,int(count)))
     root=DOWNLOAD_ROOT/"video_story_frames"
     root.mkdir(parents=True,exist_ok=True)
     stamp=f"{video_path.stat().st_size}_{video_path.stat().st_mtime_ns}"
@@ -1405,12 +1417,96 @@ def extract_video_story_frames(video_path, count=5):
     return frames
 
 
+def _transcribe_local_post_media(video_path, username):
+    """Transcribe local upload audio so captions/hashtags use what is actually said."""
+    if not username:
+        return "", ""
+    try:
+        settings = get_account_control_settings(username)
+        if not settings.get("reels_audio_transcription", True):
+            return "", ""
+    except Exception:
+        settings = {}
+
+    video_path = Path(video_path)
+    try:
+        stat = video_path.stat()
+    except Exception:
+        return "", ""
+
+    model_name = str(settings.get("whisper_model", "small") or "small").strip()
+    token = hashlib.sha256(
+        f"{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{model_name}".encode(
+            "utf-8", "replace"
+        )
+    ).hexdigest()[:24]
+    cache_root = DOWNLOAD_ROOT / "post_audio_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_json = cache_root / f"{token}.json"
+
+    try:
+        if cache_json.exists():
+            cached = json.loads(cache_json.read_text(encoding="utf-8"))
+            transcript = str(cached.get("transcript") or "").strip()
+            backend = str(cached.get("backend") or "").strip()
+            if transcript:
+                return transcript[:12000], backend
+    except Exception:
+        pass
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg = None
+    if not ffmpeg:
+        return "", ""
+
+    wav = cache_root / f"{token}.wav"
+    try:
+        subprocess.run(
+            [
+                str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
+                "-t", "180", "-c:a", "pcm_s16le", str(wav),
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240,
+        )
+        if not wav.exists() or wav.stat().st_size < 5000:
+            return "", ""
+
+        # _transcribe_wav_local is defined later in the module; runtime lookup is intentional.
+        transcript, backend = _transcribe_wav_local(username, wav)
+        transcript = str(transcript or "").strip()[:12000]
+        backend = str(backend or "").strip()
+        if transcript:
+            try:
+                cache_json.write_text(
+                    json.dumps({"transcript": transcript, "backend": backend}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        return transcript, backend
+    except Exception:
+        return "", ""
+    finally:
+        try:
+            if wav.exists():
+                wav.unlink()
+        except Exception:
+            pass
+
+
 def analyze_media_for_caption(
     media_files,
     sidecar_text="",
     source_account="",
     frame_count=5,
     require_video_vision=True,
+    account_username=None,
 ):
     clean_text=_sanitize_post_context(sidecar_text,source_account)
     vision_model=get_ollama_vision_model()
@@ -1427,6 +1523,13 @@ def analyze_media_for_caption(
             visual_files=[]
     elif image:
         visual_files=[image]
+
+    audio_transcript = ""
+    audio_backend = ""
+    if video and account_username:
+        audio_transcript, audio_backend = _transcribe_local_post_media(
+            video, account_username
+        )
 
     if video and require_video_vision and (not vision_model or len(visual_files)<3):
         return {
@@ -1449,12 +1552,18 @@ Actually watch the sequence by comparing all frames from earliest to latest.
 
 Return:
 PERSPECTIVE: POV_FIRST_PERSON | SELFIE_VLOG | THIRD_PERSON | UNKNOWN
-SEQUENCE: 3-7 concise sentences explaining what happens over time, in order.
-NARRATION_NOTES: a concise first-person-friendly description suitable for a post caption.
+SEQUENCE: 5-10 concise sentences explaining what happens from beginning to end.
+VISIBLE_TEXT: important readable text/signs/captions and how they affect meaning.
+KEY_DETAILS: 5-10 concrete objects/actions/results/details that distinguish this media.
+MAIN_POINT: what the clip is actually showing, arguing, demonstrating, joking about, or trying to convey.
+CAPTION_ANGLES: 3-5 grounded caption angles.
+HASHTAG_TOPICS: 5-10 specific searchable subject/topic phrases, not generic social tags.
+AVOID_CLAIMS: anything the evidence does not support.
 
 Rules:
-- Base the answer only on visible evidence across the frames.
-- Notice changes between frames, actions, movement, setting, objects, and readable text.
+- Base the answer only on visible evidence across ALL chronological frames.
+- Compare early/middle/late frames instead of describing one frame.
+- Read visible text carefully and use it when it changes the meaning.
 - If this is POV/selfie/vlog footage, make that explicit.
 - Do not identify people by name or infer private traits.
 - Do not mention usernames, filenames, source accounts, reposting, or archive metadata.
@@ -1462,11 +1571,21 @@ Rules:
 """.strip()
         else:
             prompt = """
-Analyze this social-media image for caption writing.
+Analyze this social-media image carefully for caption and hashtag writing.
+If the image contains substantial text, a screenshot, meme, sign, quote, argument,
+chart annotation, or written opinion, the WRITTEN CONTENT is a primary subject:
+read it before describing the background.
+
 Return:
 PERSPECTIVE: SELFIE_VLOG | THIRD_PERSON | UNKNOWN
-SEQUENCE: 1-3 concise sentences describing what is visibly happening.
-NARRATION_NOTES: a concise first-person-friendly description suitable for a caption.
+VISIBLE_TEXT: transcribe/summarize the important readable text as accurately as possible.
+VISUAL_CONTEXT: what is physically visible besides the text.
+MAIN_POINT: what the image/text is actually communicating or arguing.
+KEY_DETAILS: 4-8 specific grounded details.
+CAPTION_ANGLES: 3-5 grounded caption angles.
+HASHTAG_TOPICS: 5-10 specific searchable subject/topic phrases.
+AVOID_CLAIMS: unsupported inferences to avoid.
+
 Do not identify people by name, infer private traits, mention usernames/files, or invent topics.
 """.strip()
         try:
@@ -1499,6 +1618,12 @@ Do not identify people by name, infer private traits, mention usernames/files, o
     pieces=[]
     if visual_description:
         pieces.append("VIDEO/IMAGE VISUAL ANALYSIS:\n"+visual_description)
+    if audio_transcript:
+        pieces.append(
+            "LOCAL AUDIO TRANSCRIPT"
+            + (f" ({audio_backend})" if audio_backend else "")
+            + ":\n" + audio_transcript
+        )
     if clean_text:
         pieces.append("SUPPORTING TEXT CONTEXT:\n"+clean_text)
     if not pieces:
@@ -1507,13 +1632,66 @@ Do not identify people by name, infer private traits, mention usernames/files, o
             "identity, profession, location, or event."
         )
 
+    evidence = "\n\n".join(pieces)
+    interpreted = ""
+    if visual_description or audio_transcript or clean_text:
+        synthesis_prompt = f"""
+Interpret this ONE social-media post before anyone writes its caption or hashtags.
+Use all available visual, audio, and written evidence together.
+
+EVIDENCE:
+{evidence[:16000]}
+
+Return:
+POST_SUMMARY: a specific beginning-to-end / whole-image understanding.
+MAIN_POINT: what the post is really about or trying to communicate.
+IMPORTANT_WORDS_OR_SPEECH: key written/spoken content that changes meaning.
+KEY_DETAILS: 6-12 concrete details grounded in evidence.
+CAPTION_DIRECTIONS: 4-6 specific possible angles that fit this exact post.
+HASHTAG_CONCEPTS: 8-12 specific searchable concepts grounded in this post.
+AVOID_CLAIMS: facts/identities/locations not supported by the evidence.
+
+Do not write the final caption yet. Do not invent missing facts.
+""".strip()
+        try:
+            response = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {
+                        "role":"system",
+                        "content":(
+                            "Interpret multimodal social media evidence carefully. "
+                            "Specificity and accuracy matter more than cleverness."
+                        ),
+                    },
+                    {"role":"user","content":synthesis_prompt},
+                ],
+                options={"temperature":0.08,"top_p":0.75,"num_predict":900},
+            )
+            interpreted = _clean_ollama_output(
+                response.get("message",{}).get("content","")
+                if isinstance(response,dict)
+                else getattr(getattr(response,"message",None),"content","")
+            ).strip()
+        except Exception:
+            interpreted = ""
+
+    context = (
+        "DEEP POST INTERPRETATION:\n" + interpreted + "\n\nRAW EVIDENCE:\n" + evidence
+        if interpreted
+        else evidence
+    )
+
     return {
-        "context":"\n\n".join(pieces),
+        "context":context[:20000],
         "perspective":perspective,
         "vision_model":vision_model,
         "media_kind":media_kind,
         "vision_required_failed":False,
         "frames_analyzed":len(visual_files),
+        "audio_transcript_chars":len(audio_transcript),
+        "audio_backend":audio_backend,
+        "deep_interpreted":bool(interpreted),
     }
 
 
@@ -3846,6 +4024,7 @@ def execute_repost_flow(cl, history, username, folder_pool):
         source_account=selected_folder.get("source", ""),
         frame_count=settings["video_frames"],
         require_video_vision=settings["require_video_vision"],
+        account_username=username,
     )
 
     if post_analysis.get("vision_required_failed"):
@@ -3870,7 +4049,10 @@ def execute_repost_flow(cl, history, username, folder_pool):
     update_account_metric(
         username, "add_history",
         value=(
-            f"👁️ Media watched with {vision_model}; frames={post_analysis.get('frames_analyzed', 0)}, "
+            f"👁️ Media deeply interpreted with {vision_model}; "
+            f"frames={post_analysis.get('frames_analyzed', 0)}, "
+            f"audio_chars={post_analysis.get('audio_transcript_chars', 0)}, "
+            f"deep_synthesis={'yes' if post_analysis.get('deep_interpreted') else 'no'}, "
             f"perspective={perspective}."
             if vision_model else
             "👁️ No vision model detected; using sanitized text context only."
@@ -3935,7 +4117,9 @@ Rules:
 
     tag_line = " ".join(tags[:5])
     total_limit = int(settings["caption_char_limit"])
-    caption = _clip_chars(caption, max(20, total_limit - len(tag_line) - 2))
+    caption = _strip_generation_edge_quotes(
+        _clip_chars(caption, max(20, total_limit - len(tag_line) - 2))
+    )
     full_caption = f"{caption}\n\n{tag_line}".strip()
 
     video_files = [item for item in media_files if item.suffix.lower() == ".mp4"]
@@ -7724,96 +7908,12 @@ def _browser_collect_engage_links(
 
 def _browser_visible_reel_scope(page):
     """
-    Return the DOM container for the ACTUALLY VISIBLE Reel video.
+    Return the currently dominant visible reel/post container.
 
-    Instagram keeps neighboring reels mounted in the DOM. Anchoring the scope
-    to the largest visible <video> prevents selectors/text/audio from drifting
-    into an adjacent or previously viewed reel.
+    Instagram may keep neighboring reels mounted in the DOM. This chooses the
+    visible article/section with the largest viewport intersection, preferring
+    the one closest to the viewport center.
     """
-    token = f"igch_{int(time.time()*1000)}_{random.randint(1000,9999)}"
-
-    try:
-        found = page.evaluate(
-            """
-            token => {
-              document.querySelectorAll('[data-igch-active-reel]').forEach(
-                el => el.removeAttribute('data-igch-active-reel')
-              );
-
-              const videos = [...document.querySelectorAll('video')];
-              const vh = window.innerHeight || 1;
-              const vw = window.innerWidth || 1;
-
-              let bestVideo = null;
-              let bestArea = 0;
-
-              for (const v of videos) {
-                const r = v.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) continue;
-
-                const left = Math.max(0, r.left);
-                const right = Math.min(vw, r.right);
-                const top = Math.max(0, r.top);
-                const bottom = Math.min(vh, r.bottom);
-
-                const area =
-                  Math.max(0, right-left) * Math.max(0, bottom-top);
-
-                if (area > bestArea) {
-                  bestArea = area;
-                  bestVideo = v;
-                }
-              }
-
-              if (!bestVideo || bestArea <= 0) return false;
-
-              let root =
-                bestVideo.closest('article') ||
-                bestVideo.closest('section');
-
-              if (!root) {
-                let cur = bestVideo.parentElement;
-                let fallback = cur;
-
-                for (let i = 0; cur && i < 10; i++, cur = cur.parentElement) {
-                  fallback = cur;
-
-                  const actionCount = cur.querySelectorAll(
-                    'svg[aria-label="Like"],' +
-                    'svg[aria-label="Unlike"],' +
-                    'svg[aria-label="Comment"],' +
-                    'svg[aria-label="Save"],' +
-                    'svg[aria-label="Repost"]'
-                  ).length;
-
-                  if (actionCount >= 2) {
-                    root = cur;
-                    break;
-                  }
-                }
-
-                root = root || fallback;
-              }
-
-              if (!root) return false;
-
-              root.setAttribute('data-igch-active-reel', token);
-              return true;
-            }
-            """,
-            token,
-        )
-
-        if found:
-            loc = page.locator(
-                f'[data-igch-active-reel="{token}"]'
-            ).first
-
-            if loc.count() and loc.is_visible(timeout=220):
-                return loc
-    except Exception:
-        pass
-
     best = None
     best_score = None
 
@@ -7859,7 +7959,12 @@ def _browser_visible_reel_scope(page):
                         Math.abs(cx - vw / 2) +
                         Math.abs(cy - vh / 2);
 
-                      return { area, centerDistance };
+                      return {
+                        area,
+                        centerDistance,
+                        width: r.width,
+                        height: r.height
+                      };
                     }
                     """
                 )
@@ -7871,6 +7976,8 @@ def _browser_visible_reel_scope(page):
 
             area = float(data.get("area") or 0.0)
             center = float(data.get("centerDistance") or 999999.0)
+
+            # Favor large visible containers, then the one nearest center.
             score = (-area, center)
 
             if best_score is None or score < best_score:
@@ -7890,37 +7997,14 @@ def _browser_visible_reel_scope(page):
     return page
 
 
-
-def _browser_reel_stable_key(page, scope=None) -> str:
+def _browser_visible_reel_permalink(page, scope=None) -> str:
     """
-    Stable identity for the CURRENT visible Reel.
-
-    Priority:
-      1. working tab URL shortcode (strongest; survives UI state changes)
-      2. active Reel container permalink shortcode
-      3. stable fingerprint of media path/poster + creator + duration + text
-
-    Never uses time as identity.
+    Resolve the current visible reel permalink without navigating.
     """
     scope = scope or _browser_visible_reel_scope(page)
 
-    # 1) The single-tab binding makes the working URL the strongest source.
     try:
-        current_url = str(page.url or "")
-    except Exception:
-        current_url = ""
-
-    try:
-        shortcode = _instagram_reel_shortcode_from_url(current_url)
-    except Exception:
-        shortcode = ""
-
-    if shortcode:
-        return f"reel-shortcode:{shortcode}"
-
-    # 2) Fallback to a permalink inside the active Reel scope.
-    try:
-        hrefs = scope.locator("a[href*='/reel/'], a[href*='/reels/']").evaluate_all(
+        hrefs = scope.locator("a[href*='/reel/']").evaluate_all(
             """els => els.map(e => e.href || e.getAttribute('href') || '')
                          .filter(Boolean)"""
         )
@@ -7928,218 +8012,19 @@ def _browser_reel_stable_key(page, scope=None) -> str:
         hrefs = []
 
     for href in hrefs:
-        try:
-            shortcode = _instagram_reel_shortcode_from_url(str(href or ""))
-        except Exception:
-            shortcode = ""
-
-        if shortcode:
-            return f"reel-shortcode:{shortcode}"
-
-    # 3) Last-resort content/media fingerprint.
-    try:
-        data = scope.evaluate(
-            """
-            root => {
-              const v = root.querySelector('video');
-
-              function stablePath(raw) {
-                if (!raw) return '';
-                try {
-                  const u = new URL(raw, location.href);
-                  return u.hostname + u.pathname;
-                } catch (e) {
-                  return String(raw).split('?')[0];
-                }
-              }
-
-              const sourceEl = v ? v.querySelector('source') : null;
-              const mediaSrc = v
-                ? (v.currentSrc || v.src || (sourceEl && sourceEl.src) || '')
-                : '';
-
-              const poster = v ? (v.poster || '') : '';
-
-              const profileLinks = [...root.querySelectorAll('a[href^="/"]')]
-                .map(a => a.getAttribute('href') || '')
-                .filter(h =>
-                  h &&
-                  !h.startsWith('/reel/') &&
-                  !h.startsWith('/reels/') &&
-                  !h.startsWith('/explore/') &&
-                  !h.startsWith('/direct/') &&
-                  !h.startsWith('/accounts/')
-                );
-
-              const creator = profileLinks.length ? profileLinks[0] : '';
-
-              const txt = String(root.innerText || '')
-                .replace(/\\b(Like|Unlike|Comment|Comments|Share|Save|Repost|Follow|Following)\\b/gi, ' ')
-                .replace(/\\s+/g, ' ')
-                .trim()
-                .slice(0, 1200);
-
-              return {
-                media: stablePath(mediaSrc),
-                poster: stablePath(poster),
-                creator,
-                duration: v && Number.isFinite(v.duration)
-                  ? Math.round(Number(v.duration) * 10) / 10
-                  : null,
-                text: txt
-              };
-            }
-            """
-        )
-    except Exception:
-        data = {}
-
-    payload = json.dumps(
-        data if isinstance(data, dict) else {},
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-    if len(payload) < 20:
-        payload += "|" + current_url.split("?", 1)[0]
-
-    digest = hashlib.sha256(payload.encode("utf-8", "ignore")).hexdigest()[:24]
-    return f"reel-fp:{digest}"
-
-
-
-def _browser_visible_reel_text(page, scope=None, *, limit: int = 5000) -> str:
-    scope = scope or _browser_visible_reel_scope(page)
+        clean = str(href).split("?", 1)[0].strip()
+        if "/reel/" in clean:
+            return clean
 
     try:
-        raw = str(scope.inner_text(timeout=500) or "")
+        current = str(page.url or "").split("?", 1)[0]
     except Exception:
-        raw = ""
+        current = ""
 
-    return re.sub(r"\s+", " ", raw).strip()[:limit]
+    if "/reel/" in current:
+        return current
 
-
-def _browser_sponsored_reel_allowed_topic(page, scope=None) -> str:
-    """
-    Return "finance", "coding", or "".
-
-    Sponsored reels are only eligible for engagement when the visible current
-    Reel clearly contains finance/trading/markets or coding/software/dev/AI
-    terminology. Ambiguous sponsored content is skipped.
-    """
-    scope = scope or _browser_visible_reel_scope(page)
-    visible = _browser_visible_reel_text(page, scope, limit=6000).lower()
-
-    finance_terms = (
-        "finance", "financial", "stock", "stocks", "trading", "trader",
-        "forex", "futures", "options", "investing", "investor", "market",
-        "markets", "nasdaq", "nyse", "s&p", "sp500", "bitcoin", "crypto",
-        "cryptocurrency", "xauusd", "gold", "bond", "bonds", "portfolio",
-        "earnings", "dividend", "dividends", "etf", "interest rate",
-    )
-
-    coding_terms = (
-        "code", "coding", "programmer", "programming", "developer",
-        "development", "software", "python", "javascript", "typescript",
-        "github", "api", "database", "server", "cloud", "devops", "docker",
-        "kubernetes", "linux", "algorithm", "automation", "automate",
-        "machine learning", "artificial intelligence", " ai ", "llm",
-        "ollama", "open source", "saas", "web app", "app development",
-    )
-
-    if any(term in visible for term in finance_terms):
-        return "finance"
-
-    padded = f" {visible} "
-    if any(term in padded for term in coding_terms):
-        return "coding"
-
-    return ""
-
-def _browser_visible_reel_is_ad(page, scope=None) -> bool:
-    """
-    Conservative Sponsored/ad detection for the CURRENT centered Reel only.
-
-    Do not search the whole Reel container's text for the word "Sponsored",
-    because Instagram can keep neighboring reels and unrelated UI mounted.
-    Require an exact visible marker positioned within the active video's
-    vertical region.
-    """
-    scope = scope or _browser_visible_reel_scope(page)
-    video = _browser_visible_video(page, scope)
-
-    if video is None:
-        return False
-
-    try:
-        video_box = video.bounding_box(timeout=250)
-    except Exception:
-        video_box = None
-
-    if not video_box:
-        return False
-
-    top = float(video_box["y"])
-    bottom = top + float(video_box["height"])
-    margin = max(80.0, float(video_box["height"]) * 0.20)
-
-    exact_patterns = (
-        r"^Sponsored$",
-        r"^Advertisement$",
-    )
-
-    for pattern in exact_patterns:
-        try:
-            locs = scope.get_by_text(
-                re.compile(pattern, re.I),
-                exact=True,
-            )
-            count = min(locs.count(), 20)
-        except Exception:
-            continue
-
-        for i in range(count):
-            loc = locs.nth(i)
-
-            try:
-                if not loc.is_visible(timeout=120):
-                    continue
-
-                box = loc.bounding_box(timeout=180)
-                if not box:
-                    continue
-
-                cy = float(box["y"]) + float(box["height"]) / 2.0
-
-                if (top - margin) <= cy <= (bottom + margin):
-                    return True
-            except Exception:
-                continue
-
-    return False
-
-
-
-def _browser_reel_identity_matches(
-    page,
-    expected_key: str,
-) -> tuple[bool, str]:
-    current = _browser_reel_stable_key(
-        page,
-        _browser_visible_reel_scope(page),
-    )
-    return current == expected_key, current
-
-def _browser_visible_reel_permalink(page, scope=None) -> str:
-    """
-    Historical name retained for compatibility; returns stable reel identity.
-    """
-    return _browser_reel_stable_key(
-        page,
-        scope or _browser_visible_reel_scope(page),
-    )
-
+    return f"reels-demo-current:{int(time.time())}"
 
 
 def _browser_find_svg_action_visible(page, labels):
@@ -8151,13 +8036,46 @@ def _browser_find_svg_action_visible(page, labels):
 
 def _browser_current_visible_reel_key(page, fallback_index: int = 0) -> str:
     """
-    Stable identity for the centered visible Reel.
+    Find the reel permalink nearest the viewport center without navigating.
     """
-    return _browser_reel_stable_key(
-        page,
-        _browser_visible_reel_scope(page),
-    )
+    try:
+        href = page.evaluate(
+            """
+            () => {
+              const links = [...document.querySelectorAll('a[href*="/reel/"]')];
+              const vh = window.innerHeight || 1;
+              const vw = window.innerWidth || 1;
+              let best = null;
+              let bestScore = Infinity;
 
+              for (const a of links) {
+                const r = a.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                if (r.bottom <= 0 || r.top >= vh) continue;
+
+                const cx = r.left + r.width / 2;
+                const cy = r.top + r.height / 2;
+                const score =
+                  Math.abs(cx - vw / 2) * 0.25 +
+                  Math.abs(cy - vh / 2);
+
+                if (score < bestScore) {
+                  bestScore = score;
+                  best = a.href || a.getAttribute('href') || '';
+                }
+              }
+              return best || '';
+            }
+            """
+        )
+    except Exception:
+        href = ""
+
+    href = str(href or "").split("?", 1)[0].strip()
+    if href:
+        return href
+
+    return f"reels-demo:{int(fallback_index)}:{int(time.time())}"
 
 
 def _browser_visible_action_controls(page):
@@ -8524,22 +8442,8 @@ def _browser_open_reel_comments_if_needed(page) -> bool:
 
 def _browser_reels_scroll_next(page) -> bool:
     """
-    Advance to the next Reel and VERIFY that the centered Reel identity changed.
-
-    A wheel/key event by itself is not success. Instagram sometimes absorbs
-    the event without moving the Reels feed, which caused the old skip loop to
-    re-check the same Reel repeatedly.
+    Advance the Reels feed without refresh/navigation.
     """
-    before_key = _browser_reel_stable_key(
-        page,
-        _browser_visible_reel_scope(page),
-    )
-
-    try:
-        page.bring_to_front()
-    except Exception:
-        pass
-
     try:
         vh = int(
             page.evaluate(
@@ -8549,126 +8453,20 @@ def _browser_reels_scroll_next(page) -> bool:
     except Exception:
         vh = 800
 
-    # Put the mouse over the actual visible video so wheel events target the
-    # Reels feed rather than a sidebar.
     try:
-        scope = _browser_visible_reel_scope(page)
-        video = _browser_visible_video(page, scope)
-        if video is not None:
-            box = video.bounding_box(timeout=250)
-            if box:
-                page.mouse.move(
-                    float(box["x"]) + float(box["width"]) * 0.50,
-                    float(box["y"]) + float(box["height"]) * 0.50,
-                )
+        page.mouse.wheel(
+            0,
+            int(vh * random.uniform(0.82, 1.05)),
+        )
+        page.wait_for_timeout(random.randint(900, 1500))
+        return True
     except Exception:
-        pass
-
-    def changed(wait_ms=900):
-        page.wait_for_timeout(wait_ms)
         try:
-            after_key = _browser_reel_stable_key(
-                page,
-                _browser_visible_reel_scope(page),
-            )
+            page.keyboard.press("ArrowDown")
+            page.wait_for_timeout(random.randint(900, 1500))
+            return True
         except Exception:
             return False
-
-        return bool(after_key and after_key != before_key)
-
-    # Strategy 1: scroll the nearest real scrollable ancestor of the currently
-    # visible video. This is generally the most reliable path on Reels.
-    try:
-        page.evaluate(
-            """
-            () => {
-              const videos = [...document.querySelectorAll('video')];
-              const vh = window.innerHeight || 1;
-              const vw = window.innerWidth || 1;
-
-              let v = null;
-              let best = 0;
-
-              for (const candidate of videos) {
-                const r = candidate.getBoundingClientRect();
-                const left = Math.max(0, r.left);
-                const right = Math.min(vw, r.right);
-                const top = Math.max(0, r.top);
-                const bottom = Math.min(vh, r.bottom);
-                const area =
-                  Math.max(0, right-left) * Math.max(0, bottom-top);
-
-                if (area > best) {
-                  best = area;
-                  v = candidate;
-                }
-              }
-
-              if (!v) return false;
-
-              let cur = v.parentElement;
-
-              while (cur) {
-                const style = getComputedStyle(cur);
-                const overflowY = style.overflowY || '';
-                const scrollable =
-                  /(auto|scroll)/.test(overflowY) &&
-                  cur.scrollHeight > cur.clientHeight + 80;
-
-                if (scrollable) {
-                  cur.scrollBy({
-                    top: Math.max(520, cur.clientHeight * 0.92),
-                    left: 0,
-                    behavior: 'instant'
-                  });
-                  return true;
-                }
-
-                cur = cur.parentElement;
-              }
-
-              window.scrollBy({
-                top: Math.max(520, window.innerHeight * 0.92),
-                left: 0,
-                behavior: 'instant'
-              });
-              return true;
-            }
-            """
-        )
-        if changed(1100):
-            return True
-    except Exception:
-        pass
-
-    # Strategy 2: a deliberate PageDown.
-    try:
-        page.keyboard.press("PageDown")
-        if changed(1100):
-            return True
-    except Exception:
-        pass
-
-    # Strategy 3: larger wheel movement over the visible Reel.
-    try:
-        page.mouse.wheel(0, int(vh * 1.25))
-        if changed(1200):
-            return True
-    except Exception:
-        pass
-
-    # Strategy 4: ArrowDown twice for feeds that snap one card per keypress.
-    try:
-        page.keyboard.press("ArrowDown")
-        page.wait_for_timeout(300)
-        page.keyboard.press("ArrowDown")
-        if changed(1200):
-            return True
-    except Exception:
-        pass
-
-    return False
-
 
 
 def _browser_visible_video(page, scope=None):
@@ -9157,41 +8955,57 @@ def _browser_reel_video_metadata(page, scope=None) -> dict:
 
 def _browser_find_reel_media_url(page, scope=None) -> str:
     """
-    Resolve media ONLY from the currently visible Reel video.
+    Resolve an HTTP media URL for the current reel.
 
-    Never select an arbitrary recent Instagram MP4 from the performance cache,
-    because it may belong to an adjacent/previous reel.
+    Instagram may expose a blob: URL on the video element, so fall back to
+    recent performance resource entries and prefer MP4/video CDN resources.
     """
-    scope = scope or _browser_visible_reel_scope(page)
-    video = _browser_visible_video(page, scope)
+    meta = _browser_reel_video_metadata(page, scope)
+    src = str(meta.get("src") or "").strip()
 
-    if video is None:
-        return ""
+    if src.startswith(("http://", "https://")):
+        return src
 
     try:
-        candidates = video.evaluate(
+        urls = page.evaluate(
             """
-            v => {
-              const sourceEls = Array.from(v.querySelectorAll('source'));
-              const values = [
-                v.currentSrc || '',
-                v.src || '',
-                ...sourceEls.map(s => s.src || s.getAttribute('src') || '')
-              ];
-              return values.filter(Boolean);
-            }
+            () => performance.getEntriesByType('resource')
+              .map(e => String(e.name || ''))
+              .filter(Boolean)
+              .slice(-600)
             """
         )
     except Exception:
-        candidates = []
+        urls = []
 
-    for raw in candidates or []:
+    scored = []
+
+    for raw in urls or []:
         url = str(raw or "").strip()
-        if url.startswith(("http://", "https://")):
-            return url
+        lower = url.lower()
 
-    return ""
+        if not url.startswith(("http://", "https://")):
+            continue
 
+        score = 0
+
+        if ".mp4" in lower:
+            score += 8
+        if "cdninstagram.com" in lower or "fbcdn.net" in lower:
+            score += 4
+        if "/t16/" in lower or "/video/" in lower:
+            score += 3
+        if any(ext in lower for ext in (".jpg", ".jpeg", ".png", ".webp")):
+            score -= 10
+
+        if score > 0:
+            scored.append((score, url))
+
+    if not scored:
+        return ""
+
+    scored.sort(key=lambda row: row[0])
+    return scored[-1][1]
 
 
 def _browser_media_request_headers(page, media_url: str) -> dict:
@@ -9472,394 +9286,6 @@ def _transcribe_reel_audio_worker(
                 pass
 
 
-INSTAGRAM_REEL_RESERVED_SLUGS = {
-    "audio",
-    "reel",
-    "reels",
-    "explore",
-    "direct",
-    "accounts",
-    "stories",
-    "about",
-    "developer",
-    "developers",
-    "privacy",
-    "terms",
-    "web",
-}
-
-
-def _instagram_reel_shortcode_from_url(raw_url: str) -> str:
-    """
-    Extract a real Reel shortcode only from /reel/<code>/ or /reels/<code>/.
-
-    Reject Instagram route words such as /reel/audio/ that can appear inside
-    the Reel UI and are not Reel post identities.
-    """
-    url = str(raw_url or "").strip()
-
-    if not url:
-        return ""
-
-    match = re.search(
-        r"(?:https?://(?:www\.)?instagram\.com)?/"
-        r"reels?/([A-Za-z0-9_-]{5,64})(?:[/?#]|$)",
-        url,
-        re.I,
-    )
-
-    if not match:
-        return ""
-
-    shortcode = match.group(1).strip()
-
-    if shortcode.lower() in INSTAGRAM_REEL_RESERVED_SLUGS:
-        return ""
-
-    # Instagram post shortcodes are opaque IDs, not ordinary route words.
-    if not re.search(r"[A-Z0-9_-]", shortcode):
-        return ""
-
-    return shortcode
-
-def _browser_current_reel_canonical_url(page, scope=None) -> str:
-    """
-    Return the exact canonical URL for the currently centered Reel.
-
-    Priority is deliberately PAGE URL FIRST. The working tab URL is the
-    strongest binding we have after the single-tab Reel lock. Reel UI links can
-    include unrelated routes such as /reel/audio/, so they are only fallbacks.
-    """
-    scope = scope or _browser_visible_reel_scope(page)
-
-    candidates = []
-
-    # 1) Strongest source: the locked working tab's current URL.
-    try:
-        candidates.append(str(page.url or ""))
-    except Exception:
-        pass
-
-    # 2) Current active scope's canonical/permalink-style links.
-    try:
-        hrefs = scope.locator(
-            "a[href*='/reel/'], a[href*='/reels/']"
-        ).evaluate_all(
-            """els => els.map(e => e.href || e.getAttribute('href') || '')
-                         .filter(Boolean)"""
-        )
-        candidates.extend(list(hrefs or []))
-    except Exception:
-        pass
-
-    seen = set()
-
-    for raw in candidates:
-        raw = str(raw or "").strip()
-
-        if not raw or raw in seen:
-            continue
-
-        seen.add(raw)
-        shortcode = _instagram_reel_shortcode_from_url(raw)
-
-        if shortcode:
-            return f"https://www.instagram.com/reel/{shortcode}/"
-
-    return ""
-
-
-
-def _browser_export_netscape_cookies(
-    page,
-    reel_url: str,
-    username: str,
-) -> Path | None:
-    """
-    Export Instagram cookies into a temporary Netscape cookie file for yt-dlp.
-
-    Playwright/Chromium commonly represents session cookies with expires=-1.
-    Netscape cookie readers expect non-negative epoch values, so session cookies
-    are normalized to 0.
-    """
-    root = DOWNLOAD_ROOT / "reel_audio_cache"
-    root.mkdir(parents=True, exist_ok=True)
-
-    out = root / (
-        f"{_safe_account_slug(username)}_"
-        f"{int(time.time()*1000)}_cookies.txt"
-    )
-
-    try:
-        cookies = page.context.cookies(
-            [
-                "https://www.instagram.com/",
-                reel_url,
-            ]
-        )
-    except Exception:
-        cookies = []
-
-    if not cookies:
-        return None
-
-    lines = [
-        "# Netscape HTTP Cookie File",
-        "# Temporary Instagram cookies for exact-Reel audio download.",
-    ]
-
-    for cookie in cookies:
-        try:
-            domain = str(cookie.get("domain") or "").strip()
-
-            if not domain:
-                continue
-
-            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
-            path = str(cookie.get("path") or "/")
-            secure = "TRUE" if cookie.get("secure") else "FALSE"
-
-            expires = cookie.get("expires")
-
-            try:
-                expires = int(float(expires))
-            except Exception:
-                expires = 0
-
-            # Chromium/Playwright session cookie convention.
-            if expires < 0:
-                expires = 0
-
-            name = str(cookie.get("name") or "")
-            value = str(cookie.get("value") or "")
-
-            if not name:
-                continue
-
-            # Netscape cookie files are tab-delimited. Avoid malformed rows.
-            name = name.replace("\t", " ").replace("\r", "").replace("\n", "")
-            value = value.replace("\t", " ").replace("\r", "").replace("\n", "")
-
-            lines.append(
-                "\t".join(
-                    [
-                        domain,
-                        include_subdomains,
-                        path,
-                        secure,
-                        str(expires),
-                        name,
-                        value,
-                    ]
-                )
-            )
-        except Exception:
-            continue
-
-    if len(lines) <= 2:
-        return None
-
-    try:
-        out.write_text(
-            "\n".join(lines) + "\n",
-            encoding="utf-8",
-        )
-        return out
-    except Exception:
-        return None
-
-
-
-class _ReelYTDLPLogger:
-    def __init__(self):
-        self.messages = []
-
-    def debug(self, msg):
-        # yt-dlp can route informational text through debug().
-        return None
-
-    def warning(self, msg):
-        value = re.sub(r"\s+", " ", str(msg or "")).strip()
-        if value:
-            self.messages.append(value)
-
-    def error(self, msg):
-        value = re.sub(r"\s+", " ", str(msg or "")).strip()
-        if value:
-            self.messages.append(value)
-
-    def last_message(self) -> str:
-        return self.messages[-1] if self.messages else ""
-
-def _download_exact_reel_media_ytdlp(
-    username: str,
-    reel_url: str,
-    cookie_file: Path | None,
-) -> tuple[Path | None, str]:
-    """
-    Download media from the EXACT locked Reel URL using yt-dlp.
-
-    This is intentionally safer than selecting an arbitrary recent MP4 from
-    Instagram's network cache because the URL belongs to the Reel identity
-    already locked by the browser workflow.
-    """
-    try:
-        import yt_dlp
-    except Exception:
-        return None, (
-            "yt-dlp is not installed "
-            "(install with: python -m pip install -U yt-dlp)"
-        )
-
-    shortcode = _instagram_reel_shortcode_from_url(reel_url)
-    if not shortcode:
-        return None, f"refusing invalid/non-Reel Instagram URL: {reel_url}"
-
-    reel_url = f"https://www.instagram.com/reel/{shortcode}/"
-    root = DOWNLOAD_ROOT / "reel_audio_cache"
-    root.mkdir(parents=True, exist_ok=True)
-
-    stem = (
-        f"{_safe_account_slug(username)}_"
-        f"{int(time.time()*1000)}_exact_reel"
-    )
-    template = str(root / f"{stem}.%(ext)s")
-
-    ytdlp_logger = _ReelYTDLPLogger()
-
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "logger": ytdlp_logger,
-        "noplaylist": True,
-        # We only need an audio-bearing file. Prefer audio-only where the
-        # extractor exposes it, otherwise use the best single-file media.
-        "format": "bestaudio/best",
-        "outtmpl": template,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
-    }
-
-    if cookie_file and Path(cookie_file).exists():
-        opts["cookiefile"] = str(cookie_file)
-
-    before = set(root.glob(f"{stem}.*"))
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(
-                reel_url,
-                download=True,
-            )
-
-            requested = []
-
-            if isinstance(info, dict):
-                filename = info.get("_filename")
-                if filename:
-                    requested.append(Path(filename))
-
-                for key in ("requested_downloads", "requested_formats"):
-                    for row in info.get(key) or []:
-                        if isinstance(row, dict):
-                            fp = row.get("filepath") or row.get("_filename")
-                            if fp:
-                                requested.append(Path(fp))
-
-        for candidate in requested:
-            if candidate.exists() and candidate.stat().st_size > 10_000:
-                return candidate, ""
-
-        after = set(root.glob(f"{stem}.*"))
-        created = sorted(
-            [
-                p
-                for p in (after - before)
-                if p.is_file() and p.stat().st_size > 10_000
-            ],
-            key=lambda p: p.stat().st_size,
-            reverse=True,
-        )
-
-        if created:
-            return created[0], ""
-
-        return None, "yt-dlp completed but produced no usable Reel media file"
-
-    except Exception as exc:
-        detail = ytdlp_logger.last_message()
-        suffix = f" · {detail[:260]}" if detail else ""
-        return None, (
-            f"yt-dlp exact-Reel download failed: "
-            f"{type(exc).__name__}{suffix}"
-        )
-
-
-def _transcribe_exact_reel_ytdlp_worker(
-    username: str,
-    reel_url: str,
-    cookie_file: Path | None,
-) -> dict:
-    media_path = None
-    wav_path = None
-
-    try:
-        media_path, reason = _download_exact_reel_media_ytdlp(
-            username,
-            reel_url,
-            cookie_file,
-        )
-
-        if media_path is None:
-            return {
-                "transcript": "",
-                "backend": "",
-                "reason": reason,
-            }
-
-        wav_path = _extract_reel_audio_wav(media_path)
-
-        if wav_path is None:
-            return {
-                "transcript": "",
-                "backend": "",
-                "reason": (
-                    "exact Reel downloaded, but ffmpeg could not extract audio"
-                ),
-            }
-
-        transcript, backend = _transcribe_wav_local(
-            username,
-            wav_path,
-        )
-
-        if transcript:
-            return {
-                "transcript": transcript,
-                "backend": f"{backend}+yt-dlp-exact-reel",
-                "reason": "",
-            }
-
-        return {
-            "transcript": "",
-            "backend": "",
-            "reason": (
-                "exact Reel audio was extracted, but local Whisper returned "
-                "no transcript"
-            ),
-        }
-
-    finally:
-        for path in (wav_path, media_path, cookie_file):
-            if not path:
-                continue
-
-            try:
-                Path(path).unlink()
-            except Exception:
-                pass
-
 def _start_reel_audio_transcription(
     page,
     username: str,
@@ -9870,92 +9296,41 @@ def _start_reel_audio_transcription(
     if not settings.get("reels_audio_transcription", True):
         return None, None
 
-    # Fast path: Instagram directly exposes HTTP media on the current <video>.
     media_url = _browser_find_reel_media_url(page, scope)
 
+    if not media_url:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "🎧 Reel audio stream URL was not exposed; deep analysis will "
+                "use visuals + visible caption/subtitles."
+            ),
+        )
+        return None, None
+
+    headers = _browser_media_request_headers(page, media_url)
     executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="reel-audio",
     )
-
-    if media_url:
-        headers = _browser_media_request_headers(page, media_url)
-        future = executor.submit(
-            _transcribe_reel_audio_worker,
-            username,
-            media_url,
-            headers,
-        )
-
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🎧 Reel audio transcription started from the current visible "
-                "video's direct media URL."
-            ),
-        )
-
-        return executor, future
-
-    # Instagram commonly uses blob:/MediaSource. Instead of guessing from
-    # cached MP4s, bind the fallback to the exact visible Reel permalink.
-    reel_url = _browser_current_reel_canonical_url(
-        page,
-        scope,
-    )
-
-    if not reel_url:
-        executor.shutdown(wait=False, cancel_futures=True)
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🎧 Current Reel uses blob/MediaSource and no valid exact Reel "
-                "shortcode could be bound; skipping audio rather than using "
-                "audio from a possibly different Reel."
-            ),
-        )
-        return None, None
-
-    shortcode = _instagram_reel_shortcode_from_url(reel_url)
-    if not shortcode:
-        executor.shutdown(wait=False, cancel_futures=True)
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                f"🎧 Refusing invalid exact-Reel audio URL: {reel_url}"
-            ),
-        )
-        return None, None
-
-    reel_url = f"https://www.instagram.com/reel/{shortcode}/"
-
-    cookie_file = _browser_export_netscape_cookies(
-        page,
-        reel_url,
-        username,
-    )
-
     future = executor.submit(
-        _transcribe_exact_reel_ytdlp_worker,
+        _transcribe_reel_audio_worker,
         username,
-        reel_url,
-        cookie_file,
+        media_url,
+        headers,
     )
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            "🎧 Current Reel uses blob/MediaSource; started exact-Reel audio "
-            f"fallback for {reel_url}"
+            "🎧 Reel audio transcription started in parallel with visual "
+            "watching/analysis."
         ),
     )
 
     return executor, future
-
 
 
 def _finish_reel_audio_transcription(
@@ -9987,13 +9362,12 @@ def _finish_reel_audio_transcription(
     reason = str(result.get("reason") or "").strip()
 
     if transcript:
-        preview = re.sub(r"\s+", " ", transcript).strip()[:260]
         update_account_metric(
             username,
             "add_history",
             value=(
                 f"🎧 Reel audio transcript ready via {backend} "
-                f"({len(transcript)} chars). Preview: {preview}"
+                f"({len(transcript)} chars)."
             ),
         )
         return transcript, backend
@@ -10015,7 +9389,6 @@ def _browser_reel_watch_context(
     watch_seconds: float = 4.0,
     analyze_vision: bool = False,
     frame_count: int = 8,
-    expected_reel_key: str = "",
 ) -> str:
     """
     Watch the current reel.
@@ -10117,27 +9490,7 @@ def _browser_reel_watch_context(
 
     captured_marks = set()
 
-    identity_changed = False
-
     while time.monotonic() - started < actual_watch:
-        if expected_reel_key:
-            same_reel, current_key = _browser_reel_identity_matches(
-                page,
-                expected_reel_key,
-            )
-            if not same_reel:
-                identity_changed = True
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🛑 Deep watch stopped immediately because the centered "
-                        f"Reel changed. expected={expected_reel_key} "
-                        f"current={current_key}"
-                    ),
-                )
-                break
-
         problem = _browser_page_problem(page)
         if problem:
             _browser_pause_for_manual_security(username, problem)
@@ -10215,7 +9568,7 @@ def _browser_reel_watch_context(
     # still be using CPU. This is intentional CPU/GPU overlap.
     vision = ""
 
-    if analyze_vision and not identity_changed:
+    if analyze_vision:
         vision = _browser_analyze_reel_frames(
             username,
             frame_paths,
@@ -10229,10 +9582,6 @@ def _browser_reel_watch_context(
             audio_future,
             timeout=150,
         )
-
-        if identity_changed:
-            transcript = ""
-            transcript_backend = ""
 
         # If audio arrived after the first vision pass, run a compact synthesis
         # pass that merges audio with the visual analysis rather than forcing a
@@ -10386,6 +9735,49 @@ def _browser_prepare_reel_comment(
         or RAGE_BAIT_PERSONA
     ).strip()
 
+    interpretation = ""
+    try:
+        interpretation_prompt = f"""
+Study this current Reel context before writing any comment.
+
+REEL EVIDENCE:
+{context[:12000]}
+
+Return:
+CREATOR_POINT: what the reel is actually doing/saying/showing.
+SEQUENCE_OR_RESULT: what changes or happens from beginning to end.
+SPOKEN_OR_WRITTEN_DETAILS: key audio transcript / captions / on-screen text.
+COMMENTABLE_DETAILS: 5-8 specific grounded details.
+SMART_RESPONSE_ANGLES: 4-6 reactions/questions that fit only this reel.
+TONE: the reel's apparent tone based on evidence.
+AVOID_CLAIMS: unsupported claims to avoid.
+
+Do not write the final comment yet. Do not invent facts.
+""".strip()
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {
+                    "role":"system",
+                    "content":(
+                        "Interpret reel evidence carefully before responding. "
+                        "Ground every detail in the supplied evidence."
+                    ),
+                },
+                {"role":"user","content":interpretation_prompt},
+            ],
+            options=_ollama_hybrid_options(
+                username, temperature=0.08, top_p=0.75, num_predict=650
+            ),
+        )
+        interpretation = _clean_ollama_output(
+            response.get("message",{}).get("content","")
+            if isinstance(response,dict)
+            else getattr(getattr(response,"message",None),"content","")
+        ).strip()
+    except Exception:
+        interpretation = ""
+
     system_prompt = f"""
 Write a short Instagram comment from supplied evidence.
 
@@ -10411,7 +9803,10 @@ NON-NEGOTIABLE RULES:
 Write ONE natural comment about the CURRENT REEL.
 
 DEEP REEL ANALYSIS:
-{context[:9000]}
+{context[:10000]}
+
+SECOND-PASS COMMENT INTERPRETATION:
+{interpretation[:7000] or "(unavailable; use raw reel evidence)"}
 
 ACCOUNT COMMENT INSTRUCTIONS:
 {extra or "(none)"}
@@ -10437,8 +9832,8 @@ Requirements:
         username,
         "add_history",
         value=(
-            "🧠 Reels writing comment from the completed deep multimodal "
-            "analysis."
+            "🧠 Reels writing comment after full watch/audio/vision plus a "
+            "second interpretation pass."
         ),
     )
 
@@ -10882,78 +10277,41 @@ def _browser_submit_prepared_reel_comment(
 
     if not comment:
         return False
-
     if href in history["browser_commented_urls"]:
         update_account_metric(
             username,
             "add_history",
-            value=(
-                "💬 Comment already recorded for this locked Reel; "
-                "not duplicating it."
-            ),
+            value="💬 Reels Demo comment already recorded for this reel; not duplicating it.",
         )
         return True
 
-    expected_key = href
-    same, current_key = _browser_reel_identity_matches(page, expected_key)
-
-    if not same:
+    if not _browser_open_reel_comments_if_needed(page):
+        controls = _browser_visible_action_controls(page)
+        summary = "; ".join(
+            row.get("label", "")
+            for row in controls[:12]
+            if row.get("label")
+        )
         update_account_metric(
             username,
             "add_history",
             value=(
-                "🛑 Comment aborted because centered Reel changed before "
-                f"opening comments. expected={expected_key} current={current_key}"
+                "↪️ Reels Demo could not open the visible reel's comment "
+                "panel. Visible action controls: "
+                f"{summary[:900] if summary else '(none detected)'}"
             ),
         )
         return False
 
-    if not _browser_open_reel_comments_if_needed(page):
-        # Retry once after a short UI settle, still on the same Reel.
-        page.wait_for_timeout(500)
-        same, current_key = _browser_reel_identity_matches(page, expected_key)
-
-        if not same:
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🛑 Comment panel retry cancelled because Reel changed. "
-                    f"expected={expected_key} current={current_key}"
-                ),
-            )
-            return False
-
-        if not _browser_open_reel_comments_if_needed(page):
-            controls = _browser_visible_action_controls(page)
-            summary = "; ".join(
-                row.get("label", "")
-                for row in controls[:12]
-                if row.get("label")
-            )
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "↪️ Could not open the CURRENT Reel's comment panel. "
-                    f"Visible controls: {summary[:900] if summary else '(none)'}"
-                ),
-            )
-            return False
-
     box = _browser_wait_for_reel_comment_editor(
         page,
-        timeout_seconds=5.0,
+        timeout_seconds=4.0,
     )
-
     if box is None:
         update_account_metric(
             username,
             "add_history",
-            value=(
-                "↪️ Current Reel's comment panel opened, but no local editor "
-                "was found."
-            ),
+            value="↪️ Reels Demo comment panel opened, but no visible comment editor was found.",
         )
         return False
 
@@ -10963,33 +10321,6 @@ def _browser_submit_prepared_reel_comment(
         "comment",
         max_wait=max_wait,
     ):
-        return False
-
-    # The pacing wait can be long enough for UI virtualization to change.
-    same, current_key = _browser_reel_identity_matches(page, expected_key)
-
-    if not same:
-        _finish_shared_write_reservation(username, "comment", False)
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Comment write slot became available after Reel changed; "
-                f"discarding comment. expected={expected_key} current={current_key}"
-            ),
-        )
-        return False
-
-    # Reacquire editor after waiting; never type into a stale locator.
-    box = _browser_find_reel_comment_editor(page)
-
-    if box is None:
-        _finish_shared_write_reservation(username, "comment", False)
-        update_account_metric(
-            username,
-            "add_history",
-            value="↪️ Comment editor disappeared before typing; not posting.",
-        )
         return False
 
     try:
@@ -11009,80 +10340,52 @@ def _browser_submit_prepared_reel_comment(
 
         page.wait_for_timeout(250)
 
+        # Capture the filled state before submission. Instagram frequently
+        # accepts the comment but does not immediately render the new comment
+        # back into the visible DOM.
         try:
             before_value = (
                 box.input_value(timeout=250)
                 if tag in {"textarea", "input"}
-                else str(
-                    box.evaluate(
-                        "(el) => el.innerText || el.textContent || ''"
-                    )
-                    or ""
-                )
+                else str(box.evaluate("(el) => el.innerText || el.textContent || '") or "")
             )
         except Exception:
             before_value = comment
 
-        # Verify the Reel one last time AFTER typing and BEFORE submit.
-        same, current_key = _browser_reel_identity_matches(
-            page,
-            expected_key,
-        )
-
-        if not same:
-            _finish_shared_write_reservation(username, "comment", False)
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🛑 Reel changed after comment text was prepared; "
-                    f"not submitting. expected={expected_key} current={current_key}"
-                ),
-            )
-            return False
-
         posted = False
-        submit = _browser_find_local_comment_submit_control(
-            page,
-            box,
-        )
 
-        if submit is not None:
-            submit.click(timeout=3500)
-            posted = True
-        else:
-            # Local editor fallback only; do not use a page-global Post button.
+        try:
+            buttons = page.get_by_role(
+                "button",
+                name=re.compile(r"^(Post|Submit)$", re.I),
+            )
+            for i in range(min(buttons.count(), 6)):
+                btn = buttons.nth(i)
+                if btn.is_visible(timeout=120):
+                    btn.click(timeout=3500)
+                    posted = True
+                    break
+        except Exception:
+            pass
+
+        if not posted:
             try:
-                box.press("Enter")
+                page.keyboard.press("Enter")
                 posted = True
             except Exception:
-                try:
-                    box.click(timeout=1500)
-                    page.keyboard.press("Enter")
-                    posted = True
-                except Exception:
-                    posted = False
+                posted = False
 
         if not posted:
             _finish_shared_write_reservation(username, "comment", False)
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "⚠️ Comment editor was filled but no local submit control "
-                    "or editor Enter-submit path succeeded."
-                ),
-            )
             return False
 
         page.wait_for_timeout(900)
-
     except Exception as exc:
         _finish_shared_write_reservation(username, "comment", False)
         update_account_metric(
             username,
             "add_history",
-            value=f"⚠️ Reels Comment failed: {type(exc).__name__}",
+            value=f"⚠️ Reels Demo Comment failed: {type(exc).__name__}",
         )
         return False
 
@@ -11090,33 +10393,20 @@ def _browser_submit_prepared_reel_comment(
         _finish_shared_write_reservation(username, "comment", False)
         return False
 
-    same, current_key = _browser_reel_identity_matches(page, expected_key)
-
-    if not same:
-        _finish_shared_write_reservation(username, "comment", False)
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Reel changed during comment submission; not recording "
-                f"success. expected={expected_key} current={current_key}"
-            ),
-        )
-        return False
-
+    # Confirmation is accepted when either:
+    #   1. the comment is rendered back in the visible DOM, OR
+    #   2. Instagram cleared/closed the editor after a successful submit.
+    confirmed = False
     rendered = False
     cleared_or_closed = False
 
-    # Confirmation remains conservative, but keep it local to the comment UI
-    # when possible.
     try:
-        scope = _browser_visible_reel_scope(page)
-        visible = re.sub(
+        body = re.sub(
             r"\s+",
             " ",
-            scope.inner_text(timeout=700) or "",
+            page.locator("body").inner_text(timeout=700) or "",
         )
-        rendered = comment.lower() in visible.lower()
+        rendered = comment.lower() in body.lower()
     except Exception:
         rendered = False
 
@@ -11156,16 +10446,15 @@ def _browser_submit_prepared_reel_comment(
 
     if confirmed:
         record_write(username, "comment")
-        if href not in history["browser_commented_urls"]:
-            history["browser_commented_urls"].append(href)
-            history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
+        history["browser_commented_urls"].append(href)
+        history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
             value=(
                 f"💬 Reels comment accepted "
                 f"({'rendered' if rendered else 'editor cleared after submit'}): "
-                f"{comment[:140]}"
+                f"{comment[:120]}"
             ),
         )
         return True
@@ -11175,12 +10464,11 @@ def _browser_submit_prepared_reel_comment(
         username,
         "add_history",
         value=(
-            "⚠️ Comment submit remained ambiguous on the same locked Reel; "
-            "not counting it as confirmed."
+            "⚠️ Reels comment submit state remained ambiguous; "
+            "continuing without counting it."
         ),
     )
     return False
-
 
 
 def _browser_demo_save(
@@ -11268,171 +10556,72 @@ def _browser_demo_save(
 
 
 
-def _browser_repost_thought_overlay_open(page) -> bool:
-    """
-    Detect the optional post-Repost 'Add a thought' UI without searching
-    unrelated background Reel content.
-    """
-    try:
-        dialogs = page.locator("[role='dialog']")
-        for i in range(min(dialogs.count(), 12)):
-            dialog = dialogs.nth(i)
-            if not dialog.is_visible(timeout=100):
-                continue
-            txt = re.sub(
-                r"\s+",
-                " ",
-                dialog.inner_text(timeout=250) or "",
-            ).strip()
-            if re.search(r"\bAdd\s+a\s+thought\b", txt, re.I):
-                return True
-    except Exception:
-        pass
-
-    return False
-
-
-def _browser_find_repost_confirmation_in_overlay(page):
-    """
-    Find an explicit Repost confirmation ONLY inside a visible overlay/menu.
-
-    Never searches the entire page, which can contain controls for neighboring
-    mounted Reels.
-    """
-    overlay_selectors = (
-        "[role='dialog']",
-        "[role='menu']",
-        "[data-radix-popper-content-wrapper]",
-    )
-
-    for selector in overlay_selectors:
-        try:
-            overlays = page.locator(selector)
-            count = min(overlays.count(), 20)
-        except Exception:
-            continue
-
-        for i in range(count):
-            overlay = overlays.nth(i)
-
-            try:
-                if not overlay.is_visible(timeout=100):
-                    continue
-            except Exception:
-                continue
-
-            # Prefer semantic controls.
-            for role in ("button", "menuitem"):
-                try:
-                    controls = overlay.get_by_role(
-                        role,
-                        name=re.compile(r"^Repost$", re.I),
-                    )
-                    for j in range(min(controls.count(), 8)):
-                        control = controls.nth(j)
-                        if control.is_visible(timeout=100):
-                            return control
-                except Exception:
-                    pass
-
-            # Last overlay-local fallback: exact text, never page-global.
-            try:
-                items = overlay.get_by_text(
-                    re.compile(r"^Repost$", re.I),
-                    exact=True,
-                )
-                for j in range(min(items.count(), 8)):
-                    item = items.nth(j)
-                    if item.is_visible(timeout=100):
-                        return item
-            except Exception:
-                pass
-
-    return None
-
 def _browser_close_repost_thought_overlay(
     page,
     username: str,
 ) -> bool:
     """
-    Close the optional 'Add a thought' composer using ONLY its own visible
-    controls. Never send Escape, because Escape can alter the Reels navigation
-    stack and expose another Reel.
+    Instagram may open an optional "Add a thought" composer after a repost.
+
+    The repost itself does not require adding text. Close the optional composer
+    explicitly before the next reel action so the following click cannot land
+    inside the overlay.
     """
-    if not _browser_repost_thought_overlay_open(page):
+    detected = False
+
+    try:
+        body_text = str(
+            page.locator("body").inner_text(timeout=500) or ""
+        )
+        detected = bool(
+            re.search(
+                r"\badd\s+a\s+thought\b",
+                body_text,
+                re.I,
+            )
+        )
+    except Exception:
+        detected = False
+
+    if not detected:
         return False
 
     update_account_metric(
         username,
         "add_history",
         value=(
-            "📝 Repost opened optional 'Add a thought'; closing only that "
-            "overlay before the next action."
+            "📝 Repost opened optional 'Add a thought'; closing it before "
+            "the next reel action."
         ),
     )
 
-    try:
-        dialogs = page.locator("[role='dialog']")
-        for i in range(min(dialogs.count(), 12)):
-            dialog = dialogs.nth(i)
-            if not dialog.is_visible(timeout=100):
-                continue
-
-            try:
-                txt = re.sub(
-                    r"\s+",
-                    " ",
-                    dialog.inner_text(timeout=250) or "",
-                ).strip()
-            except Exception:
-                txt = ""
-
-            if not re.search(r"\bAdd\s+a\s+thought\b", txt, re.I):
-                continue
-
-            for pattern in (r"^Close$", r"^Cancel$", r"^Done$"):
-                try:
-                    buttons = dialog.get_by_role(
-                        "button",
-                        name=re.compile(pattern, re.I),
-                    )
-                    for j in range(min(buttons.count(), 8)):
-                        button = buttons.nth(j)
-                        if button.is_visible(timeout=100):
-                            button.click(timeout=2500)
-                            page.wait_for_timeout(350)
-                            return True
-                except Exception:
-                    pass
-
-            # Some Instagram dialogs expose an aria-label Close on an SVG.
-            try:
-                closes = dialog.locator(
-                    "svg[aria-label='Close'], [aria-label='Close']"
-                )
-                for j in range(min(closes.count(), 8)):
-                    control = closes.nth(j)
-                    if not control.is_visible(timeout=100):
-                        continue
-                    clickable = _browser_clickable_from_svg(control)
-                    clickable.click(timeout=2500)
-                    page.wait_for_timeout(350)
+    # Prefer an explicit Close/X control.
+    for pattern in (
+        r"^Close$",
+        r"^Cancel$",
+        r"^Done$",
+    ):
+        try:
+            buttons = page.get_by_role(
+                "button",
+                name=re.compile(pattern, re.I),
+            )
+            for i in range(min(buttons.count(), 10)):
+                button = buttons.nth(i)
+                if button.is_visible(timeout=120):
+                    button.click(timeout=2500)
+                    page.wait_for_timeout(400)
                     return True
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+    # Escape is safer than clicking a random coordinate.
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(450)
+        return True
     except Exception:
-        pass
-
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            "📝 'Add a thought' remained open; leaving it untouched rather "
-            "than using Escape and risking a Reel change."
-        ),
-    )
-    return False
-
+        return False
 
 def _browser_demo_repost(
     page,
@@ -11444,8 +10633,6 @@ def _browser_demo_repost(
 ) -> bool:
     history.setdefault("browser_reposted_urls", [])
 
-    expected_key = href
-    initial_url = str(page.url or "")
     state = _browser_visible_reel_state(page)
 
     if state["reposted"] or href in history["browser_reposted_urls"]:
@@ -11459,25 +10646,13 @@ def _browser_demo_repost(
         )
         return True
 
-    same, current_key = _browser_reel_identity_matches(page, expected_key)
-    if not same:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Repost aborted before click because centered Reel changed: "
-                f"expected={expected_key} current={current_key}"
-            ),
-        )
-        return False
-
     repost_svg = _browser_find_strict_reel_svg(page, "Repost")
 
     if repost_svg is None:
         update_account_metric(
             username,
             "add_history",
-            value="↪️ Reels Repost control is not visible in the locked reel.",
+            value="↪️ Reels Repost control is not visible in the current reel.",
         )
         return False
 
@@ -11492,96 +10667,46 @@ def _browser_demo_repost(
         return False
 
     try:
-        # Stage 1: click ONLY the locked Reel's exact Repost icon/control.
         _browser_clickable_from_svg(repost_svg).click(timeout=4000)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(450)
 
-        same, current_key = _browser_reel_identity_matches(
-            page,
-            expected_key,
-        )
-        if not same:
-            _finish_shared_write_reservation(username, "repost", False)
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🛑 Repost's first click changed the centered Reel; "
-                    "stopping before any confirmation click. "
-                    f"expected={expected_key} current={current_key} "
-                    f"before_url={initial_url[:180]} "
-                    f"now_url={str(page.url or '')[:180]}"
-                ),
+        # Instagram may open a small menu requiring one exact Repost choice.
+        scope = _browser_visible_reel_scope(page)
+        try:
+            exact = page.get_by_text(
+                re.compile(r"^Repost$", re.I),
+                exact=True,
             )
-            return False
+            for i in range(min(exact.count(), 8)):
+                item = exact.nth(i)
+                if not item.is_visible(timeout=120):
+                    continue
 
-        # Some Instagram variants repost immediately on the first click.
-        first_state = _browser_visible_reel_state(page)
-        thought_open = _browser_repost_thought_overlay_open(page)
+                # Avoid re-clicking the original reel action itself by only
+                # accepting a visible text/menu item outside the strict SVG
+                # button when Instagram exposes one.
+                try:
+                    tag = str(
+                        item.evaluate("(el) => el.tagName.toLowerCase()")
+                    ).lower()
+                except Exception:
+                    tag = ""
 
-        # Stage 2: only if still not reposted and no success/thought UI,
-        # click an exact Repost choice INSIDE a visible overlay/menu.
-        if not first_state["reposted"] and not thought_open:
-            confirm = _browser_find_repost_confirmation_in_overlay(page)
+                if tag == "svg":
+                    continue
 
-            if confirm is not None:
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🔁 Repost menu opened on the locked Reel; clicking "
-                        "its overlay-local Repost confirmation."
-                    ),
-                )
-                confirm.click(timeout=3000)
+                item.click(timeout=3000)
                 page.wait_for_timeout(650)
-            else:
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🔁 Repost icon clicked, but no reel-bound confirmation "
-                        "menu was found; checking final state without any "
-                        "page-global click."
-                    ),
-                )
+                break
+        except Exception:
+            pass
 
-        # Never continue if Instagram switched Reels during confirmation.
-        same, current_key = _browser_reel_identity_matches(
+        # Repost can open an optional "Add a thought" overlay. The repost has
+        # already been requested; close the overlay before any later action.
+        _browser_close_repost_thought_overlay(
             page,
-            expected_key,
+            username,
         )
-        if not same:
-            _finish_shared_write_reservation(username, "repost", False)
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🛑 Repost confirmation changed the centered Reel; "
-                    "ending Repost without touching the new Reel. "
-                    f"expected={expected_key} current={current_key} "
-                    f"now_url={str(page.url or '')[:180]}"
-                ),
-            )
-            return False
-
-        thought_open = _browser_repost_thought_overlay_open(page)
-
-        # Instagram opening Add-a-thought is itself strong evidence that Repost
-        # was accepted on this exact locked Reel.
-        if thought_open:
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🔁 Repost accepted: Instagram opened the optional "
-                    "'Add a thought' composer on the same locked Reel."
-                ),
-            )
-            _browser_close_repost_thought_overlay(
-                page,
-                username,
-            )
 
     except Exception as exc:
         _finish_shared_write_reservation(username, "repost", False)
@@ -11589,23 +10714,6 @@ def _browser_demo_repost(
             username,
             "add_history",
             value=f"⚠️ Reels Repost failed: {type(exc).__name__}",
-        )
-        return False
-
-    # Same Reel must still be centered after optional overlay cleanup.
-    same, current_key = _browser_reel_identity_matches(
-        page,
-        expected_key,
-    )
-    if not same:
-        _finish_shared_write_reservation(username, "repost", False)
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Repost cleanup changed the centered Reel; ending pass. "
-                f"expected={expected_key} current={current_key}"
-            ),
         )
         return False
 
@@ -11619,44 +10727,30 @@ def _browser_demo_repost(
 
     state = _browser_visible_reel_state(page)
 
-    # Re-check thought state too; it may still be open if no close control was
-    # available, but that is still evidence of a successful same-Reel repost.
-    thought_open = _browser_repost_thought_overlay_open(page)
-
-    if state["reposted"] or thought_open:
+    if state["reposted"]:
         record_write(username, "repost")
-        if href not in history["browser_reposted_urls"]:
-            history["browser_reposted_urls"].append(href)
-            history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+        history["browser_reposted_urls"].append(href)
+        history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
-            value=(
-                "🔁 Reels Repost confirmed on the same locked Reel"
-                + (
-                    " by the Add-a-thought composer."
-                    if thought_open
-                    else "."
-                )
-            ),
+            value="🔁 Reels Repost confirmed.",
         )
         return True
 
-    # Conservative overlay-local text/state fallback only. Never scan the whole
-    # page for repost text, because neighboring Reels remain mounted.
+    # Text confirmation fallback.
     try:
-        scope = _browser_visible_reel_scope(page)
-        scoped_text = re.sub(
+        body = re.sub(
             r"\s+",
             " ",
-            scope.inner_text(timeout=500) or "",
+            page.locator("body").inner_text(timeout=500) or "",
         ).lower()
         confirmed = any(
-            phrase in scoped_text
+            phrase in body
             for phrase in (
+                "reposted",
                 "remove repost",
                 "undo repost",
-                "reposted",
             )
         )
     except Exception:
@@ -11664,13 +10758,12 @@ def _browser_demo_repost(
 
     if confirmed:
         record_write(username, "repost")
-        if href not in history["browser_reposted_urls"]:
-            history["browser_reposted_urls"].append(href)
-            history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+        history["browser_reposted_urls"].append(href)
+        history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
-            value="🔁 Reels Repost confirmed by locked-Reel state.",
+            value="🔁 Reels Repost confirmed by Instagram text/state.",
         )
         return True
 
@@ -11678,371 +10771,11 @@ def _browser_demo_repost(
     update_account_metric(
         username,
         "add_history",
-        value=(
-            "⚠️ Reels Repost was not confirmed on the locked Reel; "
-            "no additional page-global click was attempted."
-        ),
+        value="⚠️ Reels Repost was not visibly confirmed.",
     )
     return False
 
 
-
-
-def _browser_reel_follow_status(page) -> str:
-    """
-    Return one of: following, requested, follow, unknown.
-
-    Search ONLY inside the active Reel container and accept the DOM shapes
-    Instagram currently uses for relationship controls.
-    """
-    scope = _browser_visible_reel_scope(page)
-
-    def exact_visible_text(label: str) -> bool:
-        # Semantic buttons.
-        try:
-            locs = scope.get_by_role(
-                "button",
-                name=re.compile(rf"^{re.escape(label)}$", re.I),
-            )
-            for i in range(min(locs.count(), 12)):
-                if locs.nth(i).is_visible(timeout=100):
-                    return True
-        except Exception:
-            pass
-
-        # role=button div/span wrappers.
-        try:
-            locs = scope.locator("[role='button']")
-            for i in range(min(locs.count(), 40)):
-                loc = locs.nth(i)
-                if not loc.is_visible(timeout=80):
-                    continue
-                try:
-                    value = re.sub(
-                        r"\s+",
-                        " ",
-                        loc.inner_text(timeout=120) or "",
-                    ).strip()
-                except Exception:
-                    value = ""
-                if value.lower() == label.lower():
-                    return True
-        except Exception:
-            pass
-
-        # Exact visible text as a final scope-local read-only check.
-        try:
-            locs = scope.get_by_text(
-                re.compile(rf"^{re.escape(label)}$", re.I),
-                exact=True,
-            )
-            for i in range(min(locs.count(), 20)):
-                if locs.nth(i).is_visible(timeout=80):
-                    return True
-        except Exception:
-            pass
-
-        return False
-
-    if exact_visible_text("Following"):
-        return "following"
-    if exact_visible_text("Requested"):
-        return "requested"
-    if exact_visible_text("Follow"):
-        return "follow"
-    return "unknown"
-
-
-def _browser_find_reel_follow_control(page):
-    """
-    Find the current Reel author's Follow control without leaving the Reel.
-
-    No page-global fallback is allowed.
-    """
-    scope = _browser_visible_reel_scope(page)
-
-    # 1) Native semantic button.
-    try:
-        locs = scope.get_by_role(
-            "button",
-            name=re.compile(r"^Follow$", re.I),
-        )
-        for i in range(min(locs.count(), 12)):
-            candidate = locs.nth(i)
-            if candidate.is_visible(timeout=120):
-                return candidate
-    except Exception:
-        pass
-
-    # 2) Instagram often uses div[role=button].
-    try:
-        locs = scope.locator("[role='button']")
-        for i in range(min(locs.count(), 50)):
-            candidate = locs.nth(i)
-            if not candidate.is_visible(timeout=80):
-                continue
-            try:
-                value = re.sub(
-                    r"\s+",
-                    " ",
-                    candidate.inner_text(timeout=120) or "",
-                ).strip()
-            except Exception:
-                value = ""
-            if value.lower() == "follow":
-                return candidate
-    except Exception:
-        pass
-
-    # 3) Exact Follow text -> climb only to a local clickable ancestor.
-    try:
-        texts = scope.get_by_text(
-            re.compile(r"^Follow$", re.I),
-            exact=True,
-        )
-        for i in range(min(texts.count(), 20)):
-            node = texts.nth(i)
-            if not node.is_visible(timeout=80):
-                continue
-
-            try:
-                clickable = node.locator(
-                    "xpath=ancestor-or-self::*[self::button or @role='button'][1]"
-                )
-                if clickable.count() and clickable.first.is_visible(timeout=80):
-                    return clickable.first
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return None
-
-
-def _browser_find_local_comment_submit_control(page, editor):
-    """
-    Find Post/Submit only inside the editor's own composer/dialog/form.
-
-    Never search the whole Instagram page for a generic Post button.
-    """
-    containers = []
-
-    for xpath in (
-        "xpath=ancestor::*[@role='dialog'][1]",
-        "xpath=ancestor::form[1]",
-        "xpath=ancestor::*[@role='presentation'][1]",
-    ):
-        try:
-            loc = editor.locator(xpath)
-            if loc.count() and loc.first.is_visible(timeout=80):
-                containers.append(loc.first)
-        except Exception:
-            pass
-
-    # The editor parent/grandparent is a conservative local fallback.
-    for xpath in ("xpath=..", "xpath=../.."):
-        try:
-            loc = editor.locator(xpath)
-            if loc.count() and loc.first.is_visible(timeout=80):
-                containers.append(loc.first)
-        except Exception:
-            pass
-
-    for container in containers:
-        try:
-            buttons = container.get_by_role(
-                "button",
-                name=re.compile(r"^(Post|Submit)$", re.I),
-            )
-            for i in range(min(buttons.count(), 8)):
-                button = buttons.nth(i)
-                if button.is_visible(timeout=100):
-                    return button
-        except Exception:
-            pass
-
-        try:
-            controls = container.locator("[role='button']")
-            for i in range(min(controls.count(), 20)):
-                control = controls.nth(i)
-                if not control.is_visible(timeout=80):
-                    continue
-                try:
-                    label = re.sub(
-                        r"\s+",
-                        " ",
-                        control.inner_text(timeout=100) or "",
-                    ).strip()
-                except Exception:
-                    label = ""
-                if label.lower() in {"post", "submit"}:
-                    return control
-        except Exception:
-            pass
-
-    return None
-
-
-def _percent_roll(value) -> bool:
-    try:
-        pct = max(0, min(100, int(value)))
-    except Exception:
-        pct = 0
-
-    if pct <= 0:
-        return False
-    if pct >= 100:
-        return True
-    return random.random() < (pct / 100.0)
-
-
-def _browser_reels_auto_action_intents(settings: dict) -> dict:
-    """
-    One immutable action decision per Auto Reel.
-
-    The hub percentages now actually control Auto Reels. Manual Reels Demo
-    still exercises all available actions.
-    """
-    return {
-        "like": _percent_roll(settings.get("engage_like_percent", 75)),
-        "save": _percent_roll(settings.get("engage_save_percent", 55)),
-        "repost": _percent_roll(settings.get("engage_repost_percent", 45)),
-        "follow": _percent_roll(settings.get("engage_follow_percent", 25)),
-        "comment": _percent_roll(settings.get("engage_comment_percent", 10))
-        if settings.get("enable_comments", True)
-        else False,
-    }
-
-def _browser_reel_action_plan(
-    include_comment: bool,
-    action_intents: dict | None = None,
-) -> list[str]:
-    """
-    Reliability-first action order.
-
-    Follow and Comment happen before potentially disruptive Repost.
-    Like/Save remain randomized. Repost is always last.
-
-    action_intents=None means Manual Demo: all actions are enabled.
-    """
-    if action_intents is None:
-        enabled = {
-            "follow": True,
-            "comment": bool(include_comment),
-            "like": True,
-            "save": True,
-            "repost": True,
-        }
-    else:
-        enabled = {
-            "follow": bool(action_intents.get("follow", False)),
-            "comment": bool(
-                include_comment
-                and action_intents.get("comment", False)
-            ),
-            "like": bool(action_intents.get("like", False)),
-            "save": bool(action_intents.get("save", False)),
-            "repost": bool(action_intents.get("repost", False)),
-        }
-
-    actions = []
-
-    if enabled["follow"]:
-        actions.append("follow")
-
-    if enabled["comment"]:
-        actions.append("comment")
-
-    stable_tail = [
-        action
-        for action in ("like", "save")
-        if enabled[action]
-    ]
-    random.shuffle(stable_tail)
-    actions.extend(stable_tail)
-
-    if enabled["repost"]:
-        actions.append("repost")
-
-    return actions
-
-
-
-def _browser_reel_protected_priority(action: str) -> int:
-    # Lower number = protect earlier when the rolling budget is tight.
-    return {
-        "comment": 0,
-        "follow": 1,
-        "like": 2,
-        "save": 2,
-        "repost": 3,
-    }.get(action, 9)
-
-
-def _browser_reel_reorder_for_budget(
-    username: str,
-    pending: list[str],
-) -> list[str]:
-    """
-    Keep reliability priorities when budget gets tight.
-
-    Comment and Follow are protected. Repost remains last because it may change
-    Reel navigation. This does not raise/reset/bypass any pacing limit.
-    """
-    items = list(pending or [])
-    if not items:
-        return items
-
-    budget = _shared_write_budget_status(username)
-    remaining = int(budget.get("remaining") or 0)
-
-    # Under comfortable budget, preserve the reliability action plan order.
-    if remaining > 2:
-        return items
-
-    indexed = list(enumerate(items))
-    indexed.sort(
-        key=lambda row: (
-            _browser_reel_protected_priority(row[1]),
-            row[0],
-        )
-    )
-    return [action for _, action in indexed]
-
-
-def _browser_reel_should_defer_for_protected_action(
-    username: str,
-    action: str,
-    pending: list[str],
-) -> tuple[bool, str]:
-    """
-    Reserve the final available rolling slot for the highest-priority pending
-    action (Comment first, then Follow), never automatically for Repost.
-    """
-    budget = _shared_write_budget_status(username)
-    remaining = int(budget.get("remaining") or 0)
-
-    if remaining > 1:
-        return False, ""
-
-    other = [
-        item
-        for item in (pending or [])
-        if item != action
-    ]
-
-    if not other:
-        return False, ""
-
-    best = min(
-        other,
-        key=_browser_reel_protected_priority,
-    )
-
-    if _browser_reel_protected_priority(best) < _browser_reel_protected_priority(action):
-        return True, best
-
-    return False, ""
 
 def _browser_demo_follow_if_needed(
     page,
@@ -12061,23 +10794,10 @@ def _browser_demo_follow_if_needed(
         )
         return False
 
-    expected_key = href
-    same, current_key = _browser_reel_identity_matches(page, expected_key)
+    scope = _browser_visible_reel_scope(page)
+    state = _browser_visible_reel_state(page)
 
-    if not same:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Follow aborted because centered Reel changed before lookup. "
-                f"expected={expected_key} current={current_key}"
-            ),
-        )
-        return False
-
-    status = _browser_reel_follow_status(page)
-
-    if status == "following":
+    if state["following"]:
         update_account_metric(
             username,
             "add_history",
@@ -12085,7 +10805,7 @@ def _browser_demo_follow_if_needed(
         )
         return True
 
-    if status == "requested":
+    if state["requested"]:
         update_account_metric(
             username,
             "add_history",
@@ -12093,40 +10813,33 @@ def _browser_demo_follow_if_needed(
         )
         return True
 
-    # Allow the Reel UI a short settle before declaring Follow unavailable.
-    button = _browser_find_reel_follow_control(page)
+    button = None
+
+    try:
+        follows = scope.get_by_role(
+            "button",
+            name=re.compile(r"^Follow$", re.I),
+        )
+        for i in range(min(follows.count(), 8)):
+            candidate = follows.nth(i)
+            if candidate.is_visible(timeout=150):
+                button = candidate
+                break
+    except Exception:
+        button = None
 
     if button is None:
-        page.wait_for_timeout(550)
-
-        same, current_key = _browser_reel_identity_matches(page, expected_key)
-        if not same:
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🛑 Follow lookup stopped because the Reel changed during "
-                    f"UI settle. expected={expected_key} current={current_key}"
-                ),
-            )
-            return False
-
-        button = _browser_find_reel_follow_control(page)
-
-    if button is None:
-        status = _browser_reel_follow_status(page)
-
         update_account_metric(
             username,
             "add_history",
             value=(
-                "↪️ Reels Follow unavailable in the CURRENT locked Reel "
-                f"(relationship state={status}); no navigation fallback used."
+                "↪️ Reels found no exact visible Follow button in the current "
+                "reel; no follow action is needed/available."
             ),
         )
-        return status in {"following", "requested"}
+        return False
 
-    liked_before = _browser_visible_reel_state(page)["liked"]
+    liked_before = state["liked"]
 
     if not _browser_demo_wait_follow_slot(
         page,
@@ -12135,53 +10848,14 @@ def _browser_demo_follow_if_needed(
     ):
         return False
 
-    # Revalidate after waiting for the write slot.
-    same, current_key = _browser_reel_identity_matches(page, expected_key)
-    if not same:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Follow write slot became available after Reel changed; "
-                f"not clicking. expected={expected_key} current={current_key}"
-            ),
-        )
-        return False
-
-    # Re-find the control after pacing wait; do not click a stale Locator.
-    button = _browser_find_reel_follow_control(page)
-
-    if button is None:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "↪️ Follow control disappeared before click; leaving the Reel "
-                "untouched."
-            ),
-        )
-        return False
-
     try:
         button.click(timeout=4000)
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(800)
     except Exception as exc:
         update_account_metric(
             username,
             "add_history",
             value=f"⚠️ Reels Follow click failed: {type(exc).__name__}",
-        )
-        return False
-
-    same, current_key = _browser_reel_identity_matches(page, expected_key)
-    if not same:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Follow click changed the centered Reel; ending Follow "
-                f"verification. expected={expected_key} current={current_key}"
-            ),
         )
         return False
 
@@ -12193,22 +10867,18 @@ def _browser_demo_follow_if_needed(
     ):
         return False
 
-    # Give relationship text one brief retry window.
-    final_status = _browser_reel_follow_status(page)
+    state = _browser_visible_reel_state(page)
 
-    if final_status not in {"following", "requested"}:
-        page.wait_for_timeout(650)
-        final_status = _browser_reel_follow_status(page)
-
-    if final_status in {"following", "requested"}:
+    if state["following"] or state["requested"]:
         record_write(username, "follow")
         update_account_metric(username, "total_follows", increment=1)
         used_after, cap_after = _daily_follow_attempts_status(username)
+        status = "Following" if state["following"] else "Requested"
         update_account_metric(
             username,
             "add_history",
             value=(
-                f"✅ Reels Follow confirmed [{final_status.title()}]; "
+                f"✅ Reels Follow confirmed [{status}]; "
                 f"daily follows={used_after}/{cap_after}."
             ),
         )
@@ -12217,285 +10887,27 @@ def _browser_demo_follow_if_needed(
     update_account_metric(
         username,
         "add_history",
-        value=(
-            "⚠️ Follow was clicked on the locked Reel but relationship state "
-            "did not resolve to Following/Requested; not counting confirmed."
-        ),
+        value="⚠️ Reels Follow state ambiguous; not counted confirmed.",
     )
     return False
 
 
-
-def _browser_tag_current_reel_action_rail(page) -> tuple[str, dict]:
-    """
-    Bind action state to the control rail physically nearest the CENTERED video.
-
-    Instagram virtualizes neighboring Reels and can leave their visible SVGs
-    mounted inside a broad article/section. A page/scope-wide `Unlike` search
-    therefore creates false "already liked" results.
-
-    This helper:
-      * finds the largest visible video
-      * collects only Reel action SVGs vertically aligned with that video
-      * clusters them by x-position
-      * selects the cluster nearest the video's right edge with multiple
-        distinct Reel actions
-      * tags only that cluster for subsequent state/click queries
-    """
-    token = f"rail_{int(time.time()*1000)}_{random.randint(1000,9999)}"
-
-    try:
-        result = page.evaluate(
-            """
-            token => {
-              document.querySelectorAll('[data-igch-reel-rail]').forEach(
-                el => el.removeAttribute('data-igch-reel-rail')
-              );
-
-              const vh = window.innerHeight || 1;
-              const vw = window.innerWidth || 1;
-              const videos = [...document.querySelectorAll('video')];
-
-              let video = null;
-              let bestArea = 0;
-
-              for (const candidate of videos) {
-                const r = candidate.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) continue;
-
-                const left = Math.max(0, r.left);
-                const right = Math.min(vw, r.right);
-                const top = Math.max(0, r.top);
-                const bottom = Math.min(vh, r.bottom);
-                const area =
-                  Math.max(0, right-left) * Math.max(0, bottom-top);
-
-                if (area > bestArea) {
-                  bestArea = area;
-                  video = candidate;
-                }
-              }
-
-              if (!video || bestArea <= 0) {
-                return {ok:false, reason:'no-visible-video'};
-              }
-
-              const vr = video.getBoundingClientRect();
-              const allowed = new Set([
-                'Like','Unlike','Comment','Share',
-                'Save','Remove','Unsave',
-                'Repost','Remove repost','Undo repost','Reposted'
-              ]);
-
-              const rows = [];
-
-              for (const svg of document.querySelectorAll('svg[aria-label]')) {
-                const label = String(svg.getAttribute('aria-label') || '');
-                if (!allowed.has(label)) continue;
-
-                const r = svg.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) continue;
-
-                const cx = r.left + r.width / 2;
-                const cy = r.top + r.height / 2;
-
-                if (cx < 0 || cx > vw || cy < 0 || cy > vh) continue;
-
-                // Correct action controls should live in/next to the same
-                // vertical card as the centered video.
-                const yMargin = Math.max(100, vr.height * 0.18);
-                if (cy < vr.top - yMargin || cy > vr.bottom + yMargin) {
-                  continue;
-                }
-
-                // Exclude controls far to the left or far beyond the video.
-                if (cx < vr.left + vr.width * 0.42) continue;
-                if (cx > vr.right + Math.max(360, vr.width * 0.55)) continue;
-
-                rows.push({
-                  svg,
-                  label,
-                  cx,
-                  cy,
-                  key: Math.round(cx / 52)
-                });
-              }
-
-              if (!rows.length) {
-                return {ok:false, reason:'no-action-candidates'};
-              }
-
-              const groups = new Map();
-
-              for (const row of rows) {
-                if (!groups.has(row.key)) groups.set(row.key, []);
-                groups.get(row.key).push(row);
-              }
-
-              let best = null;
-              let bestScore = -1e9;
-
-              for (const group of groups.values()) {
-                const labels = [...new Set(group.map(x => x.label))];
-                const core = labels.filter(x =>
-                  ['Like','Unlike','Comment','Save','Remove','Unsave',
-                   'Repost','Remove repost','Undo repost','Reposted'].includes(x)
-                );
-
-                // Require at least two distinct Reel actions. This prevents a
-                // random stale Unlike icon from becoming the "rail".
-                if (core.length < 2) continue;
-
-                const meanX =
-                  group.reduce((sum, x) => sum + x.cx, 0) / group.length;
-                const rightDistance = Math.abs(meanX - vr.right);
-
-                // Distinct action richness matters more than x distance.
-                const score = core.length * 1000 - rightDistance;
-
-                if (score > bestScore) {
-                  bestScore = score;
-                  best = group;
-                }
-              }
-
-              if (!best) {
-                return {ok:false, reason:'no-confident-action-cluster'};
-              }
-
-              for (const row of best) {
-                row.svg.setAttribute('data-igch-reel-rail', token);
-              }
-
-              return {
-                ok: true,
-                labels: [...new Set(best.map(x => x.label))],
-                count: best.length,
-                video: {
-                  left: vr.left,
-                  right: vr.right,
-                  top: vr.top,
-                  bottom: vr.bottom
-                }
-              };
-            }
-            """,
-            token,
-        )
-    except Exception as exc:
-        return "", {
-            "ok": False,
-            "reason": f"evaluate-{type(exc).__name__}",
-        }
-
-    if not isinstance(result, dict) or not result.get("ok"):
-        return "", result if isinstance(result, dict) else {"ok": False}
-
-    return token, result
-
-
-def _browser_current_reel_action_labels(page) -> tuple[set[str], dict]:
-    token, diag = _browser_tag_current_reel_action_rail(page)
-
-    if not token:
-        return set(), diag
-
-    try:
-        labels = page.locator(
-            f"svg[data-igch-reel-rail='{token}'][aria-label]"
-        ).evaluate_all(
-            """els => els.map(e => e.getAttribute('aria-label') || '')
-                         .filter(Boolean)"""
-        )
-    except Exception:
-        labels = []
-
-    return {str(x) for x in labels}, diag
-
-
-def _browser_current_reel_action_svg(page, label: str):
-    token, diag = _browser_tag_current_reel_action_rail(page)
-
-    if not token:
-        return None
-
-    try:
-        locs = page.locator(
-            f"svg[data-igch-reel-rail='{token}']"
-            f"[aria-label='{str(label).replace(chr(39), '')}']"
-        )
-    except Exception:
-        return None
-
-    for i in range(min(locs.count(), 8)):
-        svg = locs.nth(i)
-        try:
-            if svg.is_visible(timeout=120):
-                return svg
-        except Exception:
-            continue
-
-    return None
-
 def _browser_visible_reel_state(page) -> dict:
     """
-    Snapshot relationship/action state for the CENTERED Reel only.
-
-    Like/Save/Repost state comes exclusively from the geometry-bound action
-    rail nearest the centered video. This prevents neighboring mounted Reels
-    from producing false `Unlike` / `Remove` / `Reposted` state.
+    Snapshot the current visible reel's key relationship/action states.
+    Uses exact SVG/button labels only.
     """
-    labels, diag = _browser_current_reel_action_labels(page)
-    rail_confident = bool(diag.get("ok")) if isinstance(diag, dict) else False
-
-    has_like = "Like" in labels
-    has_unlike = "Unlike" in labels
-
-    # A state is trusted only when the rail is confident and only one side of
-    # the Like/Unlike pair is present.
-    liked = bool(
-        rail_confident
-        and has_unlike
-        and not has_like
-    )
-    like_available = bool(
-        rail_confident
-        and has_like
-        and not has_unlike
-    )
-
-    saved = bool(
-        rail_confident
-        and (
-            "Remove" in labels
-            or "Unsave" in labels
-        )
-        and "Save" not in labels
-    )
-    save_available = bool(
-        rail_confident
-        and "Save" in labels
-        and not saved
-    )
-
-    reposted = bool(
-        rail_confident
-        and any(
-            label in labels
-            for label in (
-                "Remove repost",
-                "Undo repost",
-                "Reposted",
-            )
-        )
-    )
-    repost_available = bool(
-        rail_confident
-        and "Repost" in labels
-        and not reposted
-    )
-
     scope = _browser_visible_reel_scope(page)
+
+    def svg_visible(label):
+        try:
+            locs = scope.locator(f"svg[aria-label='{label}']")
+            for i in range(min(locs.count(), 8)):
+                if locs.nth(i).is_visible(timeout=100):
+                    return True
+        except Exception:
+            pass
+        return False
 
     def button_visible(label):
         try:
@@ -12511,59 +10923,77 @@ def _browser_visible_reel_state(page) -> dict:
         return False
 
     return {
-        "rail_confident": rail_confident,
-        "rail_labels": sorted(labels),
-        "liked": liked,
-        "like_available": like_available,
-        "saved": saved,
-        "save_available": save_available,
-        "reposted": reposted,
-        "repost_available": repost_available,
+        "liked": svg_visible("Unlike"),
+        "like_available": svg_visible("Like"),
+        "saved": (
+            svg_visible("Remove")
+            or svg_visible("Unsave")
+        ),
+        "save_available": svg_visible("Save"),
+        "reposted": (
+            svg_visible("Remove repost")
+            or svg_visible("Undo repost")
+            or svg_visible("Reposted")
+        ),
+        "repost_available": svg_visible("Repost"),
         "following": button_visible("Following"),
         "requested": button_visible("Requested"),
         "follow_available": button_visible("Follow"),
     }
 
 
-
 def _browser_find_strict_reel_svg(page, label: str):
     """
-    Exact action SVG from the CENTERED Reel's geometry-bound action rail.
+    Exact action SVG in the CURRENT visible reel only.
 
-    There is deliberately no broad scope/page fallback.
+    No page-global fallback. This prevents a neighboring reel or another action
+    container from being clicked by mistake.
     """
-    svg = _browser_current_reel_action_svg(page, label)
-
-    if svg is None:
-        return None
+    scope = _browser_visible_reel_scope(page)
 
     try:
-        clickable = _browser_clickable_from_svg(svg)
-        if not clickable.is_visible(timeout=120):
-            return None
-
-        labels = clickable.locator(
-            "svg[aria-label]"
-        ).evaluate_all(
-            """els => els.map(e => e.getAttribute('aria-label') || '')
-                         .filter(Boolean)"""
+        locs = scope.locator(
+            f"svg[aria-label='{str(label).replace(chr(39), '')}']"
         )
-
-        normalized = [str(x) for x in labels]
-
-        if label not in normalized:
-            return None
-
-        if label not in {"Like", "Unlike"} and any(
-            x in {"Like", "Unlike"}
-            for x in normalized
-        ):
-            return None
-
-        return svg
     except Exception:
         return None
 
+    for i in range(min(locs.count(), 10)):
+        svg = locs.nth(i)
+        try:
+            if not svg.is_visible(timeout=120):
+                continue
+
+            clickable = _browser_clickable_from_svg(svg)
+            if not clickable.is_visible(timeout=120):
+                continue
+
+            # Verify the clickable ancestor really contains the requested SVG,
+            # and reject controls that also contain Like/Unlike when targeting
+            # another action.
+            labels = clickable.locator(
+                "svg[aria-label]"
+            ).evaluate_all(
+                """els => els.map(e => e.getAttribute('aria-label') || '')
+                             .filter(Boolean)"""
+            )
+
+            normalized = [str(x) for x in labels]
+
+            if label not in normalized:
+                continue
+
+            if label not in {"Like", "Unlike"} and any(
+                x in {"Like", "Unlike"}
+                for x in normalized
+            ):
+                continue
+
+            return svg
+        except Exception:
+            continue
+
+    return None
 
 
 def _browser_assert_reel_still_liked(
@@ -12823,52 +11253,6 @@ def _browser_close_comment_panel_safely(
     )
     return False
 
-def _browser_reel_reorder_for_budget(
-    username: str,
-    pending: list[str],
-) -> list[str]:
-    """
-    Keep the shuffled Reel action order unless the rolling write budget becomes
-    tight.
-
-    Repost is protected from starvation:
-      * with <=2 shared write slots remaining, a pending Repost is moved first
-      * with exactly 1 slot remaining, no other pending state-changing action
-        is allowed to spend that final slot ahead of Repost
-
-    This does NOT raise, reset, or bypass the rolling budget.
-    """
-    items = list(pending or [])
-
-    if "repost" not in items:
-        return items
-
-    budget = _shared_write_budget_status(username)
-    remaining = int(budget.get("remaining") or 0)
-
-    if remaining > 2:
-        return items
-
-    items.remove("repost")
-    items.insert(0, "repost")
-    return items
-
-
-def _browser_reel_reserve_final_slot_for_repost(
-    username: str,
-    action: str,
-    pending: list[str],
-) -> bool:
-    """
-    True when action should be deferred because Repost still needs the final
-    available rolling-budget slot.
-    """
-    if action == "repost" or "repost" not in (pending or []):
-        return False
-
-    budget = _shared_write_budget_status(username)
-    return int(budget.get("remaining") or 0) <= 1
-
 def _browser_run_reel_action_cycle(
     page,
     username: str,
@@ -12877,7 +11261,6 @@ def _browser_run_reel_action_cycle(
     prepared_comment: str,
     *,
     include_comment: bool = True,
-    action_intents: dict | None = None,
     max_cycle_seconds: int = 145,
 ) -> tuple[int, list[str]]:
     """
@@ -12893,7 +11276,10 @@ def _browser_run_reel_action_cycle(
         then continues the remaining actions
       * non-Like actions are guarded against accidentally toggling Like off
     """
-    actions = _browser_reel_action_plan(include_comment, action_intents)
+    actions = ["like", "save", "repost", "follow"]
+    if include_comment:
+        actions.append("comment")
+    random.shuffle(actions)
 
     budget = _shared_write_budget_status(username)
 
@@ -12901,8 +11287,8 @@ def _browser_run_reel_action_cycle(
         username,
         "add_history",
         value=(
-            "🧭 Reels reliability action order: "
-            + (" → ".join(a.title() for a in actions) if actions else "(no Auto actions selected)")
+            "🎲 Reels action order: "
+            + " → ".join(a.title() for a in actions)
             + f" · shared write budget {budget['used']}/{budget['max']} "
             + f"({budget['remaining']} slot(s) currently remaining). "
             + (
@@ -12914,20 +11300,12 @@ def _browser_run_reel_action_cycle(
         ),
     )
 
-    pending = _browser_reel_reorder_for_budget(
-        username,
-        list(actions),
-    )
+    pending = list(actions)
     completed = []
     confirmed = 0
     deadline = time.monotonic() + max(30, int(max_cycle_seconds))
 
     while pending and time.monotonic() < deadline:
-        pending = _browser_reel_reorder_for_budget(
-            username,
-            pending,
-        )
-
         if get_account_safety_state(username)["active"]:
             break
 
@@ -12942,40 +11320,6 @@ def _browser_run_reel_action_cycle(
             if time.monotonic() >= deadline:
                 next_pending.append(action)
                 continue
-
-            same_reel, current_key = _browser_reel_identity_matches(
-                page,
-                reel_key,
-            )
-            if not same_reel:
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🛑 Reels identity changed before "
-                        f"{action.title()}; stopping this pass rather than "
-                        f"touching another reel. expected={reel_key} "
-                        f"current={current_key}"
-                    ),
-                )
-                return confirmed, completed
-
-            current_scope = _browser_visible_reel_scope(page)
-            if _browser_visible_reel_is_ad(page, current_scope):
-                sponsored_topic = _browser_sponsored_reel_allowed_topic(
-                    page,
-                    current_scope,
-                )
-                if not sponsored_topic:
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value=(
-                            "🛑 Current locked Reel is an unrelated Sponsored "
-                            "reel; stopping actions."
-                        ),
-                    )
-                    return confirmed, completed
 
             if _browser_engage_security_problem(page, username):
                 next_pending.extend(
@@ -12995,26 +11339,6 @@ def _browser_run_reel_action_cycle(
                     ),
                 )
                 completed.append(action)
-                continue
-
-            defer_for_priority, protected_action = (
-                _browser_reel_should_defer_for_protected_action(
-                    username,
-                    action,
-                    pending,
-                )
-            )
-            if defer_for_priority:
-                next_pending.append(action)
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        f"⏸️ Reels {action.title()} deferred so the final "
-                        f"available rolling-budget slot is preserved for "
-                        f"{protected_action.title()}."
-                    ),
-                )
                 continue
 
             block_reason = _browser_reel_action_blocked_now(
@@ -13112,22 +11436,6 @@ def _browser_run_reel_action_cycle(
             if ok:
                 confirmed += 1
 
-            same_reel, current_key = _browser_reel_identity_matches(
-                page,
-                reel_key,
-            )
-            if not same_reel:
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "🛑 Instagram changed the centered reel immediately "
-                        f"after {action.title()}; ending this pass. "
-                        f"expected={reel_key} current={current_key}"
-                    ),
-                )
-                return confirmed, completed
-
             if _browser_engage_security_problem(page, username):
                 break
 
@@ -13173,10 +11481,6 @@ def _browser_run_reel_action_cycle(
             a for a in next_pending
             if a not in completed
         ]
-        pending = _browser_reel_reorder_for_budget(
-            username,
-            pending,
-        )
 
         if not pending:
             break
@@ -13278,29 +11582,24 @@ def _browser_reel_marked_interacted(
     history: dict,
 ) -> tuple[bool, str]:
     """
-    Skip before expensive work when the visible Reel is already interacted
-    with, or when it is an unrelated sponsored reel.
+    Decide whether the CURRENT visible reel should be skipped before any further
+    expensive work.
 
-    Sponsored finance/coding/software/AI reels are allowed through.
+    Skip cases:
+      * reel is already visibly liked right now
+      * reel URL exists in local liked history
+      * reel URL exists in local commented history
+
+    This prevents the engine from reprocessing a reel that the browser snapped
+    back to after a prior successful action.
     """
     history.setdefault("browser_liked_urls", [])
     history.setdefault("browser_commented_urls", [])
 
-    scope = _browser_visible_reel_scope(page)
-
-    if _browser_visible_reel_is_ad(page, scope):
-        allowed_topic = _browser_sponsored_reel_allowed_topic(
-            page,
-            scope,
-        )
-
-        if not allowed_topic:
-            return True, "an unrelated sponsored/ad reel"
-
     state = _browser_visible_reel_state(page)
 
-    if state.get("rail_confident") and state.get("liked"):
-        return True, "already visibly liked on the centered Reel's action rail"
+    if state.get("liked"):
+        return True, "already visibly liked"
 
     if reel_key and reel_key in history["browser_liked_urls"]:
         return True, "already in liked history"
@@ -13311,51 +11610,23 @@ def _browser_reel_marked_interacted(
     return False, ""
 
 
-
-
 def _browser_advance_past_interacted_reels(
     page,
     username: str,
     history: dict,
     *,
-    max_skips: int = 8,
+    max_skips: int = 4,
 ) -> str:
     """
-    Advance until a fresh eligible Reel is centered.
-
-    Skips:
-      * already-liked/commented reels
-      * unrelated sponsored reels
-
-    Allows:
-      * sponsored finance/trading/markets
-      * sponsored coding/software/developer/AI
-
-    A skip only counts after the centered stable Reel identity actually changes.
+    If the visible reel is one we've already liked or commented on, advance to
+    the next reel(s) until a fresh one is found or the skip limit is reached.
     """
     last_key = ""
 
     for idx in range(max(1, int(max_skips)) + 1):
         scope = _browser_visible_reel_scope(page)
-        reel_key = _browser_reel_stable_key(page, scope)
+        reel_key = _browser_visible_reel_permalink(page, scope)
         last_key = reel_key
-
-        is_ad = _browser_visible_reel_is_ad(page, scope)
-        ad_topic = (
-            _browser_sponsored_reel_allowed_topic(page, scope)
-            if is_ad
-            else ""
-        )
-
-        if is_ad and ad_topic:
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    f"💼 Sponsored Reel allowed because visible content is "
-                    f"{ad_topic}-related: {reel_key}"
-                ),
-            )
 
         should_skip, reason = _browser_reel_marked_interacted(
             page,
@@ -13369,8 +11640,8 @@ def _browser_advance_past_interacted_reels(
                     username,
                     "add_history",
                     value=(
-                        f"✅ Reels found an eligible reel after skipping "
-                        f"{idx} reel(s): {reel_key}"
+                        f"✅ Reels found a fresh reel after skipping {idx} "
+                        f"previously interacted reel(s): {reel_key}"
                     ),
                 )
             return reel_key
@@ -13389,93 +11660,28 @@ def _browser_advance_past_interacted_reels(
                 username,
                 "add_history",
                 value=(
-                    f"↪️ Reels skip limit reached ({max_skips}); no eligible "
-                    "reel was found in this short scan."
+                    f"↪️ Reels skip limit reached ({max_skips}); leaving the "
+                    f"current reel in place: {reel_key}"
                 ),
             )
             return reel_key
 
-        before_key = reel_key
+        moved = _browser_reels_scroll_next(page)
 
-        if not _browser_reels_scroll_next(page):
+        if not moved:
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    "⚠️ Reels could not advance: all scroll/key strategies "
-                    f"left the same centered reel ({before_key})."
+                    "↪️ Reels could not advance to the next reel while trying "
+                    "to skip a previously interacted one."
                 ),
             )
             return reel_key
 
-        page.wait_for_timeout(350)
-
-        after_key = _browser_reel_stable_key(
-            page,
-            _browser_visible_reel_scope(page),
-        )
-
-        if after_key == before_key:
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "⚠️ Reels advance reported success but stable identity did "
-                    f"not change; stopping skip loop at {before_key}."
-                ),
-            )
-            return reel_key
-
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                f"↕️ Reels advanced successfully: {before_key} → {after_key}"
-            ),
-        )
+        page.wait_for_timeout(900)
 
     return last_key
-
-
-
-def _browser_reel_binding_snapshot(page) -> tuple[str, str]:
-    try:
-        url = str(page.url or "")
-    except Exception:
-        url = ""
-
-    key = _browser_reel_stable_key(
-        page,
-        _browser_visible_reel_scope(page),
-    )
-
-    return url, key
-
-
-def _browser_reel_binding_matches(
-    page,
-    expected_url_page,
-    expected_key: str,
-) -> tuple[bool, str, str]:
-    """
-    Verify the same Playwright Page object and same centered Reel are still
-    active. URL may change within the same Reels feed, so identity is decisive;
-    the URL is returned for diagnostics.
-    """
-    try:
-        current_url = str(page.url or "")
-    except Exception:
-        current_url = ""
-
-    current_key = _browser_reel_stable_key(
-        page,
-        _browser_visible_reel_scope(page),
-    )
-
-    same_page = page is expected_url_page
-    same_reel = current_key == expected_key
-
-    return bool(same_page and same_reel), current_url, current_key
 
 def _browser_run_one_reel(
     page,
@@ -13483,7 +11689,6 @@ def _browser_run_one_reel(
     history: dict,
     *,
     comment_intent: bool,
-    action_intents: dict | None = None,
     quick_watch_seconds: float = 3.0,
     max_cycle_seconds: int = 145,
 ) -> int:
@@ -13500,7 +11705,7 @@ def _browser_run_one_reel(
         page,
         username,
         history,
-        max_skips=8,
+        max_skips=4,
     )
 
     update_account_metric(
@@ -13529,31 +11734,6 @@ def _browser_run_one_reel(
         )
         return 0
 
-    locked_reel_key = reel_key
-    locked_page = page
-    locked_url, locked_key_check = _browser_reel_binding_snapshot(page)
-
-    if locked_key_check != locked_reel_key:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Reels binding changed while establishing the pass; "
-                f"expected={locked_reel_key} current={locked_key_check}. "
-                "Skipping this reel."
-            ),
-        )
-        return 0
-
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            f"🔒 Reels bound to ONE tab/reel for this pass: "
-            f"url={locked_url[:220]} · id={locked_reel_key}"
-        ),
-    )
-
     prepared_comment = ""
 
     if comment_intent:
@@ -13580,38 +11760,10 @@ def _browser_run_one_reel(
             watch_seconds=deep_seconds,
             analyze_vision=True,
             frame_count=frame_count,
-            expected_reel_key=locked_reel_key,
         )
 
         if _browser_engage_security_problem(page, username):
             return 0
-
-        binding_ok, current_url, current_key = _browser_reel_binding_matches(
-            page,
-            locked_page,
-            locked_reel_key,
-        )
-        if not binding_ok:
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🛑 Tab/Reel changed during deep analysis; discarding "
-                    "analysis instead of commenting on the wrong content. "
-                    f"expected={locked_reel_key} current={current_key} "
-                    f"url={current_url[:220]}"
-                ),
-            )
-            return 0
-
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                f"✅ Deep-analysis binding verified before comment generation: "
-                f"url={current_url[:220]} · id={current_key}"
-            ),
-        )
 
         prepared_comment = _browser_prepare_reel_comment(
             page,
@@ -13638,48 +11790,18 @@ def _browser_run_one_reel(
             watch_seconds=quick_watch_seconds,
             analyze_vision=False,
             frame_count=3,
-            expected_reel_key=locked_reel_key,
         )
 
         if _browser_engage_security_problem(page, username):
             return 0
 
-    binding_ok, pre_action_url, pre_action_key = _browser_reel_binding_matches(
-        page,
-        locked_page,
-        locked_reel_key,
-    )
-
-    if not binding_ok:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                "🛑 Tab/Reel changed while AI was generating the comment; "
-                "discarding the generated comment and taking no actions. "
-                f"expected={locked_reel_key} current={pre_action_key} "
-                f"url={pre_action_url[:220]}"
-            ),
-        )
-        return 0
-
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            f"✅ Comment/action binding verified: "
-            f"url={pre_action_url[:220]} · id={pre_action_key}"
-        ),
-    )
-
     confirmed, _ = _browser_run_reel_action_cycle(
         page,
         username,
-        locked_reel_key,
+        reel_key,
         history,
         prepared_comment,
         include_comment=comment_intent,
-        action_intents=action_intents,
         max_cycle_seconds=max_cycle_seconds,
     )
 
@@ -13689,109 +11811,30 @@ def _browser_run_one_reel(
 
 def _browser_pick_active_instagram_page(context):
     """
-    Choose ONE Instagram working tab for Reels automation.
-
-    Priority:
-      1. focused Instagram tab
-      2. visible Instagram tab
-      3. oldest Instagram tab (normally the original login/main tab)
-
-    All other Instagram tabs in this dedicated bot Chromium context are closed
-    so Reels analysis/actions cannot silently happen in a stale background tab.
-    Non-Instagram tabs are left alone.
+    Pick the most recently created Instagram page in a connected live Chromium
+    context. This avoids attaching automation to an older Instagram tab when
+    multiple pages have accumulated.
     """
     pages = list(getattr(context, "pages", []) or [])
 
     if not pages:
-        page = context.new_page()
-        try:
-            page.bring_to_front()
-        except Exception:
-            pass
-        return page
+        return context.new_page()
 
     instagram_pages = []
 
-    for index, page in enumerate(pages):
+    for page in pages:
         try:
             url = str(page.url or "").lower()
         except Exception:
             url = ""
 
-        if "instagram.com" not in url:
-            continue
+        if "instagram.com" in url:
+            instagram_pages.append(page)
 
-        focused = False
-        visible = False
+    if instagram_pages:
+        return instagram_pages[-1]
 
-        try:
-            focused = bool(page.evaluate("() => document.hasFocus()"))
-        except Exception:
-            pass
-
-        try:
-            visible = (
-                str(
-                    page.evaluate("() => document.visibilityState")
-                    or ""
-                ).lower()
-                == "visible"
-            )
-        except Exception:
-            pass
-
-        instagram_pages.append(
-            {
-                "page": page,
-                "index": index,
-                "focused": focused,
-                "visible": visible,
-                "url": url,
-            }
-        )
-
-    if not instagram_pages:
-        page = pages[0]
-        try:
-            page.bring_to_front()
-        except Exception:
-            pass
-        return page
-
-    focused_rows = [r for r in instagram_pages if r["focused"]]
-    visible_rows = [r for r in instagram_pages if r["visible"]]
-
-    if focused_rows:
-        chosen = focused_rows[0]
-    elif visible_rows:
-        # Prefer the oldest visible Instagram page, which is normally the
-        # original login tab rather than a stale Reel tab opened later.
-        chosen = sorted(visible_rows, key=lambda r: r["index"])[0]
-    else:
-        chosen = sorted(instagram_pages, key=lambda r: r["index"])[0]
-
-    page = chosen["page"]
-
-    # Close stale extra Instagram tabs only. The dedicated browser profile is
-    # owned by this automation, and multiple IG tabs caused cross-reel analysis.
-    for row in instagram_pages:
-        other = row["page"]
-
-        if other is page:
-            continue
-
-        try:
-            other.close()
-        except Exception:
-            pass
-
-    try:
-        page.bring_to_front()
-    except Exception:
-        pass
-
-    return page
-
+    return pages[-1]
 
 def _browser_auto_reels(username, history, config) -> int:
     """
@@ -13825,29 +11868,6 @@ def _browser_auto_reels(username, history, config) -> int:
 
         try:
             try:
-                page.bring_to_front()
-            except Exception:
-                pass
-
-            try:
-                ig_tab_count = sum(
-                    1
-                    for p in context.pages
-                    if "instagram.com" in str(p.url or "").lower()
-                )
-            except Exception:
-                ig_tab_count = -1
-
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🧭 Reels working-tab lock active: "
-                    f"Instagram tabs remaining={ig_tab_count}; "
-                    f"working URL={str(page.url or '')[:220]}"
-                ),
-            )
-            try:
                 current_url = str(page.url or "").lower()
             except Exception:
                 current_url = ""
@@ -13868,24 +11888,20 @@ def _browser_auto_reels(username, history, config) -> int:
             if get_account_safety_state(username)["active"]:
                 return 0
 
-            action_intents = _browser_reels_auto_action_intents(
+            comment_intent = _reels_should_comment_auto(
+                username,
                 settings,
             )
-            comment_intent = bool(action_intents.get("comment"))
 
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    "🎯 Auto Reels action decisions: "
-                    + ", ".join(
-                        f"{name.title()}={'yes' if enabled else 'no'}"
-                        for name, enabled in action_intents.items()
-                    )
+                    "🎯 Auto Reels comment decision: "
                     + (
-                        " · deep analysis enabled."
+                        "COMMENT — running deep analysis."
                         if comment_intent
-                        else " · no comment selected, so expensive vision/audio analysis is skipped."
+                        else "NO COMMENT — skipping deep vision analysis."
                     )
                 ),
             )
@@ -13895,8 +11911,7 @@ def _browser_auto_reels(username, history, config) -> int:
                 username,
                 history,
                 comment_intent=comment_intent,
-                action_intents=action_intents,
-                quick_watch_seconds=3.0,
+                quick_watch_seconds=6.0,
                 max_cycle_seconds=135,
             )
 
@@ -13914,19 +11929,12 @@ def _browser_auto_reels(username, history, config) -> int:
             # still counts only once regardless of its five sub-actions.
             try:
                 if _browser_reels_scroll_next(page):
-                    page.wait_for_timeout(700)
-                    next_key = _browser_advance_past_interacted_reels(
-                        page,
-                        username,
-                        history,
-                        max_skips=8,
-                    )
                     update_account_metric(
                         username,
                         "add_history",
                         value=(
-                            "↕️ Auto Reels advanced and left a fresh non-ad "
-                            f"reel visible for the next pass: {next_key}"
+                            "↕️ Auto Reels advanced once and left the next reel "
+                            "visible for the next pass."
                         ),
                     )
             except Exception:
@@ -13971,29 +11979,6 @@ def _browser_reels_demo(username, history, config) -> int:
         page = _browser_pick_active_instagram_page(context)
 
         try:
-            try:
-                page.bring_to_front()
-            except Exception:
-                pass
-
-            try:
-                ig_tab_count = sum(
-                    1
-                    for p in context.pages
-                    if "instagram.com" in str(p.url or "").lower()
-                )
-            except Exception:
-                ig_tab_count = -1
-
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🧭 Reels working-tab lock active: "
-                    f"Instagram tabs remaining={ig_tab_count}; "
-                    f"working URL={str(page.url or '')[:220]}"
-                ),
-            )
             try:
                 current_url = str(page.url or "").lower()
             except Exception:
@@ -14045,7 +12030,6 @@ def _browser_reels_demo(username, history, config) -> int:
                 username,
                 history,
                 comment_intent=True,
-                action_intents=None,
                 quick_watch_seconds=3.0,
                 max_cycle_seconds=145,
             )
@@ -14479,85 +12463,29 @@ def _browser_post_context_blob(selection, analysis=None) -> str:
 
 def _browser_post_topic(selection, analysis=None) -> str:
     """
-    Conservative topic classification for hashtag selection.
+    Lightweight topic classification used only for choosing fallback hashtags.
     """
     blob = _browser_post_context_blob(selection, analysis)
 
-    climbing_high = (
-        "bouldering",
-        "rock climbing",
-        "climbing gym",
-        "climber",
-        "climbers",
-        "crag",
-        "belay",
-        "belaying",
-        "climbing route",
-        "climbing holds",
-        "climbing wall",
+    finance_terms = (
+        "stock", "stocks", "trading", "trader", "forex", "xau",
+        "gold", "futures", "market", "markets", "candlestick",
+        "price action", "chart", "equities", "nasdaq", "s&p",
+        "sp500", "dow", "options",
     )
-    climbing_medium = (
-        "climb",
-        "climbing",
-        "boulder",
-        "chalk bag",
-        "harness",
-        "carabiner",
+    climbing_terms = (
+        "climb", "climbing", "boulder", "bouldering", "rock climbing",
+        "crag", "climbing gym", "route", "hold", "holds", "wall",
     )
 
-    finance_high = (
-        "stock market",
-        "stock trading",
-        "forex",
-        "xauusd",
-        "futures trading",
-        "options trading",
-        "candlestick chart",
-        "price action",
-        "nasdaq",
-        "s&p 500",
-        "sp500",
-        "portfolio",
-        "dividend",
-    )
-    finance_medium = (
-        "stocks",
-        "trading",
-        "trader",
-        "investing",
-        "investor",
-        "futures",
-        "options",
-        "equities",
-        "bitcoin",
-        "crypto",
-    )
+    finance_score = sum(term in blob for term in finance_terms)
+    climbing_score = sum(term in blob for term in climbing_terms)
 
-    climbing_high_score = sum(term in blob for term in climbing_high)
-    climbing_medium_score = sum(term in blob for term in climbing_medium)
-    finance_high_score = sum(term in blob for term in finance_high)
-    finance_medium_score = sum(term in blob for term in finance_medium)
-
-    climbing_score = climbing_high_score * 3 + climbing_medium_score
-    finance_score = finance_high_score * 3 + finance_medium_score
-
-    climbing_confident = (
-        climbing_high_score >= 1
-        or climbing_medium_score >= 2
-    )
-    finance_confident = (
-        finance_high_score >= 1
-        or finance_medium_score >= 2
-    )
-
-    if finance_confident and finance_score > climbing_score:
+    if finance_score > climbing_score and finance_score > 0:
         return "finance"
-
-    if climbing_confident and climbing_score > finance_score:
+    if climbing_score > finance_score and climbing_score > 0:
         return "climbing"
-
     return "general"
-
 
 
 def _browser_clean_hashtag(tag: str) -> str:
@@ -14569,123 +12497,6 @@ def _browser_clean_hashtag(tag: str) -> str:
     return f"#{tag}" if tag else ""
 
 
-_GENERIC_LOW_SIGNAL_HASHTAGS = {
-    "#fyp", "#foryou", "#foryoupage", "#viral", "#trending",
-    "#reels", "#reel", "#video", "#content", "#social",
-    "#explore", "#explorepage", "#photo", "#creator", "#daily",
-    "#instagood",
-}
-
-_CLIMBING_HASHTAG_WORDS = (
-    "climb", "boulder", "rockclimb", "climbinggym",
-    "climber", "crag", "belay",
-)
-
-_FINANCE_HASHTAG_WORDS = (
-    "stock", "trading", "trader", "forex", "future", "option",
-    "invest", "market", "nasdaq", "sp500", "bitcoin", "crypto",
-    "xau", "finance", "priceaction",
-)
-
-
-def _browser_hashtag_is_relevant(tag: str, topic: str) -> bool:
-    cleaned = _browser_clean_hashtag(tag)
-    if not cleaned:
-        return False
-
-    key = cleaned.lower()
-    if key in _GENERIC_LOW_SIGNAL_HASHTAGS:
-        return False
-
-    bare = key.lstrip("#")
-    is_climbing = any(word in bare for word in _CLIMBING_HASHTAG_WORDS)
-    is_finance = any(word in bare for word in _FINANCE_HASHTAG_WORDS)
-
-    if is_climbing and topic != "climbing":
-        return False
-
-    if is_finance and topic != "finance":
-        return False
-
-    return True
-
-
-def _browser_contextual_fallback_hashtags(selection, analysis=None) -> list[str]:
-    """
-    Small content-grounded fallback set. Never pads with discovery spam.
-    """
-    blob = _browser_post_context_blob(selection, analysis)
-    candidates = []
-
-    if any(
-        term in blob
-        for term in (
-            "confrontation",
-            "forcing",
-            "pushing",
-            "against a brick wall",
-            "distressed",
-            "altercation",
-            "argument",
-            "tense scene",
-        )
-    ):
-        candidates.extend([
-            "#confrontation",
-            "#dramaticmoment",
-            "#storytelling",
-            "#cinematicscene",
-        ])
-
-    if any(
-        term in blob
-        for term in (
-            "augmented reality",
-            "ar experience",
-            "interactive 3d",
-            "flashcards",
-            "3d model",
-        )
-    ):
-        candidates.extend([
-            "#augmentedreality",
-            "#edtech",
-            "#3dlearning",
-            "#interactivelearning",
-        ])
-
-    if any(
-        term in blob
-        for term in (
-            "python",
-            "github",
-            "git ",
-            "coding",
-            "programming",
-            "software",
-            "developer",
-            "automation",
-        )
-    ):
-        candidates.extend([
-            "#coding",
-            "#programming",
-            "#softwaredevelopment",
-            "#developer",
-        ])
-
-    result = []
-    seen = set()
-
-    for tag in candidates:
-        cleaned = _browser_clean_hashtag(tag)
-        key = cleaned.lower()
-        if cleaned and key not in seen:
-            seen.add(key)
-            result.append(cleaned)
-
-    return result[:5]
-
 def _browser_preferred_post_hashtags(
     username,
     selection,
@@ -14694,11 +12505,14 @@ def _browser_preferred_post_hashtags(
     ai_tags=None,
 ):
     """
-    Return 0-5 hashtags relevant to this exact media.
+    Return exactly five useful hashtags.
 
-    Fewer relevant tags is preferable to unrelated padding.
+    Finance media gets the requested market-oriented set. Climbing media gets
+    climbing tags. Generic low-signal tags such as #photo/#creator/#daily are
+    deliberately excluded.
     """
     topic = _browser_post_topic(selection, analysis)
+    settings = get_account_control_settings(username)
 
     if topic == "finance":
         preferred = [
@@ -14706,7 +12520,7 @@ def _browser_preferred_post_hashtags(
             "#trading",
             "#forex",
             "#futures",
-            "#investing",
+            "#fyp",
         ]
     elif topic == "climbing":
         preferred = [
@@ -14714,22 +12528,35 @@ def _browser_preferred_post_hashtags(
             "#bouldering",
             "#rockclimbing",
             "#climbinggym",
-            "#climber",
+            "#fyp",
         ]
     else:
         preferred = []
 
+        # AI tags come first for non-classified media.
         for tag in ai_tags or []:
             cleaned = _browser_clean_hashtag(tag)
             if cleaned:
                 preferred.append(cleaned)
 
-        preferred.extend(
-            _browser_contextual_fallback_hashtags(
-                selection,
-                analysis,
-            )
-        )
+        # Then use the account's configured target topics.
+        for tag in _normalize_hashtag_list(
+            settings.get("target_hashtags") or []
+        ):
+            cleaned = _browser_clean_hashtag(tag)
+            if cleaned:
+                preferred.append(cleaned)
+
+        # Keep a couple of neutral discovery tags available as final fill.
+        preferred.extend(["#fyp", "#reels"])
+
+    blocked = {
+        "#photo",
+        "#creator",
+        "#explore",
+        "#daily",
+        "#instagood",
+    }
 
     result = []
     seen = set()
@@ -14738,10 +12565,7 @@ def _browser_preferred_post_hashtags(
         cleaned = _browser_clean_hashtag(tag)
         key = cleaned.lower()
 
-        if not cleaned or key in seen:
-            continue
-
-        if not _browser_hashtag_is_relevant(cleaned, topic):
+        if not cleaned or key in blocked or key in seen:
             continue
 
         seen.add(key)
@@ -14750,94 +12574,68 @@ def _browser_preferred_post_hashtags(
         if len(result) == 5:
             break
 
+    # Ensure exactly five without falling back to the old generic spam set.
+    filler = (
+        ["#markets", "#investing", "#priceaction", "#fyp", "#finance"]
+        if topic == "finance"
+        else
+        ["#climbinglife", "#climber", "#outdoors", "#fyp", "#reels"]
+        if topic == "climbing"
+        else
+        ["#fyp", "#reels", "#video", "#content", "#social"]
+    )
+
+    for tag in filler:
+        cleaned = _browser_clean_hashtag(tag)
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(cleaned)
+        if len(result) == 5:
+            break
+
     return result[:5]
 
 
-
-def _browser_strip_caption_labels(value: str) -> str:
-    """
-    Remove model-formatting labels from user-visible Instagram captions while
-    preserving the actual caption text and #hashtags.
-
-    Handles:
-      HASHTAGS:
-      Hashtags -
-      hashtags
-      CAPTION:
-      inline labels such as "... HASHTAGS: #tag1 #tag2"
-    """
-    cleaned = str(value or "")
-
-    # Remove CAPTION labels when they appear at the start of a line/string.
-    cleaned = re.sub(
-        r"(?im)^\s*CAPTION\s*(?::|-)?\s*",
-        "",
-        cleaned,
-    )
-
-    # Remove HASHTAG/HASHTAGS labels anywhere they appear before the real tags.
-    cleaned = re.sub(
-        r"(?i)(?<![#A-Za-z0-9_])HASHTAGS?\s*(?::|-)?\s*",
-        "",
-        cleaned,
-    )
-
-    # Clean up whitespace left behind without flattening the normal
-    # caption/hashtag paragraph break.
-    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-    cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-
-    return cleaned.strip()
-
 def _browser_extract_caption_from_ai(raw: str) -> str:
-    """
-    Extract only the caption prose from AI output.
-
-    Accepts labeled or ordinary output and prevents CAPTION:/HASHTAGS: labels
-    from leaking into the Instagram caption.
-    """
-    raw = _clean_ollama_output(raw or "").strip()
+    """Extract caption while preserving CAPTION/HASHTAGS structure and removing wrappers."""
+    raw = str(raw or "").strip()
     if not raw:
         return ""
 
-    # CAPTION: may be followed by HASHTAGS: on the same line or another line.
+    # Strip markdown fences without flattening line structure.
+    raw = re.sub(r"^```(?:text|markdown)?\s*", "", raw, flags=re.I)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    # Accept either a newline or ordinary whitespace before HASHTAGS because
+    # older cleaners/models sometimes flatten the two fields onto one line.
     match = re.search(
         r"CAPTION\s*:\s*(.*?)(?=\s+HASHTAGS?\s*:|\Z)",
         raw,
         re.I | re.S,
     )
     if match:
-        return _browser_strip_caption_labels(
-            match.group(1).strip()
-        )
+        caption = match.group(1).strip()
+        return _strip_generation_edge_quotes(caption)
 
-    # If CAPTION: was omitted, split at HASHTAGS: whether inline or multiline.
     cleaned = re.split(
-        r"(?i)(?<![#A-Za-z0-9_])HASHTAGS?\s*:",
+        r"\s+HASHTAGS?\s*:",
         raw,
         maxsplit=1,
+        flags=re.I,
     )[0].strip()
 
-    # Strip standalone hashtag-only tail lines from prose extraction.
-    lines = []
-    for line in cleaned.splitlines():
-        stripped = line.strip()
+    cleaned = re.sub(r"^CAPTION\s*:\s*", "", cleaned, flags=re.I)
 
-        if stripped and re.fullmatch(
-            r"(?:#[A-Za-z0-9_]+\s*){2,}",
-            stripped,
-        ):
-            continue
+    # Remove hashtag-only tail fragments if the model ignored the requested label.
+    cleaned = re.sub(
+        r"(?:\s+#[A-Za-z0-9_]+){2,}\s*$",
+        "",
+        cleaned,
+    ).strip()
 
-        if stripped:
-            lines.append(stripped)
-
-    cleaned = " ".join(lines).strip()
-    return _browser_strip_caption_labels(cleaned)
-
-
+    return _strip_generation_edge_quotes(cleaned)
 
 def _browser_caption_readback(locator) -> str:
     try:
@@ -14912,7 +12710,6 @@ def _browser_set_caption_verified(page, caption_box, full_caption: str) -> tuple
     Share is not allowed to continue merely because .fill() returned without an
     exception.
     """
-    full_caption = _browser_strip_caption_labels(full_caption)
     expected = re.sub(r"\s+", " ", full_caption).strip()
     expected_tags = re.findall(r"#[A-Za-z0-9_]+", full_caption)
 
@@ -15053,12 +12850,8 @@ def _browser_fallback_caption(
         max(20, total_limit - len(tag_line) - 2),
     )
 
-    final_caption = _browser_strip_caption_labels(
-        f"{caption}\n\n{tag_line}".strip()
-    )
-
     return {
-        "caption": final_caption,
+        "caption": f"{caption}\n\n{tag_line}".strip(),
         "used_fallback": True,
         "reason": str(reason or "AI unavailable"),
         "analysis": analysis,
@@ -15093,6 +12886,7 @@ def _browser_generate_post_caption(username, selection):
             source_account=selection["folder"].get("source", ""),
             frame_count=frame_count,
             require_video_vision=settings["require_video_vision"],
+            account_username=username,
         )
     except Exception as exc:
         return _browser_fallback_caption(
@@ -15135,7 +12929,6 @@ def _browser_generate_post_caption(username, selection):
         settings.get("persona_prompt", RAGE_BAIT_PERSONA) or RAGE_BAIT_PERSONA
     ).strip()
     char_limit = int(settings["caption_char_limit"])
-    topic = _browser_post_topic(selection, analysis)
     preferred_tags = _browser_preferred_post_hashtags(
         username,
         selection,
@@ -15144,7 +12937,7 @@ def _browser_generate_post_caption(username, selection):
     preferred_tag_line = " ".join(preferred_tags)
 
     prompt = f"""
-Write ONE Instagram caption and 3-5 genuinely relevant hashtags for this exact media.
+Write ONE Instagram caption and EXACTLY 5 relevant hashtags for this exact media.
 
 MEDIA ANALYSIS:
 {semantic_context}
@@ -15156,27 +12949,23 @@ PERSPECTIVE:
 ACCOUNT-SPECIFIC CAPTION INSTRUCTIONS:
 {extra or "(none)"}
 
-TOPIC CLASSIFICATION:
-{topic}
-
-TOPIC-SPECIFIC SEED HASHTAGS (use only when they precisely fit this media):
-{preferred_tag_line or "(none — derive tags only from the media itself)"}
+PREFERRED ACCOUNT HASHTAGS WHEN RELEVANT:
+{preferred_tag_line}
 
 Return exactly:
 CAPTION: <caption text>
-HASHTAGS: <3-5 hashtags grounded in this exact media>
+HASHTAGS: #tag1 #tag2 #tag3 #tag4 #tag5
 
 Rules:
-- Base the caption on the supplied visual analysis.
+- Base BOTH the caption and hashtags on the supplied deep multimodal interpretation.
+- Use spoken words/audio, readable on-screen text, and beginning-to-end visual progression when present.
+- Prefer a specific observation/interpretation over a generic scene description.
 - Never mention source usernames, repost metadata, archive folders, or filenames.
 - Do not invent a location, identity, profession, event, or stock/trading topic.
 - Keep the caption under {char_limit} characters before hashtags.
 - Complete natural sentences.
-- Never use a hashtag merely because it is an account target or common discovery tag.
-- Never infer climbing from an ordinary wall, route, or physical hold.
-- Never infer finance from generic words such as market, gold, option, or future unless the media context clearly indicates finance/trading.
-- Avoid generic low-signal tags such as #fyp #reels #viral #video #content #social #photo #creator #explore #daily #instagood.
-- If only 3 or 4 hashtags are truly relevant, return only those rather than adding unrelated filler.
+- Prefer the supplied account hashtags when they fit the visual subject.
+- Avoid generic low-signal tags such as #photo #creator #explore #daily #instagood.
 """.strip()
 
     try:
@@ -15193,7 +12982,7 @@ Rules:
             },
         )
 
-        raw = _clean_ollama_output(
+        raw = str(
             response.get("message", {}).get("content", "")
             if isinstance(response, dict)
             else getattr(
@@ -15242,17 +13031,15 @@ Rules:
         )
 
     tag_line = " ".join(tags[:5])
-    caption = _clip_chars(
-        caption,
-        max(20, char_limit - len(tag_line) - 2),
-    )
-
-    final_caption = _browser_strip_caption_labels(
-        f"{caption}\n\n{tag_line}".strip()
+    caption = _strip_generation_edge_quotes(
+        _clip_chars(
+            caption,
+            max(20, char_limit - len(tag_line) - 2),
+        )
     )
 
     return {
-        "caption": final_caption,
+        "caption": f"{caption}\n\n{tag_line}".strip(),
         "used_fallback": False,
         "reason": "",
         "analysis": analysis,
@@ -15336,76 +13123,10 @@ def _browser_find_new_permalink_after_share(page, username: str, before_links: s
         page.wait_for_timeout(2500)
     return ""
 
-def _browser_post_quota_status(
-    history: dict,
-    settings: dict,
-    *,
-    now: float | None = None,
-) -> tuple[int, int, int]:
-    """
-    Persistent rolling-24h successful Browser Post count.
-
-    Returns: used, limit, retry_seconds_if_full.
-    """
-    now = float(now if now is not None else time.time())
-    cutoff = now - 86400.0
-
-    raw = history.setdefault("browser_post_timestamps", [])
-    times = sorted(
-        float(ts)
-        for ts in raw
-        if isinstance(ts, (int, float))
-        and float(ts) >= cutoff
-        and float(ts) <= now + 60
-    )
-
-    history["browser_post_timestamps"] = times[-200:]
-    limit = max(
-        1,
-        min(
-            50,
-            int(settings.get("daily_post_limit", 20)),
-        ),
-    )
-
-    retry = 0
-    if len(times) >= limit and times:
-        retry = int(max(1, times[0] + 86400.0 - now))
-
-    return len(times), limit, retry
-
-
-def _browser_record_successful_post(history: dict) -> None:
-    settings_stub = {"daily_post_limit": 50}
-    _browser_post_quota_status(history, settings_stub)
-    history.setdefault("browser_post_timestamps", []).append(time.time())
-    history["browser_post_timestamps"] = history["browser_post_timestamps"][-200:]
-
 def _browser_post(username, history, folder_pool, manual=False) -> bool:
     settings = get_account_control_settings(username)
 
     if not manual and not settings.get("enable_posts", False):
-        return False
-
-    posts_used, post_limit, post_retry = _browser_post_quota_status(
-        history,
-        settings,
-    )
-
-    if not manual and posts_used >= post_limit:
-        update_account_metric(
-            username,
-            "add_history",
-            value=(
-                f"⏳ Browser Post skipped: Auto rolling-24h post cap "
-                f"{posts_used}/{post_limit} reached"
-                + (
-                    f"; next slot in ~{post_retry}s."
-                    if post_retry
-                    else "."
-                )
-            ),
-        )
         return False
 
     update_account_metric(
@@ -15413,9 +13134,7 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
         "add_history",
         value=(
             f"🧰 Browser Post starting ({'manual' if manual else 'Auto'}); "
-            f"media folders discovered={len(folder_pool)}; "
-            f"posts last 24h={posts_used}/{post_limit}; "
-            f"upload cooldown={int(settings.get('upload_cooldown_seconds', UPLOAD_COOLDOWN_SECONDS))}s"
+            f"media folders discovered={len(folder_pool)}"
         ),
     )
 
@@ -15865,7 +13584,6 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                 history["posted_ids"].append(selected["id"])
 
             update_account_metric(username, "total_posts", increment=1)
-            _browser_record_successful_post(history)
 
             record_recent_post(
                 username=username,
@@ -16132,34 +13850,20 @@ def _browser_maybe_run_readonly_listeners(username: str) -> None:
 
 
 
-def _browser_auto_choices(
-    username: str,
-    settings: dict,
-    folder_pool,
-    history: dict,
-) -> list[str]:
+def _browser_auto_choices(username: str, settings: dict, folder_pool) -> list[str]:
     choices = []
 
     if settings.get("enable_follow", False):
         choices.append("networking")
-
     if settings.get("enable_engage", False):
         choices.append("reels")
 
     if settings.get("enable_posts", False) and folder_pool:
-        posts_used, post_limit, _ = _browser_post_quota_status(
-            history,
-            settings,
-        )
-
-        if posts_used < post_limit:
-            # Do not let upload cooldown block Reels/networking. Post simply
-            # disappears from Auto choices until its own cooldown reopens.
-            if not _shared_write_block_reason(username, "upload"):
-                choices.append("post")
+        # Do not let a long upload cooldown stall an active browsing session.
+        if not _shared_write_block_reason(username, "upload"):
+            choices.append("repost")
 
     return choices
-
 
 
 def _run_browser_active_session(
@@ -16189,14 +13893,7 @@ def _run_browser_active_session(
 
     hard_deadline = time.monotonic() + duration
     cycles = 0
-    posts_this_session = 0
-    max_posts_this_session = max(
-        1,
-        min(
-            5,
-            int(settings.get("max_posts_per_active_session", 2)),
-        ),
-    )
+    post_used = False
     max_passes = max(
         1,
         min(
@@ -16229,18 +13926,10 @@ def _run_browser_active_session(
             break
 
         settings = get_account_control_settings(username, conf)
-        choices = _browser_auto_choices(
-            username,
-            settings,
-            folder_pool,
-            history,
-        )
+        choices = _browser_auto_choices(username, settings, folder_pool)
 
-        if (
-            posts_this_session >= max_posts_this_session
-            and "post" in choices
-        ):
-            choices.remove("post")
+        if post_used and "repost" in choices:
+            choices.remove("repost")
 
         if not choices:
             update_account_metric(
@@ -16279,15 +13968,14 @@ def _run_browser_active_session(
                     history,
                     conf,
                 )
-            elif task == "post":
-                posted = _browser_post(
+            elif task == "repost":
+                _browser_post(
                     username,
                     history,
                     folder_pool,
                     manual=False,
                 )
-                if posted:
-                    posts_this_session += 1
+                post_used = True
         except RuntimeError as exc:
             # Security/restriction problems are already classified elsewhere.
             update_account_metric(
@@ -16349,11 +14037,7 @@ def _run_browser_active_session(
     update_account_metric(
         username,
         "add_history",
-        value=(
-            f"⚡ {mode.title()} active session finished after {cycles} step(s); "
-            f"successful posts this session={posts_this_session}/"
-            f"{max_posts_this_session}."
-        ),
+        value=f"⚡ {mode.title()} active session finished after {cycles} step(s).",
     )
 
 def run_browser_profile_workflow(username, conf, folder_pool):
@@ -16429,9 +14113,6 @@ def run_browser_profile_workflow(username, conf, folder_pool):
             "dm_reply_memory": {},
             "browser_liked_urls": [],
             "browser_saved_urls": [],
-            "browser_reposted_urls": [],
-            "browser_commented_urls": [],
-            "browser_post_timestamps": [],
             "browser_pending_uploads": [],
         },
     )
@@ -16481,66 +14162,17 @@ def run_browser_profile_workflow(username, conf, folder_pool):
         else:
             pace_mode = _runtime_pace_mode(username)
 
-            if pace_mode == "overnight":
-                _run_browser_active_session(
-                    username,
-                    history,
-                    conf,
-                    folder_pool,
-                    settings,
-                    pace_mode,
-                )
-            else:
-                choices = _browser_auto_choices(
-                    username,
-                    settings,
-                    folder_pool,
-                    history,
-                )
-
-                if not choices:
-                    _browser_maybe_run_readonly_listeners(username)
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value="ℹ️ Browser Mode Auto pass has no currently eligible outward feature.",
-                    )
-                    return "ran"
-
-                cycle_index = int(
-                    history.get("browser_outward_cycle_index", 0) or 0
-                )
-                task = choices[cycle_index % len(choices)]
-                history["browser_outward_cycle_index"] = cycle_index + 1
-
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=f"🔄 Browser Mode Auto selected: {task}",
-                )
-
-                if task == "networking":
-                    _browser_follow_network(
-                        username,
-                        history,
-                        conf,
-                        manual=False,
-                    )
-                elif task == "reels":
-                    _browser_auto_reels(
-                        username,
-                        history,
-                        conf,
-                    )
-                elif task == "post":
-                    _browser_post(
-                        username,
-                        history,
-                        folder_pool,
-                        manual=False,
-                    )
-
-                _browser_maybe_run_readonly_listeners(username)
+            # Normal and Overnight both use multi-step active sessions now.
+            # Write budgets, upload cooldowns, follow hard caps and security
+            # backoffs remain hard ceilings inside each step.
+            _run_browser_active_session(
+                username,
+                history,
+                conf,
+                folder_pool,
+                settings,
+                pace_mode if pace_mode in {"normal", "overnight"} else "normal",
+            )
 
     finally:
         save_json(conf["history_file"], history)
@@ -18043,7 +15675,7 @@ function cardHtml(user,a){
           <div class="row">
             <label><input id="posts_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_posts?"checked":""}> Posts</label>
             <label><input id="follow_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_follow?"checked":""}> Follow</label>
-            <label><input id="engage_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_engage?"checked":""}> Reels / Engage</label>
+            <label><input id="engage_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_engage?"checked":""}> Hashtag / Engage</label>
             <label><input id="dms_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_dms?"checked":""}> DMs</label>
             <label><input id="comments_${esc(user)}" type="checkbox" style="width:auto" ${s.enable_comments?"checked":""}> Comment Replies</label>
           </div>
@@ -18064,9 +15696,8 @@ function cardHtml(user,a){
         <div><label>Active-session passes (1-20)</label><input id="sessionpasses_${esc(user)}" type="number" min="1" max="20" value="${Number(s.active_session_max_passes||8)}"></div>
         <div><label>Engage clips / pass (1-20)</label><input id="engageclips_${esc(user)}" type="number" min="1" max="20" value="${Number(s.engage_clips_per_pass||12)}"></div>
         <div><label>Engage discovery scrolls (1-20)</label><input id="engagescrolls_${esc(user)}" type="number" min="1" max="20" value="${Number(s.engage_scroll_steps||8)}"></div>
-        <div><label>Auto Reels Like %</label><input id="engagelike_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_like_percent??75)}"></div>
-        <div><label>Auto Reels Save %</label><input id="engagesave_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_save_percent??55)}"></div>
-        <div><label>Auto Reels Repost %</label><input id="engagerepost_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_repost_percent??45)}"></div>
+        <div><label>Engage Like %</label><input id="engagelike_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_like_percent??75)}"></div>
+        <div><label>Engage Repost %</label><input id="engagerepost_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_repost_percent??75)}"></div>
         <div><label>Engage Comment %</label><input id="engagecomment_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_comment_percent??10)}"></div>
         <div><label>Engage Follow-author %</label><input id="engagefollow_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_follow_percent??25)}"></div>
         <div><label>Reels write gap seconds (8-60)</label><input id="reelswritegap_${esc(user)}" type="number" min="8" max="60" value="${Number(s.reels_write_gap_seconds||8)}"></div>
@@ -18079,9 +15710,7 @@ function cardHtml(user,a){
         <div><label>Writes / rolling window</label><input id="maxwrites_${esc(user)}" type="number" min="1" max="30" value="${Number(s.max_writes_per_window||8)}"></div>
         <div><label>Rolling window seconds</label><input id="window_${esc(user)}" type="number" min="60" max="7200" value="${Number(s.write_window_seconds||900)}"></div>
         <div><label>Min write gap seconds</label><input id="writegap_${esc(user)}" type="number" min="8" max="600" value="${Number(s.write_min_gap_seconds||22)}"></div>
-        <div><label>Upload cooldown seconds (min 300)</label><input id="uploadgap_${esc(user)}" type="number" min="300" max="21600" value="${Number(s.upload_cooldown_seconds||1200)}"></div>
-        <div><label>Auto posts / rolling 24h (1-50)</label><input id="dailypostlimit_${esc(user)}" type="number" min="1" max="50" value="${Number(s.daily_post_limit||20)}"></div>
-        <div><label>Posts / active session (1-5)</label><input id="postspersession_${esc(user)}" type="number" min="1" max="5" value="${Number(s.max_posts_per_active_session||2)}"></div>
+        <div><label>Upload cooldown seconds</label><input id="uploadgap_${esc(user)}" type="number" min="300" max="21600" value="${Number(s.upload_cooldown_seconds||1800)}"></div>
       </div>
 
       <label>Target accounts (comma/newline separated)</label>
@@ -18429,7 +16058,6 @@ function collectBehavior(user){
     engage_clips_per_pass:Number(document.getElementById(`engageclips_${user}`).value),
     engage_scroll_steps:Number(document.getElementById(`engagescrolls_${user}`).value),
     engage_like_percent:Number(document.getElementById(`engagelike_${user}`).value),
-    engage_save_percent:Number(document.getElementById(`engagesave_${user}`).value),
     engage_repost_percent:Number(document.getElementById(`engagerepost_${user}`).value),
     engage_comment_percent:Number(document.getElementById(`engagecomment_${user}`).value),
     engage_follow_percent:Number(document.getElementById(`engagefollow_${user}`).value),
@@ -18445,8 +16073,6 @@ function collectBehavior(user){
     write_window_seconds:Number(document.getElementById(`window_${user}`).value),
     write_min_gap_seconds:Number(document.getElementById(`writegap_${user}`).value),
     upload_cooldown_seconds:Number(document.getElementById(`uploadgap_${user}`).value),
-    daily_post_limit:Number(document.getElementById(`dailypostlimit_${user}`).value),
-    max_posts_per_active_session:Number(document.getElementById(`postspersession_${user}`).value),
     target_accounts:splitList(document.getElementById(`targets_${user}`).value),
     target_hashtags:splitList(document.getElementById(`tags_${user}`).value),
     persona_prompt:document.getElementById(`persona_${user}`).value,
@@ -19123,7 +16749,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Hashtag Relevance Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Skip Interacted Reels Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
