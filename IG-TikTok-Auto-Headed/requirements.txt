@@ -1,7 +1,0 @@
-instagrapi
-pyotp
-ollama
-playwright
-imageio-ffmpeg
-Pillow
-moviepy
