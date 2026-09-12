@@ -188,12 +188,20 @@ ACTIVE_SESSION_MAX_SECONDS = max(
     int(os.environ.get("IG_ACTIVE_SESSION_MAX_SECONDS", "300")),
 )
 BURST_SESSION_MIN_SECONDS = max(
-    90,
-    int(os.environ.get("IG_BURST_SESSION_MIN_SECONDS", "180")),
+    60,
+    int(os.environ.get("IG_BURST_SESSION_MIN_SECONDS", "60")),
 )
 BURST_SESSION_MAX_SECONDS = max(
     BURST_SESSION_MIN_SECONDS,
-    int(os.environ.get("IG_BURST_SESSION_MAX_SECONDS", "360")),
+    int(os.environ.get("IG_BURST_SESSION_MAX_SECONDS", "120")),
+)
+BURST_BROWSE_GAP_MIN_SECONDS = max(
+    2,
+    int(os.environ.get("IG_BURST_BROWSE_GAP_MIN_SECONDS", "2")),
+)
+BURST_BROWSE_GAP_MAX_SECONDS = max(
+    BURST_BROWSE_GAP_MIN_SECONDS,
+    int(os.environ.get("IG_BURST_BROWSE_GAP_MAX_SECONDS", "5")),
 )
 ACTIVE_BROWSE_GAP_MIN_SECONDS = max(
     3,
@@ -775,6 +783,12 @@ def _default_control_settings(username, conf):
         "follow_limit": 2,
         "auto_follow_batch_max": 10,
         "active_session_max_passes": 8,
+        "engage_clips_per_pass": 12,
+        "engage_scroll_steps": 8,
+        "engage_like_percent": 75,
+        "engage_repost_percent": 75,
+        "engage_comment_percent": 10,
+        "engage_follow_percent": 25,
         "pace_mode": "normal",
         "video_frames": 5,
         "require_video_vision": True,
@@ -900,6 +914,12 @@ def _sanitize_control_settings(username, conf, raw):
         "follow_limit": as_int("follow_limit", 1, 20),
         "auto_follow_batch_max": as_int("auto_follow_batch_max", 1, 10),
         "active_session_max_passes": as_int("active_session_max_passes", 1, 20),
+        "engage_clips_per_pass": as_int("engage_clips_per_pass", 1, 20),
+        "engage_scroll_steps": as_int("engage_scroll_steps", 1, 20),
+        "engage_like_percent": as_int("engage_like_percent", 0, 100),
+        "engage_repost_percent": as_int("engage_repost_percent", 0, 100),
+        "engage_comment_percent": as_int("engage_comment_percent", 0, 100),
+        "engage_follow_percent": as_int("engage_follow_percent", 0, 100),
         "pace_mode": pace_mode,
         "video_frames": as_int("video_frames", 3, 9),
         "require_video_vision": bool(raw.get("require_video_vision", base["require_video_vision"])),
@@ -7207,8 +7227,513 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
 
 
 
+def _browser_engage_percent(settings: dict, key: str, default: int) -> bool:
+    try:
+        pct = int(settings.get(key, default))
+    except Exception:
+        pct = default
+    pct = max(0, min(100, pct))
+    return random.random() * 100.0 < pct
+
+
+def _browser_engage_security_problem(page, username: str) -> str:
+    problem = _browser_page_problem(page)
+    if problem:
+        apply_account_safety_backoff(
+            username,
+            f"Instagram Web engagement restriction/challenge: {problem}",
+            level="restricted",
+            hours=4,
+        )
+        _browser_pause_for_manual_security(username, problem)
+        return problem
+    return ""
+
+
+def _browser_try_like_engage(page, username: str, href: str, history: dict) -> bool:
+    if href in history.setdefault("browser_liked_urls", []):
+        return False
+
+    like_svg = _browser_find_svg_action(page, ("Like",))
+    if like_svg is None:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"↪️ Engage skip Like: control not found on {href}",
+        )
+        return False
+
+    if not wait_for_write_slot(
+        username,
+        "like",
+        max_wait=0,
+        fail_fast=True,
+    ):
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Engage skip Like: current write pacing/budget is full; browsing continues.",
+        )
+        return False
+
+    try:
+        _browser_clickable_from_svg(like_svg).click(timeout=4000)
+        page.wait_for_timeout(650)
+    except Exception as exc:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Engage Like click failed; continuing: {type(exc).__name__}",
+        )
+        return False
+
+    if _browser_find_svg_action(page, ("Unlike",)) is not None:
+        record_write(username, "like")
+        history["browser_liked_urls"].append(href)
+        history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
+        update_account_metric(username, "total_likes", increment=1)
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"❤️ Browser Like confirmed: {href}",
+        )
+        return True
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=f"⚠️ Browser Like was not confirmed; continuing to next action/clip: {href}",
+    )
+    return False
+
+
+def _browser_try_repost_engage(page, username: str, href: str, history: dict) -> bool:
+    history.setdefault("browser_reposted_urls", [])
+    if href in history["browser_reposted_urls"]:
+        return False
+
+    repost_svg = _browser_find_svg_action(page, ("Repost",))
+    if repost_svg is None:
+        # Some layouts expose the control as a button with accessible text.
+        try:
+            button = page.get_by_role(
+                "button",
+                name=re.compile(r"^Repost$", re.I),
+            ).first
+            if not button.count() or not button.is_visible(timeout=250):
+                button = None
+        except Exception:
+            button = None
+    else:
+        button = _browser_clickable_from_svg(repost_svg)
+
+    if button is None:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"↪️ Engage skip Repost: control not found on {href}",
+        )
+        return False
+
+    if not wait_for_write_slot(
+        username,
+        "repost",
+        max_wait=0,
+        fail_fast=True,
+    ):
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Engage skip Repost: current write pacing/budget is full; browsing continues.",
+        )
+        return False
+
+    try:
+        button.click(timeout=4000)
+        page.wait_for_timeout(500)
+
+        # If Instagram opens a small confirmation menu, choose its exact
+        # Repost item once. Do not click broad Share controls.
+        try:
+            exact = page.get_by_text(
+                re.compile(r"^Repost$", re.I),
+                exact=True,
+            )
+            for i in range(min(exact.count(), 4)):
+                item = exact.nth(i)
+                if item.is_visible(timeout=150):
+                    item.click(timeout=2500)
+                    page.wait_for_timeout(650)
+                    break
+        except Exception:
+            pass
+    except Exception as exc:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Engage Repost click failed; continuing: {type(exc).__name__}",
+        )
+        return False
+
+    confirmed = (
+        _browser_find_svg_action(
+            page,
+            ("Remove repost", "Undo repost", "Reposted"),
+        )
+        is not None
+    )
+
+    if not confirmed:
+        try:
+            body = re.sub(
+                r"\s+",
+                " ",
+                page.locator("body").inner_text(timeout=500) or "",
+            ).lower()
+            confirmed = any(
+                phrase in body
+                for phrase in (
+                    "reposted",
+                    "remove repost",
+                    "undo repost",
+                )
+            )
+        except Exception:
+            confirmed = False
+
+    if confirmed:
+        record_write(username, "repost")
+        history["browser_reposted_urls"].append(href)
+        history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"🔁 Browser Repost confirmed: {href}",
+        )
+        return True
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=f"⚠️ Browser Repost state ambiguous; not counted and browsing continues: {href}",
+    )
+    return False
+
+
+def _browser_engage_comment_text(page, username: str) -> str:
+    settings = get_account_control_settings(username)
+    persona = str(
+        settings.get("persona_prompt", RAGE_BAIT_PERSONA)
+        or RAGE_BAIT_PERSONA
+    ).strip()
+    extra = str(settings.get("comment_prompt", "") or "").strip()
+
+    try:
+        scope = page.locator("article").first
+        if not scope.count():
+            scope = page.locator("main").first
+        visible = re.sub(
+            r"\s+",
+            " ",
+            scope.inner_text(timeout=900) or "",
+        ).strip()[:1200]
+    except Exception:
+        visible = ""
+
+    if not visible:
+        return ""
+
+    prompt = f"""
+Write ONE short Instagram comment about this visible post/reel context:
+
+{visible}
+
+ACCOUNT COMMENT INSTRUCTIONS:
+{extra or "(none)"}
+
+Rules:
+- Comment on the actual visible subject.
+- Do not invent facts, identities, relationships, or locations.
+- Do not mention automation, bots, prompts, or source metadata.
+- No threats or slurs.
+- 3 to 24 words.
+- Output only the comment.
+""".strip()
+
+    result = _ollama_generate(
+        prompt,
+        min_words=3,
+        max_words=24,
+        attempts=2,
+        system_prompt=persona,
+    )
+    return _clip_chars(
+        result,
+        int(settings.get("reply_char_limit", 280)),
+    ) if result else ""
+
+
+def _browser_try_comment_engage(page, username: str, href: str, history: dict) -> bool:
+    history.setdefault("browser_commented_urls", [])
+    if href in history["browser_commented_urls"]:
+        return False
+
+    try:
+        box = page.locator(
+            "textarea[placeholder*='comment' i], "
+            "textarea[aria-label*='comment' i]"
+        ).first
+        if not box.count() or not box.is_visible(timeout=300):
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"↪️ Engage skip Comment: comment box not found on {href}",
+            )
+            return False
+    except Exception:
+        return False
+
+    comment = _browser_engage_comment_text(page, username)
+    if not comment:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"↪️ Engage skip Comment: no usable generated comment for {href}",
+        )
+        return False
+
+    if not wait_for_write_slot(
+        username,
+        "comment",
+        max_wait=0,
+        fail_fast=True,
+    ):
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Engage skip Comment: current write pacing/budget is full; browsing continues.",
+        )
+        return False
+
+    try:
+        box.fill(comment)
+        page.wait_for_timeout(200)
+
+        post_button = page.get_by_role(
+            "button",
+            name=re.compile(r"^(Post|Submit)$", re.I),
+        ).first
+
+        if not post_button.count() or not post_button.is_visible(timeout=300):
+            update_account_metric(
+                username,
+                "add_history",
+                value="↪️ Engage skip Comment: Post button was not available.",
+            )
+            return False
+
+        post_button.click(timeout=4000)
+        page.wait_for_timeout(800)
+    except Exception as exc:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Engage Comment failed; continuing: {type(exc).__name__}",
+        )
+        return False
+
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=700) or "",
+        )
+        confirmed = comment.lower() in body.lower()
+    except Exception:
+        confirmed = False
+
+    if confirmed:
+        record_write(username, "comment")
+        history["browser_commented_urls"].append(href)
+        history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"💬 Browser Comment confirmed: {comment[:120]}",
+        )
+        return True
+
+    update_account_metric(
+        username,
+        "add_history",
+        value="⚠️ Browser Comment was submitted but not visibly confirmed; browsing continues.",
+    )
+    return False
+
+
+def _browser_try_follow_author_engage(page, username: str, href: str) -> bool:
+    used, cap = _daily_follow_attempts_status(username)
+    if used >= cap:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"↪️ Engage skip Follow-author: daily hard cap reached ({used}/{cap}).",
+        )
+        return False
+
+    scope = page.locator("article").first
+    if not scope.count():
+        scope = page.locator("main").first
+
+    try:
+        follows = scope.get_by_role(
+            "button",
+            name=re.compile(r"^Follow$", re.I),
+        )
+        button = None
+        for i in range(min(follows.count(), 5)):
+            candidate = follows.nth(i)
+            if candidate.is_visible(timeout=150):
+                button = candidate
+                break
+    except Exception:
+        button = None
+
+    if button is None:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"↪️ Engage skip Follow-author: exact Follow button not found on {href}",
+        )
+        return False
+
+    ok, reason = _reserve_browser_follow_slot(username)
+    if not ok:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"↪️ Engage skip Follow-author: {reason}",
+        )
+        return False
+
+    try:
+        button.click(timeout=4000)
+        page.wait_for_timeout(750)
+    except Exception as exc:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Engage Follow-author click failed; continuing: {type(exc).__name__}",
+        )
+        return False
+
+    confirmed = False
+    detail = ""
+
+    for state in ("Following", "Requested"):
+        try:
+            loc = scope.get_by_role(
+                "button",
+                name=re.compile(rf"^{re.escape(state)}$", re.I),
+            ).first
+            if loc.count() and loc.is_visible(timeout=250):
+                confirmed = True
+                detail = state
+                break
+        except Exception:
+            pass
+
+    if confirmed:
+        record_write(username, "follow")
+        update_account_metric(username, "total_follows", increment=1)
+        used_after, cap_after = _daily_follow_attempts_status(username)
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"✅ Engage Follow-author confirmed [{detail}]; "
+                f"daily follows={used_after}/{cap_after}."
+            ),
+        )
+        return True
+
+    update_account_metric(
+        username,
+        "add_history",
+        value="⚠️ Engage Follow-author state ambiguous; not counted as confirmed.",
+    )
+    return False
+
+
+def _browser_collect_engage_links(
+    page,
+    username: str,
+    target_count: int,
+    scroll_steps: int,
+) -> list[str]:
+    """
+    Browse/scroll the hashtag page and collect unique post/reel links.
+    Scrolling is read-only and continues even when write actions are unavailable.
+    """
+    links = []
+
+    def collect():
+        try:
+            hrefs = page.locator(
+                "a[href*='/p/'], a[href*='/reel/']"
+            ).evaluate_all(
+                """els => els.map(e => e.href || e.getAttribute('href') || '')
+                             .filter(Boolean)"""
+            )
+        except Exception:
+            hrefs = []
+
+        for href in hrefs:
+            clean = str(href).split("?", 1)[0]
+            if clean and clean not in links:
+                links.append(clean)
+
+    collect()
+
+    for step in range(max(1, int(scroll_steps))):
+        problem = _browser_page_problem(page)
+        if problem:
+            _browser_pause_for_manual_security(username, problem)
+            break
+
+        try:
+            page.mouse.wheel(0, random.randint(650, 1100))
+        except Exception:
+            try:
+                page.evaluate(
+                    "(y) => window.scrollBy({top:y,behavior:'smooth'})",
+                    random.randint(650, 1100),
+                )
+            except Exception:
+                pass
+
+        page.wait_for_timeout(random.randint(450, 850))
+        collect()
+
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"↕️ Engage discovery scroll {step + 1}/{scroll_steps}; "
+                f"candidate links={len(links)}."
+            ),
+        )
+
+        if len(links) >= max(target_count * 2, target_count + 4):
+            # We already have enough material for this pass; don't scroll just
+            # to manufacture additional load.
+            break
+
+    return links
+
 def _browser_engage_hashtag(username, history, config, manual=False) -> int:
     settings = get_account_control_settings(username, config)
+
     if not manual and not settings.get("enable_engage", False):
         return 0
 
@@ -7225,31 +7750,53 @@ def _browser_engage_hashtag(username, history, config, manual=False) -> int:
         return 0
 
     tag = random.choice(tags).lstrip("#")
-    max_actions = max(
+    clip_target = max(
         1,
         min(
-            int(settings.get("max_writes_per_workflow", MAX_WRITES_PER_WORKFLOW)),
-            6,
+            20,
+            int(settings.get("engage_clips_per_pass", 12)),
         ),
     )
+    scroll_steps = max(
+        1,
+        min(
+            20,
+            int(settings.get("engage_scroll_steps", 8)),
+        ),
+    )
+
     history.setdefault("browser_liked_urls", [])
-    history.setdefault("browser_saved_urls", [])
+    history.setdefault("browser_reposted_urls", [])
+    history.setdefault("browser_commented_urls", [])
 
     update_account_metric(
         username,
         "add_history",
-        value=f"🌐 Browser Engage starting: #{tag}; max clips={max_actions}",
+        value=(
+            f"🌐 Browser Engage starting: #{tag}; clips≤{clip_target}; "
+            f"discovery scrolls≤{scroll_steps}; "
+            f"Like≈{int(settings.get('engage_like_percent',75))}% · "
+            f"Repost≈{int(settings.get('engage_repost_percent',75))}% · "
+            f"Comment≈{int(settings.get('engage_comment_percent',10))}% · "
+            f"Follow-author≈{int(settings.get('engage_follow_percent',25))}%."
+        ),
     )
 
-    confirmed_likes = 0
+    clips_viewed = 0
+    confirmed_actions = 0
 
     with sync_playwright() as p:
         update_account_metric(
             username,
             "add_history",
-            value="🌐 Browser Engage: launching saved Chromium profile...",
+            value="🌐 Browser Engage: attaching to saved Chromium profile...",
         )
-        context = _browser_launch(p, username, headed=True if manual else None)
+
+        context = _browser_launch(
+            p,
+            username,
+            headed=True if manual else None,
+        )
         page = context.pages[0] if context.pages else context.new_page()
 
         try:
@@ -7258,147 +7805,173 @@ def _browser_engage_hashtag(username, history, config, manual=False) -> int:
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
-            page.wait_for_timeout(1600)
+            page.wait_for_timeout(1200)
             _browser_check_ready(page, context, username)
 
-            hrefs = page.locator(
-                "a[href*='/p/'], a[href*='/reel/']"
-            ).evaluate_all(
-                """els => els.map(e => e.href || e.getAttribute('href') || '')
-                             .filter(Boolean)"""
+            links = _browser_collect_engage_links(
+                page,
+                username,
+                clip_target,
+                scroll_steps,
             )
-            links = []
-            for href in hrefs:
-                clean = str(href).split("?", 1)[0]
-                if clean not in links:
-                    links.append(clean)
 
             update_account_metric(
                 username,
                 "add_history",
-                value=f"🌐 Browser Engage: found {len(links)} candidate post/reel link(s).",
+                value=f"🌐 Browser Engage: collected {len(links)} candidate post/reel link(s).",
             )
 
             if not links:
                 update_account_metric(
                     username,
                     "add_history",
-                    value=f"⚠️ Browser Engage found no posts under #{tag}.",
+                    value=f"⚠️ Browser Engage found no usable posts under #{tag}.",
                 )
                 return 0
 
-            for index, href in enumerate(links[:max_actions], start=1):
-                if href in history["browser_liked_urls"]:
-                    continue
+            # Prefer unseen items, but still browse older candidates if all are
+            # previously liked. Like history no longer causes the entire clip
+            # to be skipped because Repost/Comment/Follow may still be eligible.
+            ordered = list(links)
+            random.shuffle(ordered)
+
+            for href in ordered:
+                if clips_viewed >= clip_target:
+                    break
+
+                if username in CONTROL_PAUSED_ACCOUNTS:
+                    break
+
+                safety = get_account_safety_state(username)
+                if safety["active"]:
+                    break
+
+                clips_viewed += 1
 
                 update_account_metric(
                     username,
                     "add_history",
-                    value=f"▶️ Browser Engage clip {index}/{min(len(links), max_actions)}: {href}",
+                    value=f"▶️ Browser Engage clip {clips_viewed}/{clip_target}: {href}",
                 )
 
-                page.goto(
-                    href,
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.wait_for_timeout(1100)
-                _browser_check_ready(page, context, username)
-
-                # LIKE
-                like_svg = _browser_find_svg_action(page, ("Like",))
-                if like_svg is not None:
-                    if not wait_for_write_slot(username, "like", max_wait=180):
-                        update_account_metric(
-                            username,
-                            "add_history",
-                            value="⏳ Browser Like stopped by pacing/safety state.",
-                        )
-                        break
-
-                    _browser_clickable_from_svg(like_svg).click(timeout=5000)
-                    page.wait_for_timeout(700)
-
-                    unlike_svg = _browser_find_svg_action(page, ("Unlike",))
-                    if unlike_svg is not None:
-                        record_write(username, "like")
-                        history["browser_liked_urls"].append(href)
-                        update_account_metric(username, "total_likes", increment=1)
-                        confirmed_likes += 1
-                        update_account_metric(
-                            username,
-                            "add_history",
-                            value=f"❤️ Browser Like confirmed: {href}",
-                        )
-                    else:
-                        update_account_metric(
-                            username,
-                            "add_history",
-                            value=f"⚠️ Browser Like was not confirmed: {href}",
-                        )
-                else:
+                try:
+                    page.goto(
+                        href,
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    page.wait_for_timeout(random.randint(700, 1200))
+                    _browser_check_ready(page, context, username)
+                except Exception as exc:
                     update_account_metric(
                         username,
                         "add_history",
-                        value=f"⚠️ Browser Engage: Like control not found on {href}",
+                        value=(
+                            f"⚠️ Engage clip navigation failed; moving on: "
+                            f"{type(exc).__name__}: {str(exc)[:100]}"
+                        ),
                     )
+                    continue
 
-                problem = _browser_page_problem(page)
+                problem = _browser_engage_security_problem(
+                    page,
+                    username,
+                )
                 if problem:
-                    apply_account_safety_backoff(
-                        username,
-                        f"Instagram Web engagement restriction/challenge: {problem}",
-                        level="restricted",
-                        hours=4,
-                    )
                     break
 
-                # SAVE
-                if href not in history["browser_saved_urls"]:
-                    save_svg = _browser_find_svg_action(page, ("Save",))
-                    if save_svg is not None:
-                        if not wait_for_write_slot(username, "save", max_wait=180):
-                            update_account_metric(
-                                username,
-                                "add_history",
-                                value="⏳ Browser Save stopped by pacing/safety state.",
-                            )
-                            break
+                attempted_any = False
 
-                        _browser_clickable_from_svg(save_svg).click(timeout=5000)
-                        page.wait_for_timeout(700)
+                if _browser_engage_percent(
+                    settings,
+                    "engage_like_percent",
+                    75,
+                ):
+                    attempted_any = True
+                    if _browser_try_like_engage(
+                        page,
+                        username,
+                        href,
+                        history,
+                    ):
+                        confirmed_actions += 1
 
-                        after_remove = _browser_find_svg_action(
-                            page,
-                            ("Remove", "Unsave"),
-                        )
-                        current_save = _browser_find_svg_action(page, ("Save",))
-                        confirmed_save = (
-                            after_remove is not None or current_save is None
-                        )
+                if _browser_engage_security_problem(page, username):
+                    break
 
-                        if confirmed_save:
-                            record_write(username, "save")
-                            history["browser_saved_urls"].append(href)
-                            update_account_metric(
-                                username,
-                                "add_history",
-                                value=f"🔖 Browser Save confirmed: {href}",
-                            )
-                        else:
-                            update_account_metric(
-                                username,
-                                "add_history",
-                                value=f"⚠️ Browser Save was not confirmed: {href}",
-                            )
-                    else:
-                        update_account_metric(
-                            username,
-                            "add_history",
-                            value=f"⚠️ Browser Engage: Save control not found on {href}",
-                        )
+                if _browser_engage_percent(
+                    settings,
+                    "engage_repost_percent",
+                    75,
+                ):
+                    attempted_any = True
+                    if _browser_try_repost_engage(
+                        page,
+                        username,
+                        href,
+                        history,
+                    ):
+                        confirmed_actions += 1
 
-                page.wait_for_timeout(random.randint(900, 1800))
+                if _browser_engage_security_problem(page, username):
+                    break
+
+                if (
+                    settings.get("enable_comments", False)
+                    and _browser_engage_percent(
+                        settings,
+                        "engage_comment_percent",
+                        10,
+                    )
+                ):
+                    attempted_any = True
+                    if _browser_try_comment_engage(
+                        page,
+                        username,
+                        href,
+                        history,
+                    ):
+                        confirmed_actions += 1
+
+                if _browser_engage_security_problem(page, username):
+                    break
+
+                if (
+                    settings.get("enable_follow", False)
+                    and _browser_engage_percent(
+                        settings,
+                        "engage_follow_percent",
+                        25,
+                    )
+                ):
+                    attempted_any = True
+                    if _browser_try_follow_author_engage(
+                        page,
+                        username,
+                        href,
+                    ):
+                        confirmed_actions += 1
+
+                if _browser_engage_security_problem(page, username):
+                    break
+
+                if not attempted_any:
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value="👀 Engage viewed this clip; no configured action selected.",
+                    )
+
+                # Continue browsing regardless of an individual Like/Repost/
+                # Comment/Follow failure. There is no page refresh here.
+                if clips_viewed < clip_target:
+                    view_gap = random.randint(800, 1800)
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=f"↘️ Engage advancing to next clip in ~{view_gap/1000:.1f}s.",
+                    )
+                    page.wait_for_timeout(view_gap)
 
         finally:
             try:
@@ -7411,14 +7984,20 @@ def _browser_engage_hashtag(username, history, config, manual=False) -> int:
             _browser_close_context(context)
 
     history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
-    history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
+    history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+    history["browser_commented_urls"] = history["browser_commented_urls"][-5000:]
 
     update_account_metric(
         username,
         "add_history",
-        value=f"🌐 Browser Engage finished; confirmed likes={confirmed_likes}.",
+        value=(
+            f"🌐 Browser Engage finished: viewed {clips_viewed} clip(s), "
+            f"confirmed actions={confirmed_actions}. "
+            "Individual action failures did not terminate the pass."
+        ),
     )
-    return confirmed_likes
+    return confirmed_actions
+
 
 
 
@@ -8405,7 +8984,8 @@ def _control_burst_now(username: str):
         "add_history",
         value=(
             f"⚡ Burst Now requested for ~{duration//60}m "
-            f"{duration%60:02d}s. Rolling write budget and safety stops remain active."
+            f"{duration%60:02d}s of active work. Rolling write budget, "
+            "50/day follow cap, and security stops remain active."
         ),
     )
 
@@ -8658,7 +9238,8 @@ def _run_browser_active_session(
         value=(
             f"⚡ {mode.title()} active session started for up to ~{duration//60}m "
             f"{duration%60:02d}s; short browsing gaps "
-            f"{ACTIVE_BROWSE_GAP_MIN_SECONDS}-{ACTIVE_BROWSE_GAP_MAX_SECONDS}s; "
+            f"{(BURST_BROWSE_GAP_MIN_SECONDS if mode == 'burst' else ACTIVE_BROWSE_GAP_MIN_SECONDS)}-"
+            f"{(BURST_BROWSE_GAP_MAX_SECONDS if mode == 'burst' else ACTIVE_BROWSE_GAP_MAX_SECONDS)}s; "
             f"max passes={max_passes}."
         ),
     )
@@ -8752,10 +9333,16 @@ def _run_browser_active_session(
         if time.monotonic() >= hard_deadline:
             break
 
-        gap = random.randint(
-            ACTIVE_BROWSE_GAP_MIN_SECONDS,
-            ACTIVE_BROWSE_GAP_MAX_SECONDS,
-        )
+        if mode == "burst":
+            gap = random.randint(
+                BURST_BROWSE_GAP_MIN_SECONDS,
+                BURST_BROWSE_GAP_MAX_SECONDS,
+            )
+        else:
+            gap = random.randint(
+                ACTIVE_BROWSE_GAP_MIN_SECONDS,
+                ACTIVE_BROWSE_GAP_MAX_SECONDS,
+            )
         update_account_metric(
             username,
             "add_history",
@@ -10409,7 +10996,7 @@ function cardHtml(user,a){
           ${autoEnabled ? "Stop Automation":"Start Automation"}
         </button>
         <button class="good" ${connected ? "":"disabled"}
-          onclick="burstNow('${esc(user)}')">⚡ Burst Now</button>
+          onclick="burstNow('${esc(user)}')">⚡ Burst Now · 1-2 min</button>
         <button ${connected ? "":"disabled"}
           onclick="setPaceMode('${esc(user)}','overnight')">🌙 Overnight Pace</button>
         <button ${connected ? "":"disabled"}
@@ -10470,6 +11057,12 @@ function cardHtml(user,a){
         <div><label>Follow limit / pass</label><input id="followlim_${esc(user)}" type="number" min="1" max="20" value="${Number(s.follow_limit||2)}"></div>
         <div><label>Auto follow batch max (1-10 visible rows)</label><input id="autofollowmax_${esc(user)}" type="number" min="1" max="10" value="${Number(s.auto_follow_batch_max||10)}"></div>
         <div><label>Active-session passes (1-20)</label><input id="sessionpasses_${esc(user)}" type="number" min="1" max="20" value="${Number(s.active_session_max_passes||8)}"></div>
+        <div><label>Engage clips / pass (1-20)</label><input id="engageclips_${esc(user)}" type="number" min="1" max="20" value="${Number(s.engage_clips_per_pass||12)}"></div>
+        <div><label>Engage discovery scrolls (1-20)</label><input id="engagescrolls_${esc(user)}" type="number" min="1" max="20" value="${Number(s.engage_scroll_steps||8)}"></div>
+        <div><label>Engage Like %</label><input id="engagelike_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_like_percent??75)}"></div>
+        <div><label>Engage Repost %</label><input id="engagerepost_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_repost_percent??75)}"></div>
+        <div><label>Engage Comment %</label><input id="engagecomment_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_comment_percent??10)}"></div>
+        <div><label>Engage Follow-author %</label><input id="engagefollow_${esc(user)}" type="number" min="0" max="100" value="${Number(s.engage_follow_percent??25)}"></div>
         <div><label>Video frames to watch</label><input id="frames_${esc(user)}" type="number" min="3" max="9" value="${Number(s.video_frames||5)}"></div>
         <div><label>Writes / rolling window</label><input id="maxwrites_${esc(user)}" type="number" min="1" max="30" value="${Number(s.max_writes_per_window||8)}"></div>
         <div><label>Rolling window seconds</label><input id="window_${esc(user)}" type="number" min="60" max="7200" value="${Number(s.write_window_seconds||900)}"></div>
@@ -10499,6 +11092,7 @@ function cardHtml(user,a){
     <div class="section">
       <b>Manual actions</b>
       <div class="row">
+        <button class="good" ${connected ? "":"disabled"} onclick="burstNow('${esc(user)}')">⚡ Burst Now (1-2 min)</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','repost')">Upload/Repost</button>
         <button ${connected ? "":"disabled"} onclick="clearUploadCooldown('${esc(user)}')">Clear Upload Cooldown</button>
         <button ${connected ? "":"disabled"} onclick="queueTask('${esc(user)}','comments')">Reply Comments</button>
@@ -10826,6 +11420,12 @@ function collectBehavior(user){
     follow_limit:Number(document.getElementById(`followlim_${user}`).value),
     auto_follow_batch_max:Number(document.getElementById(`autofollowmax_${user}`).value),
     active_session_max_passes:Number(document.getElementById(`sessionpasses_${user}`).value),
+    engage_clips_per_pass:Number(document.getElementById(`engageclips_${user}`).value),
+    engage_scroll_steps:Number(document.getElementById(`engagescrolls_${user}`).value),
+    engage_like_percent:Number(document.getElementById(`engagelike_${user}`).value),
+    engage_repost_percent:Number(document.getElementById(`engagerepost_${user}`).value),
+    engage_comment_percent:Number(document.getElementById(`engagecomment_${user}`).value),
+    engage_follow_percent:Number(document.getElementById(`engagefollow_${user}`).value),
     pace_mode:(latestData.accounts?.[user]?.control?.settings?.pace_mode || "normal"),
     video_frames:Number(document.getElementById(`frames_${user}`).value),
     max_writes_per_window:Number(document.getElementById(`maxwrites_${user}`).value),
@@ -11224,7 +11824,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Daily Follow Cap: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Engage + Burst Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
@@ -11232,7 +11832,7 @@ def main():
     print("Boot mode: DISCONNECTED / AUTO OFF")
     print(f"Daily follow hard cap: {DAILY_FOLLOW_HARD_CAP} attempts per local day")
     print(
-        "Auto cadence: Normal single-pass; Overnight uses "
+        "Auto cadence: Burst = 1-2 min active session; Normal single-pass; Overnight uses "
         f"{ACTIVE_SESSION_MIN_SECONDS//60}-{ACTIVE_SESSION_MAX_SECONDS//60} min active sessions, "
         f"{OVERNIGHT_REST_MIN_SECONDS//60}-{OVERNIGHT_REST_MAX_SECONDS//60} min ordinary rests, "
         f"{OVERNIGHT_LONG_REST_MIN_SECONDS//60}-{OVERNIGHT_LONG_REST_MAX_SECONDS//60} min periodic long rests; "
