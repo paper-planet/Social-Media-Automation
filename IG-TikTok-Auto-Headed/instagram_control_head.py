@@ -8744,6 +8744,18 @@ def _browser_submit_prepared_reel_comment(
 
         page.wait_for_timeout(250)
 
+        # Capture the filled state before submission. Instagram frequently
+        # accepts the comment but does not immediately render the new comment
+        # back into the visible DOM.
+        try:
+            before_value = (
+                box.input_value(timeout=250)
+                if tag in {"textarea", "input"}
+                else str(box.evaluate("(el) => el.innerText || el.textContent || '") or "")
+            )
+        except Exception:
+            before_value = comment
+
         posted = False
 
         try:
@@ -8785,16 +8797,56 @@ def _browser_submit_prepared_reel_comment(
         _finish_shared_write_reservation(username, "comment", False)
         return False
 
-    # Best-effort visible confirmation.
+    # Confirmation is accepted when either:
+    #   1. the comment is rendered back in the visible DOM, OR
+    #   2. Instagram cleared/closed the editor after a successful submit.
+    confirmed = False
+    rendered = False
+    cleared_or_closed = False
+
     try:
         body = re.sub(
             r"\s+",
             " ",
             page.locator("body").inner_text(timeout=700) or "",
         )
-        confirmed = comment.lower() in body.lower()
+        rendered = comment.lower() in body.lower()
     except Exception:
-        confirmed = False
+        rendered = False
+
+    if not rendered:
+        try:
+            live_box = _browser_find_reel_comment_editor(page)
+            if live_box is None:
+                cleared_or_closed = True
+            else:
+                try:
+                    live_tag = str(
+                        live_box.evaluate("(el) => el.tagName.toLowerCase()")
+                    ).lower()
+                except Exception:
+                    live_tag = ""
+
+                if live_tag in {"textarea", "input"}:
+                    after_value = str(
+                        live_box.input_value(timeout=250) or ""
+                    ).strip()
+                else:
+                    after_value = str(
+                        live_box.evaluate(
+                            "(el) => el.innerText || el.textContent || ''"
+                        )
+                        or ""
+                    ).strip()
+
+                cleared_or_closed = (
+                    bool(str(before_value or "").strip())
+                    and not after_value
+                )
+        except Exception:
+            cleared_or_closed = False
+
+    confirmed = bool(rendered or cleared_or_closed)
 
     if confirmed:
         record_write(username, "comment")
@@ -8803,7 +8855,11 @@ def _browser_submit_prepared_reel_comment(
         update_account_metric(
             username,
             "add_history",
-            value=f"💬 Reels Demo comment confirmed: {comment[:120]}",
+            value=(
+                f"💬 Reels comment accepted "
+                f"({'rendered' if rendered else 'editor cleared after submit'}): "
+                f"{comment[:120]}"
+            ),
         )
         return True
 
@@ -8812,7 +8868,7 @@ def _browser_submit_prepared_reel_comment(
         username,
         "add_history",
         value=(
-            "⚠️ Reels Demo comment submission was not visibly confirmed; "
+            "⚠️ Reels comment submit state remained ambiguous; "
             "continuing without counting it."
         ),
     )
@@ -8824,6 +8880,8 @@ def _browser_demo_save(
     username: str,
     href: str,
     history: dict,
+    *,
+    max_wait: int = 45,
 ) -> bool:
     history.setdefault("browser_saved_urls", [])
 
@@ -8858,7 +8916,7 @@ def _browser_demo_save(
         page,
         username,
         "save",
-        max_wait=45,
+        max_wait=max_wait,
     ):
         return False
 
@@ -8899,6 +8957,8 @@ def _browser_demo_repost(
     username: str,
     href: str,
     history: dict,
+    *,
+    max_wait: int = 45,
 ) -> bool:
     history.setdefault("browser_reposted_urls", [])
 
@@ -8943,7 +9003,7 @@ def _browser_demo_repost(
         page,
         username,
         "repost",
-        max_wait=45,
+        max_wait=max_wait,
     ):
         return False
 
@@ -9020,6 +9080,8 @@ def _browser_demo_follow_if_needed(
     page,
     username: str,
     href: str,
+    *,
+    max_wait: int = 30,
 ) -> bool:
     used, cap = _daily_follow_attempts_status(username)
     if used >= cap:
@@ -9078,7 +9140,7 @@ def _browser_demo_follow_if_needed(
     if not _browser_demo_wait_follow_slot(
         page,
         username,
-        max_wait=30,
+        max_wait=max_wait,
     ):
         return False
 
@@ -9122,24 +9184,427 @@ def _browser_demo_follow_if_needed(
     )
     return False
 
+def _browser_demo_like(
+    page,
+    username: str,
+    href: str,
+    history: dict,
+    *,
+    max_wait: int = 0,
+) -> bool:
+    history.setdefault("browser_liked_urls", [])
+
+    if (
+        href in history["browser_liked_urls"]
+        or _browser_find_svg_action_visible(page, ("Unlike",)) is not None
+    ):
+        update_account_metric(
+            username,
+            "add_history",
+            value="❤️ Visible reel is already liked; leaving it liked.",
+        )
+        return True
+
+    like_svg = _browser_find_svg_action_visible(page, ("Like",))
+    if like_svg is None:
+        update_account_metric(
+            username,
+            "add_history",
+            value="↪️ Reels Like control is not visible on this reel.",
+        )
+        return False
+
+    if not _browser_demo_wait_write_slot(
+        page,
+        username,
+        "like",
+        max_wait=max_wait,
+    ):
+        return False
+
+    try:
+        _browser_clickable_from_svg(like_svg).click(timeout=4000)
+        page.wait_for_timeout(650)
+    except Exception as exc:
+        _finish_shared_write_reservation(username, "like", False)
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"⚠️ Reels Like click failed: {type(exc).__name__}",
+        )
+        return False
+
+    if _browser_find_svg_action_visible(page, ("Unlike",)) is not None:
+        record_write(username, "like")
+        history["browser_liked_urls"].append(href)
+        history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
+        update_account_metric(username, "total_likes", increment=1)
+        update_account_metric(
+            username,
+            "add_history",
+            value="❤️ Reels Like confirmed.",
+        )
+        return True
+
+    _finish_shared_write_reservation(username, "like", False)
+    update_account_metric(
+        username,
+        "add_history",
+        value="⚠️ Reels Like was not visibly confirmed.",
+    )
+    return False
+
+
+def _browser_reel_action_blocked_now(username: str, action: str) -> str:
+    """
+    Read-only pacing precheck used to decide whether to defer an action rather
+    than block the browser immediately.
+    """
+    if action == "follow":
+        used, cap = _daily_follow_attempts_status(username)
+        if used >= cap:
+            return f"daily follow cap reached ({used}/{cap})"
+
+        allowed, reason = account_writes_allowed(username)
+        if not allowed:
+            return reason
+
+        # Follow uses its own reservation function, so only use the generic
+        # shared reason as a hint for whether to defer right now.
+        return _shared_write_block_reason(username, "follow") or ""
+
+    return _shared_write_block_reason(username, action) or ""
+
+
+def _browser_run_reel_action_cycle(
+    page,
+    username: str,
+    reel_key: str,
+    history: dict,
+    prepared_comment: str,
+    *,
+    max_cycle_seconds: int = 95,
+) -> tuple[int, list[str]]:
+    """
+    Shared manual/Auto Reels action engine.
+
+    Applicable actions are shuffled per reel. Temporarily pacing-blocked actions
+    are deferred, other actions are tried, and deferred actions are revisited
+    while the reel stays visible. No pacing/security gate is bypassed.
+    """
+    actions = ["like", "save", "repost", "follow", "comment"]
+    random.shuffle(actions)
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🎲 Reels action order: "
+            + " → ".join(a.title() for a in actions)
+        ),
+    )
+
+    pending = list(actions)
+    completed = []
+    confirmed = 0
+    deadline = time.monotonic() + max(20, int(max_cycle_seconds))
+    round_no = 0
+
+    while pending and time.monotonic() < deadline:
+        if get_account_safety_state(username)["active"]:
+            break
+
+        problem = _browser_engage_security_problem(page, username)
+        if problem:
+            break
+
+        round_no += 1
+        progressed = False
+        deferred = []
+
+        for action in pending:
+            if time.monotonic() >= deadline:
+                deferred.append(action)
+                continue
+
+            if _browser_engage_security_problem(page, username):
+                deferred.extend(
+                    a for a in pending if a not in completed and a != action
+                )
+                pending = deferred
+                break
+
+            # Comment is not applicable when no grounded comment was produced.
+            if action == "comment" and not prepared_comment:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value="↪️ Reels Comment skipped: no grounded comment was generated.",
+                )
+                completed.append(action)
+                progressed = True
+                continue
+
+            block_reason = _browser_reel_action_blocked_now(
+                username,
+                "comment" if action == "comment" else action,
+            )
+
+            if block_reason:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"⏸️ Reels {action.title()} deferred for now: "
+                        f"{block_reason}"
+                    ),
+                )
+                deferred.append(action)
+                continue
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=f"▶️ Reels attempting {action.title()}.",
+            )
+
+            ok = False
+
+            if action == "like":
+                ok = _browser_demo_like(
+                    page,
+                    username,
+                    reel_key,
+                    history,
+                    max_wait=0,
+                )
+
+            elif action == "save":
+                ok = _browser_demo_save(
+                    page,
+                    username,
+                    reel_key,
+                    history,
+                    max_wait=0,
+                )
+
+            elif action == "repost":
+                ok = _browser_demo_repost(
+                    page,
+                    username,
+                    reel_key,
+                    history,
+                    max_wait=0,
+                )
+
+            elif action == "follow":
+                ok = _browser_demo_follow_if_needed(
+                    page,
+                    username,
+                    reel_key,
+                    max_wait=0,
+                )
+
+            elif action == "comment":
+                ok = _browser_submit_prepared_reel_comment(
+                    page,
+                    username,
+                    reel_key,
+                    history,
+                    prepared_comment,
+                    max_wait=0,
+                )
+
+                # Restore the reel view after comment drawer interaction.
+                try:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
+
+            completed.append(action)
+            progressed = True
+            if ok:
+                confirmed += 1
+
+            if _browser_engage_security_problem(page, username):
+                break
+
+            # Tiny UI settle between immediately available actions.
+            page.wait_for_timeout(random.randint(350, 850))
+
+        pending = [
+            action
+            for action in deferred
+            if action not in completed
+        ]
+
+        if not pending:
+            break
+
+        if get_account_safety_state(username)["active"]:
+            break
+
+        if time.monotonic() >= deadline:
+            break
+
+        # If every remaining action is pacing-blocked, keep watching the reel
+        # briefly and revisit the queue instead of sitting on a blank wait.
+        wait_s = random.uniform(2.0, 4.0)
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"👀 Reels keeping the current reel visible for ~{wait_s:.1f}s "
+                f"before retrying deferred actions: "
+                f"{', '.join(a.title() for a in pending)}"
+            ),
+        )
+        page.wait_for_timeout(int(wait_s * 1000))
+
+    if pending:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "↪️ Reels action cycle ended with deferred/unavailable actions: "
+                + ", ".join(a.title() for a in pending)
+            ),
+        )
+
+    return confirmed, completed
+
+
+def _browser_run_one_reel(
+    page,
+    username: str,
+    history: dict,
+    *,
+    watch_seconds: float = 8.0,
+    max_cycle_seconds: int = 95,
+) -> int:
+    """
+    Shared one-reel unit used by both manual Reels Demo and Auto Reels.
+    """
+    scope = _browser_visible_reel_scope(page)
+    reel_key = _browser_visible_reel_permalink(page, scope)
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=f"🎬 Reels unit: {reel_key}",
+    )
+
+    reel_context = _browser_reel_watch_context(
+        page,
+        username,
+        watch_seconds=watch_seconds,
+    )
+
+    if _browser_engage_security_problem(page, username):
+        return 0
+
+    prepared_comment = _browser_prepare_reel_comment(
+        page,
+        username,
+        reel_context,
+    )
+
+    if _browser_engage_security_problem(page, username):
+        return 0
+
+    confirmed, _ = _browser_run_reel_action_cycle(
+        page,
+        username,
+        reel_key,
+        history,
+        prepared_comment,
+        max_cycle_seconds=max_cycle_seconds,
+    )
+
+    return confirmed
+
+
+def _browser_auto_reels(username, history, config) -> int:
+    """
+    Auto Engage now uses the same Reels engine as the manual demo.
+
+    One Auto Engage pass handles one visible reel. Overnight active sessions can
+    perform multiple such passes according to the hub's active-session pass
+    count.
+    """
+    settings = get_account_control_settings(username, config)
+
+    if not settings.get("enable_engage", False):
+        return 0
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            "🎞️ Auto Reels pass starting: shared reel engine, random action "
+            "order, deferred pacing-blocked actions."
+        ),
+    )
+
+    with sync_playwright() as p:
+        context = _browser_launch(
+            p,
+            username,
+            headed=None,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            try:
+                current_url = str(page.url or "").lower()
+            except Exception:
+                current_url = ""
+
+            if (
+                "instagram.com/reel/" not in current_url
+                and "instagram.com/reels" not in current_url
+            ):
+                page.goto(
+                    "https://www.instagram.com/reels/",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(1200)
+
+            _browser_check_ready(page, context, username)
+
+            if get_account_safety_state(username)["active"]:
+                return 0
+
+            confirmed = _browser_run_one_reel(
+                page,
+                username,
+                history,
+                watch_seconds=8.0,
+                max_cycle_seconds=90,
+            )
+
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"🎞️ Auto Reels pass finished; "
+                    f"confirmed/retained actions={confirmed}."
+                ),
+            )
+            return confirmed
+
+        finally:
+            try:
+                _browser_refresh_saved_sessionid(context, username)
+            except Exception:
+                pass
+            _browser_close_context(context)
+
 def _browser_reels_demo(username, history, config) -> int:
     """
-    Manual one-reel demonstration.
-
-    Reuses the reel already visible in Chromium when possible.
-
-    Sequence:
-      1. watch current reel briefly + capture visible context
-      2. prepare a context-grounded comment BEFORE opening comments
-      3. comment
-      4. like
-      5. save
-      6. repost
-      7. follow author only when an exact visible Follow button exists
-
-    Existing pacing/security limits are respected. For the manual demo, a
-    temporary pacing gap is waited out rather than immediately skipping the
-    remaining actions.
+    Manual one-reel demo using the exact same action engine as Auto Reels.
     """
     for key in (
         "browser_liked_urls",
@@ -9149,14 +9614,12 @@ def _browser_reels_demo(username, history, config) -> int:
     ):
         history.setdefault(key, [])
 
-    confirmed_actions = 0
-
     update_account_metric(
         username,
         "add_history",
         value=(
-            "🎞️ Reels Demo starting: ONE visible reel; longer watch → grounded comment "
-            "→ Like → Save → Repost → Follow-if-needed."
+            "🎞️ Reels Demo starting: ONE visible reel; shared random-order "
+            "action engine."
         ),
     )
 
@@ -9170,13 +9633,13 @@ def _browser_reels_demo(username, history, config) -> int:
 
         try:
             try:
-                current_url = str(page.url or "")
+                current_url = str(page.url or "").lower()
             except Exception:
                 current_url = ""
 
             if (
-                "instagram.com/reel/" not in current_url.lower()
-                and "instagram.com/reels" not in current_url.lower()
+                "instagram.com/reel/" not in current_url
+                and "instagram.com/reels" not in current_url
             ):
                 page.goto(
                     "https://www.instagram.com/reels/",
@@ -9207,182 +9670,23 @@ def _browser_reels_demo(username, history, config) -> int:
                     username,
                     "add_history",
                     value=(
-                        "🛑 Reels Demo stopped before actions because a real "
-                        f"safety/backoff state is active: {safety['reason'][:160]}"
+                        "🛑 Reels Demo stopped because safety/backoff is active: "
+                        f"{safety['reason'][:160]}"
                     ),
                 )
                 return 0
 
-            problem = _browser_engage_security_problem(page, username)
-            if problem:
-                return 0
-
-            scope = _browser_visible_reel_scope(page)
-            reel_key = _browser_visible_reel_permalink(page, scope)
-
-            update_account_metric(
-                username,
-                "add_history",
-                value=f"🎬 Reels Demo 1/1: {reel_key}",
-            )
-
-            # WATCH FIRST.
-            reel_context = _browser_reel_watch_context(
+            confirmed = _browser_run_one_reel(
                 page,
                 username,
-                watch_seconds=10.0,
-            )
-
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # PREPARE COMMENT WHILE THE REEL ITSELF IS STILL VISIBLE.
-            prepared_comment = _browser_prepare_reel_comment(
-                page,
-                username,
-                reel_context,
-            )
-
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # 1) COMMENT
-            update_account_metric(
-                username,
-                "add_history",
-                value="1️⃣ Reels Demo: opening comments and posting the prepared reel-specific comment.",
-            )
-            if _browser_submit_prepared_reel_comment(
-                page,
-                username,
-                reel_key,
                 history,
-                prepared_comment,
-                max_wait=45,
-            ):
-                confirmed_actions += 1
-
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # Close the comment drawer/panel before targeting reel controls.
-            try:
-                page.keyboard.press("Escape")
-                page.wait_for_timeout(400)
-            except Exception:
-                pass
-
-            # 2) LIKE — use existing helper. It is the next write, so wait for
-            # the normal pacing slot first and then let the helper click it.
-            update_account_metric(
-                username,
-                "add_history",
-                value="2️⃣ Reels Demo: attempting Like.",
+                watch_seconds=10.0,
+                max_cycle_seconds=110,
             )
-
-            already_liked = (
-                reel_key in history.get("browser_liked_urls", [])
-                or _browser_find_svg_action_visible(page, ("Unlike",)) is not None
-            )
-
-            if already_liked:
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value="❤️ Visible reel is already liked; leaving it liked.",
-                )
-                confirmed_actions += 1
-            else:
-                if _browser_demo_wait_write_slot(
-                    page,
-                    username,
-                    "like",
-                    max_wait=45,
-                ):
-                    like_svg = _browser_find_svg_action_visible(page, ("Like",))
-                    if like_svg is not None:
-                        try:
-                            _browser_clickable_from_svg(like_svg).click(timeout=4000)
-                            page.wait_for_timeout(700)
-                        except Exception as exc:
-                            _finish_shared_write_reservation(username, "like", False)
-                            update_account_metric(
-                                username,
-                                "add_history",
-                                value=f"⚠️ Reels Demo Like failed: {type(exc).__name__}",
-                            )
-                        else:
-                            if _browser_find_svg_action_visible(page, ("Unlike",)) is not None:
-                                record_write(username, "like")
-                                history["browser_liked_urls"].append(reel_key)
-                                history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
-                                update_account_metric(username, "total_likes", increment=1)
-                                update_account_metric(
-                                    username,
-                                    "add_history",
-                                    value="❤️ Reels Demo Like confirmed.",
-                                )
-                                confirmed_actions += 1
-                            else:
-                                _finish_shared_write_reservation(username, "like", False)
-                                update_account_metric(
-                                    username,
-                                    "add_history",
-                                    value="⚠️ Reels Demo Like was not visibly confirmed.",
-                                )
-                    else:
-                        _finish_shared_write_reservation(username, "like", False)
-                        update_account_metric(
-                            username,
-                            "add_history",
-                            value="↪️ Reels Demo Like control is not visible.",
-                        )
-
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # 3) SAVE
-            update_account_metric(
-                username,
-                "add_history",
-                value="3️⃣ Reels Demo: attempting Save.",
-            )
-            if _browser_demo_save(page, username, reel_key, history):
-                confirmed_actions += 1
-
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # 4) REPOST
-            update_account_metric(
-                username,
-                "add_history",
-                value="4️⃣ Reels Demo: attempting Repost.",
-            )
-            if _browser_demo_repost(page, username, reel_key, history):
-                confirmed_actions += 1
-
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
-
-            # 5) FOLLOW ONLY IF NOT ALREADY FOLLOWING.
-            update_account_metric(
-                username,
-                "add_history",
-                value="5️⃣ Reels Demo: checking whether the reel author needs a Follow.",
-            )
-            if _browser_demo_follow_if_needed(page, username, reel_key):
-                confirmed_actions += 1
-
-            if _browser_engage_security_problem(page, username):
-                return confirmed_actions
 
         finally:
             try:
-                _browser_refresh_saved_sessionid(
-                    context,
-                    username,
-                )
+                _browser_refresh_saved_sessionid(context, username)
             except Exception:
                 pass
             _browser_close_context(context)
@@ -9400,11 +9704,12 @@ def _browser_reels_demo(username, history, config) -> int:
         "add_history",
         value=(
             f"🎞️ Reels Demo finished: one reel, "
-            f"confirmed/retained actions={confirmed_actions}."
+            f"confirmed/retained actions={confirmed}."
         ),
     )
 
-    return confirmed_actions
+    return confirmed
+
 
 
 
@@ -11185,7 +11490,7 @@ def _browser_auto_choices(username: str, settings: dict, folder_pool) -> list[st
     if settings.get("enable_follow", False):
         choices.append("networking")
     if settings.get("enable_engage", False):
-        choices.append("hashtags")
+        choices.append("reels")
 
     if settings.get("enable_posts", False) and folder_pool:
         # Do not let a long upload cooldown stall an active browsing session.
@@ -11291,12 +11596,11 @@ def _run_browser_active_session(
                     conf,
                     manual=False,
                 )
-            elif task == "hashtags":
-                _browser_engage_hashtag(
+            elif task == "reels":
+                _browser_auto_reels(
                     username,
                     history,
                     conf,
-                    manual=False,
                 )
             elif task == "repost":
                 _browser_post(
@@ -11525,12 +11829,11 @@ def run_browser_profile_workflow(username, conf, folder_pool):
                         conf,
                         manual=False,
                     )
-                elif task == "hashtags":
-                    _browser_engage_hashtag(
+                elif task == "reels":
+                    _browser_auto_reels(
                         username,
                         history,
                         conf,
-                        manual=False,
                     )
                 elif task == "repost":
                     _browser_post(
@@ -14099,7 +14402,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reel Comment UI Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Shared Reels Engine: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
