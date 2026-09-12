@@ -6735,7 +6735,7 @@ def _next_overnight_auto_delay(username: str, result: str, *, manual_run: bool =
             return max(WORKFLOW_RETRY_IDLE_SECONDS, 300), "idle/disconnected"
         return WORKFLOW_RETRY_IDLE_SECONDS, "retry"
     if manual_run:
-        return random.randint(60, 150), "short rest after manual action"
+        return random.randint(15, 30), "brief rest after manual action"
 
     pace_mode = _runtime_pace_mode(username)
     if pace_mode == "overnight":
@@ -9266,32 +9266,29 @@ def _browser_demo_save(
 ) -> bool:
     history.setdefault("browser_saved_urls", [])
 
-    if href in history["browser_saved_urls"]:
+    state = _browser_visible_reel_state(page)
+
+    if state["saved"] or href in history["browser_saved_urls"]:
+        if href not in history["browser_saved_urls"]:
+            history["browser_saved_urls"].append(href)
+            history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
-            value=f"🔖 Reel already recorded as saved: {href}",
+            value="🔖 Visible reel is already saved; leaving it saved.",
         )
         return True
 
-    save_svg = _browser_find_svg_action_visible(page, ("Save",))
+    save_svg = _browser_find_strict_reel_svg(page, "Save")
     if save_svg is None:
-        if _browser_find_svg_action_visible(page, ("Remove", "Unsave")) is not None:
-            history["browser_saved_urls"].append(href)
-            history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
-            update_account_metric(
-                username,
-                "add_history",
-                value="🔖 Visible reel is already saved; leaving it saved.",
-            )
-            return True
-
         update_account_metric(
             username,
             "add_history",
-            value="↪️ Reels Demo Save control is not visible on this reel.",
+            value="↪️ Reels Save control is not visible in the current reel.",
         )
         return False
+
+    liked_before = state["liked"]
 
     if not _browser_demo_wait_write_slot(
         page,
@@ -9309,18 +9306,28 @@ def _browser_demo_save(
         update_account_metric(
             username,
             "add_history",
-            value=f"⚠️ Reels Demo Save click failed: {type(exc).__name__}",
+            value=f"⚠️ Reels Save click failed: {type(exc).__name__}",
         )
         return False
 
-    if _browser_find_svg_action_visible(page, ("Remove", "Unsave")) is not None:
+    if not _browser_assert_reel_still_liked(
+        page,
+        username,
+        expected_liked=liked_before,
+        after_action="Save",
+    ):
+        return False
+
+    state = _browser_visible_reel_state(page)
+
+    if state["saved"]:
         record_write(username, "save")
         history["browser_saved_urls"].append(href)
         history["browser_saved_urls"] = history["browser_saved_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
-            value="🔖 Reels Demo Save confirmed.",
+            value="🔖 Reels Save confirmed.",
         )
         return True
 
@@ -9328,9 +9335,10 @@ def _browser_demo_save(
     update_account_metric(
         username,
         "add_history",
-        value="⚠️ Reels Demo Save was not visibly confirmed.",
+        value="⚠️ Reels Save was not visibly confirmed.",
     )
     return False
+
 
 
 def _browser_demo_repost(
@@ -9343,42 +9351,30 @@ def _browser_demo_repost(
 ) -> bool:
     history.setdefault("browser_reposted_urls", [])
 
-    if href in history["browser_reposted_urls"]:
+    state = _browser_visible_reel_state(page)
+
+    if state["reposted"] or href in history["browser_reposted_urls"]:
+        if href not in history["browser_reposted_urls"]:
+            history["browser_reposted_urls"].append(href)
+            history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
-            value="🔁 Reel already recorded as reposted; not toggling it again.",
+            value="🔁 Visible reel is already reposted; leaving it reposted.",
         )
         return True
 
-    repost_svg = _browser_find_svg_action_visible(page, ("Repost",))
-    button = (
-        _browser_clickable_from_svg(repost_svg)
-        if repost_svg is not None
-        else None
-    )
+    repost_svg = _browser_find_strict_reel_svg(page, "Repost")
 
-    if button is None:
-        try:
-            candidates = page.get_by_role(
-                "button",
-                name=re.compile(r"^Repost$", re.I),
-            )
-            for i in range(min(candidates.count(), 6)):
-                c = candidates.nth(i)
-                if c.is_visible(timeout=120):
-                    button = c
-                    break
-        except Exception:
-            button = None
-
-    if button is None:
+    if repost_svg is None:
         update_account_metric(
             username,
             "add_history",
-            value="↪️ Reels Demo Repost control is not visible on this reel.",
+            value="↪️ Reels Repost control is not visible in the current reel.",
         )
         return False
+
+    liked_before = state["liked"]
 
     if not _browser_demo_wait_write_slot(
         page,
@@ -9389,53 +9385,87 @@ def _browser_demo_repost(
         return False
 
     try:
-        button.click(timeout=4000)
+        _browser_clickable_from_svg(repost_svg).click(timeout=4000)
         page.wait_for_timeout(450)
 
-        # Some layouts require a second exact Repost choice.
+        # Instagram may open a small menu requiring one exact Repost choice.
+        scope = _browser_visible_reel_scope(page)
         try:
             exact = page.get_by_text(
                 re.compile(r"^Repost$", re.I),
                 exact=True,
             )
-            for i in range(min(exact.count(), 6)):
+            for i in range(min(exact.count(), 8)):
                 item = exact.nth(i)
-                if item.is_visible(timeout=120):
-                    item.click(timeout=3000)
-                    page.wait_for_timeout(650)
-                    break
+                if not item.is_visible(timeout=120):
+                    continue
+
+                # Avoid re-clicking the original reel action itself by only
+                # accepting a visible text/menu item outside the strict SVG
+                # button when Instagram exposes one.
+                try:
+                    tag = str(
+                        item.evaluate("(el) => el.tagName.toLowerCase()")
+                    ).lower()
+                except Exception:
+                    tag = ""
+
+                if tag == "svg":
+                    continue
+
+                item.click(timeout=3000)
+                page.wait_for_timeout(650)
+                break
         except Exception:
             pass
+
     except Exception as exc:
         _finish_shared_write_reservation(username, "repost", False)
         update_account_metric(
             username,
             "add_history",
-            value=f"⚠️ Reels Demo Repost failed: {type(exc).__name__}",
+            value=f"⚠️ Reels Repost failed: {type(exc).__name__}",
         )
         return False
 
-    confirmed = (
-        _browser_find_svg_action_visible(
-            page,
-            ("Remove repost", "Undo repost", "Reposted"),
-        )
-        is not None
-    )
+    if not _browser_assert_reel_still_liked(
+        page,
+        username,
+        expected_liked=liked_before,
+        after_action="Repost",
+    ):
+        return False
 
-    if not confirmed:
-        try:
-            body = re.sub(
-                r"\s+",
-                " ",
-                page.locator("body").inner_text(timeout=500) or "",
-            ).lower()
-            confirmed = any(
-                phrase in body
-                for phrase in ("reposted", "remove repost", "undo repost")
+    state = _browser_visible_reel_state(page)
+
+    if state["reposted"]:
+        record_write(username, "repost")
+        history["browser_reposted_urls"].append(href)
+        history["browser_reposted_urls"] = history["browser_reposted_urls"][-5000:]
+        update_account_metric(
+            username,
+            "add_history",
+            value="🔁 Reels Repost confirmed.",
+        )
+        return True
+
+    # Text confirmation fallback.
+    try:
+        body = re.sub(
+            r"\s+",
+            " ",
+            page.locator("body").inner_text(timeout=500) or "",
+        ).lower()
+        confirmed = any(
+            phrase in body
+            for phrase in (
+                "reposted",
+                "remove repost",
+                "undo repost",
             )
-        except Exception:
-            confirmed = False
+        )
+    except Exception:
+        confirmed = False
 
     if confirmed:
         record_write(username, "repost")
@@ -9444,7 +9474,7 @@ def _browser_demo_repost(
         update_account_metric(
             username,
             "add_history",
-            value="🔁 Reels Demo Repost confirmed.",
+            value="🔁 Reels Repost confirmed by Instagram text/state.",
         )
         return True
 
@@ -9452,9 +9482,10 @@ def _browser_demo_repost(
     update_account_metric(
         username,
         "add_history",
-        value="⚠️ Reels Demo Repost was not visibly confirmed.",
+        value="⚠️ Reels Repost was not visibly confirmed.",
     )
     return False
+
 
 
 def _browser_demo_follow_if_needed(
@@ -9465,41 +9496,42 @@ def _browser_demo_follow_if_needed(
     max_wait: int = 30,
 ) -> bool:
     used, cap = _daily_follow_attempts_status(username)
+
     if used >= cap:
         update_account_metric(
             username,
             "add_history",
-            value=f"↪️ Reels Demo Follow skipped: daily cap reached ({used}/{cap}).",
+            value=f"↪️ Reels Follow skipped: daily cap reached ({used}/{cap}).",
         )
         return False
 
     scope = _browser_visible_reel_scope(page)
+    state = _browser_visible_reel_state(page)
 
-    # If Following or Requested is visible, explicitly leave it alone.
-    for state in ("Following", "Requested"):
-        try:
-            locs = scope.get_by_role(
-                "button",
-                name=re.compile(rf"^{state}$", re.I),
-            )
-            for i in range(min(locs.count(), 4)):
-                if locs.nth(i).is_visible(timeout=120):
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value=f"👤 Reels Demo author already {state.lower()}; no Follow click.",
-                    )
-                    return True
-        except Exception:
-            pass
+    if state["following"]:
+        update_account_metric(
+            username,
+            "add_history",
+            value="👤 Reel author is already Following; no Follow click.",
+        )
+        return True
+
+    if state["requested"]:
+        update_account_metric(
+            username,
+            "add_history",
+            value="👤 Reel author is already Requested; no Follow click.",
+        )
+        return True
+
+    button = None
 
     try:
         follows = scope.get_by_role(
             "button",
             name=re.compile(r"^Follow$", re.I),
         )
-        button = None
-        for i in range(min(follows.count(), 5)):
+        for i in range(min(follows.count(), 8)):
             candidate = follows.nth(i)
             if candidate.is_visible(timeout=150):
                 button = candidate
@@ -9512,11 +9544,13 @@ def _browser_demo_follow_if_needed(
             username,
             "add_history",
             value=(
-                "↪️ Reels Demo found no exact visible Follow button; "
-                "assuming no follow action is needed/available."
+                "↪️ Reels found no exact visible Follow button in the current "
+                "reel; no follow action is needed/available."
             ),
         )
         return False
+
+    liked_before = state["liked"]
 
     if not _browser_demo_wait_follow_slot(
         page,
@@ -9532,38 +9566,211 @@ def _browser_demo_follow_if_needed(
         update_account_metric(
             username,
             "add_history",
-            value=f"⚠️ Reels Demo Follow click failed: {type(exc).__name__}",
+            value=f"⚠️ Reels Follow click failed: {type(exc).__name__}",
         )
         return False
 
-    for state in ("Following", "Requested"):
-        try:
-            loc = scope.get_by_role(
-                "button",
-                name=re.compile(rf"^{state}$", re.I),
-            ).first
-            if loc.count() and loc.is_visible(timeout=250):
-                record_write(username, "follow")
-                update_account_metric(username, "total_follows", increment=1)
-                used_after, cap_after = _daily_follow_attempts_status(username)
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        f"✅ Reels Demo Follow confirmed [{state}]; "
-                        f"daily follows={used_after}/{cap_after}."
-                    ),
-                )
-                return True
-        except Exception:
-            pass
+    if not _browser_assert_reel_still_liked(
+        page,
+        username,
+        expected_liked=liked_before,
+        after_action="Follow",
+    ):
+        return False
+
+    state = _browser_visible_reel_state(page)
+
+    if state["following"] or state["requested"]:
+        record_write(username, "follow")
+        update_account_metric(username, "total_follows", increment=1)
+        used_after, cap_after = _daily_follow_attempts_status(username)
+        status = "Following" if state["following"] else "Requested"
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"✅ Reels Follow confirmed [{status}]; "
+                f"daily follows={used_after}/{cap_after}."
+            ),
+        )
+        return True
 
     update_account_metric(
         username,
         "add_history",
-        value="⚠️ Reels Demo Follow state ambiguous; not counted confirmed.",
+        value="⚠️ Reels Follow state ambiguous; not counted confirmed.",
     )
     return False
+
+
+def _browser_visible_reel_state(page) -> dict:
+    """
+    Snapshot the current visible reel's key relationship/action states.
+    Uses exact SVG/button labels only.
+    """
+    scope = _browser_visible_reel_scope(page)
+
+    def svg_visible(label):
+        try:
+            locs = scope.locator(f"svg[aria-label='{label}']")
+            for i in range(min(locs.count(), 8)):
+                if locs.nth(i).is_visible(timeout=100):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def button_visible(label):
+        try:
+            locs = scope.get_by_role(
+                "button",
+                name=re.compile(rf"^{re.escape(label)}$", re.I),
+            )
+            for i in range(min(locs.count(), 8)):
+                if locs.nth(i).is_visible(timeout=100):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    return {
+        "liked": svg_visible("Unlike"),
+        "like_available": svg_visible("Like"),
+        "saved": (
+            svg_visible("Remove")
+            or svg_visible("Unsave")
+        ),
+        "save_available": svg_visible("Save"),
+        "reposted": (
+            svg_visible("Remove repost")
+            or svg_visible("Undo repost")
+            or svg_visible("Reposted")
+        ),
+        "repost_available": svg_visible("Repost"),
+        "following": button_visible("Following"),
+        "requested": button_visible("Requested"),
+        "follow_available": button_visible("Follow"),
+    }
+
+
+def _browser_find_strict_reel_svg(page, label: str):
+    """
+    Exact action SVG in the CURRENT visible reel only.
+
+    No page-global fallback. This prevents a neighboring reel or another action
+    container from being clicked by mistake.
+    """
+    scope = _browser_visible_reel_scope(page)
+
+    try:
+        locs = scope.locator(
+            f"svg[aria-label='{str(label).replace(chr(39), '')}']"
+        )
+    except Exception:
+        return None
+
+    for i in range(min(locs.count(), 10)):
+        svg = locs.nth(i)
+        try:
+            if not svg.is_visible(timeout=120):
+                continue
+
+            clickable = _browser_clickable_from_svg(svg)
+            if not clickable.is_visible(timeout=120):
+                continue
+
+            # Verify the clickable ancestor really contains the requested SVG,
+            # and reject controls that also contain Like/Unlike when targeting
+            # another action.
+            labels = clickable.locator(
+                "svg[aria-label]"
+            ).evaluate_all(
+                """els => els.map(e => e.getAttribute('aria-label') || '')
+                             .filter(Boolean)"""
+            )
+
+            normalized = [str(x) for x in labels]
+
+            if label not in normalized:
+                continue
+
+            if label not in {"Like", "Unlike"} and any(
+                x in {"Like", "Unlike"}
+                for x in normalized
+            ):
+                continue
+
+            return svg
+        except Exception:
+            continue
+
+    return None
+
+
+def _browser_assert_reel_still_liked(
+    page,
+    username: str,
+    *,
+    expected_liked: bool,
+    after_action: str,
+) -> bool:
+    """
+    Defensive invariant: non-Like actions must never toggle a liked reel off.
+
+    If the reel was liked before the action but now exposes an exact Like icon,
+    stop the current reel action cycle instead of continuing with uncertain DOM.
+    """
+    if not expected_liked:
+        return True
+
+    state = _browser_visible_reel_state(page)
+
+    if state["liked"]:
+        return True
+
+    if state["like_available"]:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"🛑 Reels liked-state guard: the reel was liked before "
+                f"{after_action}, but now shows Like. Stopping this reel "
+                "cycle to avoid further accidental toggles."
+            ),
+        )
+        return False
+
+    update_account_metric(
+        username,
+        "add_history",
+        value=(
+            f"⚠️ Reels liked-state guard could not confirm the heart state "
+            f"after {after_action}; leaving it untouched."
+        ),
+    )
+    return True
+
+
+def _short_shared_gap_seconds(reason: str) -> int:
+    """
+    Parse short account/global pacing gaps that are worth waiting through in
+    the current reel action cycle.
+    """
+    lower = str(reason or "").lower()
+    if not any(
+        marker in lower
+        for marker in (
+            "shared account gap",
+            "shared multi-process gap",
+            "shared global gap",
+        )
+    ):
+        return 0
+
+    seconds = _retry_seconds_from_reason(reason)
+    if 0 < seconds <= 40:
+        return seconds
+    return 0
 
 def _browser_demo_like(
     page,
@@ -9575,23 +9782,25 @@ def _browser_demo_like(
 ) -> bool:
     history.setdefault("browser_liked_urls", [])
 
-    if (
-        href in history["browser_liked_urls"]
-        or _browser_find_svg_action_visible(page, ("Unlike",)) is not None
-    ):
+    state = _browser_visible_reel_state(page)
+
+    if state["liked"]:
+        if href not in history["browser_liked_urls"]:
+            history["browser_liked_urls"].append(href)
+            history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
         update_account_metric(
             username,
             "add_history",
-            value="❤️ Visible reel is already liked; leaving it liked.",
+            value="❤️ Visible reel is already liked; heart will not be clicked.",
         )
         return True
 
-    like_svg = _browser_find_svg_action_visible(page, ("Like",))
+    like_svg = _browser_find_strict_reel_svg(page, "Like")
     if like_svg is None:
         update_account_metric(
             username,
             "add_history",
-            value="↪️ Reels Like control is not visible on this reel.",
+            value="↪️ Reels Like control is not visible in the current reel.",
         )
         return False
 
@@ -9615,7 +9824,8 @@ def _browser_demo_like(
         )
         return False
 
-    if _browser_find_svg_action_visible(page, ("Unlike",)) is not None:
+    state = _browser_visible_reel_state(page)
+    if state["liked"]:
         record_write(username, "like")
         history["browser_liked_urls"].append(href)
         history["browser_liked_urls"] = history["browser_liked_urls"][-5000:]
@@ -9634,6 +9844,7 @@ def _browser_demo_like(
         value="⚠️ Reels Like was not visibly confirmed.",
     )
     return False
+
 
 
 def _browser_reel_action_blocked_now(username: str, action: str) -> str:
@@ -9664,14 +9875,20 @@ def _browser_run_reel_action_cycle(
     history: dict,
     prepared_comment: str,
     *,
-    max_cycle_seconds: int = 95,
+    max_cycle_seconds: int = 145,
 ) -> tuple[int, list[str]]:
     """
     Shared manual/Auto Reels action engine.
 
-    Actions are shuffled once per reel. Short account/global gaps may be
-    revisited, but a long rolling-budget block ends the cycle cleanly instead
-    of polling every few seconds.
+    The action order is randomized once per reel.
+
+    Behavior:
+      * already-completed states do not consume write slots
+      * if the rolling window is FULL, unfinished writes are deferred cleanly
+      * if only the normal short account/global gap is blocking writes, the
+        current reel stays open and the engine waits through that gap once,
+        then continues the remaining actions
+      * non-Like actions are guarded against accidentally toggling Like off
     """
     actions = ["like", "save", "repost", "follow", "comment"]
     random.shuffle(actions)
@@ -9692,8 +9909,7 @@ def _browser_run_reel_action_cycle(
     pending = list(actions)
     completed = []
     confirmed = 0
-    deadline = time.monotonic() + max(20, int(max_cycle_seconds))
-    retry_round = 0
+    deadline = time.monotonic() + max(30, int(max_cycle_seconds))
 
     while pending and time.monotonic() < deadline:
         if get_account_safety_state(username)["active"]:
@@ -9702,17 +9918,17 @@ def _browser_run_reel_action_cycle(
         if _browser_engage_security_problem(page, username):
             break
 
-        deferred = []
+        next_pending = []
+        short_gap_values = []
         long_budget_blocked = []
-        progressed = False
 
         for action in pending:
             if time.monotonic() >= deadline:
-                deferred.append(action)
+                next_pending.append(action)
                 continue
 
             if _browser_engage_security_problem(page, username):
-                deferred.extend(
+                next_pending.extend(
                     a
                     for a in pending
                     if a not in completed and a != action
@@ -9729,7 +9945,6 @@ def _browser_run_reel_action_cycle(
                     ),
                 )
                 completed.append(action)
-                progressed = True
                 continue
 
             block_reason = _browser_reel_action_blocked_now(
@@ -9741,15 +9956,10 @@ def _browser_run_reel_action_cycle(
                 if _reason_is_long_rolling_budget(block_reason):
                     long_budget_blocked.append((action, block_reason))
                 else:
-                    deferred.append(action)
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value=(
-                            f"⏸️ Reels {action.title()} temporarily deferred: "
-                            f"{block_reason}"
-                        ),
-                    )
+                    short_gap = _short_shared_gap_seconds(block_reason)
+                    if short_gap:
+                        short_gap_values.append(short_gap)
+                    next_pending.append(action)
                 continue
 
             update_account_metric(
@@ -9796,6 +10006,8 @@ def _browser_run_reel_action_cycle(
                 )
 
             elif action == "comment":
+                liked_before = _browser_visible_reel_state(page)["liked"]
+
                 ok = _browser_submit_prepared_reel_comment(
                     page,
                     username,
@@ -9804,25 +10016,38 @@ def _browser_run_reel_action_cycle(
                     prepared_comment,
                     max_wait=0,
                 )
+
                 try:
                     page.keyboard.press("Escape")
-                    page.wait_for_timeout(300)
+                    page.wait_for_timeout(350)
                 except Exception:
                     pass
 
+                if not _browser_assert_reel_still_liked(
+                    page,
+                    username,
+                    expected_liked=liked_before,
+                    after_action="Comment",
+                ):
+                    completed.append(action)
+                    if ok:
+                        confirmed += 1
+                    pending = [
+                        a for a in next_pending
+                        if a not in completed
+                    ]
+                    return confirmed, completed
+
             completed.append(action)
-            progressed = True
+
             if ok:
                 confirmed += 1
 
             if _browser_engage_security_problem(page, username):
                 break
 
-            page.wait_for_timeout(random.randint(350, 850))
+            page.wait_for_timeout(random.randint(350, 750))
 
-        # If the rolling window is full, there is no benefit to polling every
-        # 2-4 seconds. End this reel cycle and let Auto/rest scheduling reopen
-        # the window naturally.
         if long_budget_blocked:
             names = [a.title() for a, _ in long_budget_blocked]
             retry_values = [
@@ -9837,7 +10062,7 @@ def _browser_run_reel_action_cycle(
                 username,
                 "add_history",
                 value=(
-                    f"⏳ Reels shared rolling write budget is full "
+                    f"⏳ Reels rolling write budget is full "
                     f"({latest['used']}/{latest['max']}); "
                     f"deferring {', '.join(names)} to a later pass"
                     + (
@@ -9848,58 +10073,91 @@ def _browser_run_reel_action_cycle(
                 ),
             )
 
-            deferred.extend(
+            next_pending.extend(
                 action
                 for action, _ in long_budget_blocked
+                if action not in completed
             )
             pending = [
-                action
-                for action in deferred
-                if action not in completed
+                a for a in next_pending
+                if a not in completed
             ]
             break
 
         pending = [
-            action
-            for action in deferred
-            if action not in completed
+            a for a in next_pending
+            if a not in completed
         ]
 
         if not pending:
             break
 
-        if get_account_safety_state(username)["active"]:
-            break
+        # We still have budget capacity. If the only issue is the normal
+        # short account/global gap, wait the actual remaining gap once instead
+        # of polling every 2 seconds and giving up early.
+        latest = _shared_write_budget_status(username)
 
-        if time.monotonic() >= deadline:
-            break
+        if (
+            short_gap_values
+            and latest["remaining"] > 0
+        ):
+            wait_s = min(
+                max(short_gap_values) + 1,
+                41,
+            )
 
-        retry_round += 1
+            remaining_deadline = deadline - time.monotonic()
 
-        # Only short gaps are retried, and not indefinitely.
-        if retry_round >= 3:
+            if remaining_deadline <= 1:
+                break
+
+            wait_s = min(wait_s, max(1, int(remaining_deadline) - 1))
+
             update_account_metric(
                 username,
                 "add_history",
                 value=(
-                    "↪️ Reels short-gap retry limit reached; deferring "
+                    f"⏳ Reels has {latest['remaining']} shared write slot(s) "
+                    f"available; waiting ~{wait_s}s for the normal account/"
+                    f"global gap, then continuing: "
                     + ", ".join(a.title() for a in pending)
-                    + " to a later pass."
                 ),
             )
-            break
 
-        wait_s = random.uniform(2.0, 4.0)
+            wait_deadline = time.monotonic() + wait_s
+
+            while time.monotonic() < wait_deadline:
+                if get_account_safety_state(username)["active"]:
+                    break
+
+                if _browser_engage_security_problem(page, username):
+                    break
+
+                page.wait_for_timeout(
+                    int(
+                        min(
+                            1000,
+                            max(
+                                150,
+                                (wait_deadline - time.monotonic()) * 1000,
+                            ),
+                        )
+                    )
+                )
+
+            continue
+
+        # Unknown short blocker / pacing lock: do not spam the log.
         update_account_metric(
             username,
             "add_history",
             value=(
-                f"👀 Reels keeping the current reel visible for ~{wait_s:.1f}s "
-                f"before one short-gap retry: "
-                f"{', '.join(a.title() for a in pending)}"
+                "↪️ Reels could not make immediate progress on: "
+                + ", ".join(a.title() for a in pending)
+                + "; leaving them for a later pass."
             ),
         )
-        page.wait_for_timeout(int(wait_s * 1000))
+        break
 
     if pending:
         update_account_metric(
@@ -9910,8 +10168,18 @@ def _browser_run_reel_action_cycle(
                 + ", ".join(a.title() for a in pending)
             ),
         )
+    else:
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                "✅ Reels action cycle finished all applicable actions "
+                "for the current reel."
+            ),
+        )
 
     return confirmed, completed
+
 
 
 
@@ -9921,7 +10189,7 @@ def _browser_run_one_reel(
     history: dict,
     *,
     watch_seconds: float = 8.0,
-    max_cycle_seconds: int = 95,
+    max_cycle_seconds: int = 145,
 ) -> int:
     """
     Shared one-reel unit used by both manual Reels Demo and Auto Reels.
@@ -10022,7 +10290,7 @@ def _browser_auto_reels(username, history, config) -> int:
                 username,
                 history,
                 watch_seconds=8.0,
-                max_cycle_seconds=90,
+                max_cycle_seconds=135,
             )
 
             update_account_metric(
@@ -10121,7 +10389,7 @@ def _browser_reels_demo(username, history, config) -> int:
                 username,
                 history,
                 watch_seconds=10.0,
-                max_cycle_seconds=110,
+                max_cycle_seconds=145,
             )
 
         finally:
@@ -14842,7 +15110,7 @@ def main():
         AUTH_EVENT[user] = "disconnected"
         update_account_metric(user, "status", status="Disconnected / Auto Off")
 
-    print(f"Instagram Control Head — Reels Vision + Budget Fix: http://{IG_HOST}:{IG_PORT}")
+    print(f"Instagram Control Head — Reels Finish-All-Actions Fix: http://{IG_HOST}:{IG_PORT}")
     print(f"Instagram state root: {DOWNLOAD_ROOT}")
     print(f"Instagram media root: {get_media_root()}")
     print("Configured accounts: " + (", ".join(f"@{u}" for u in active_roster) if active_roster else "(none yet — add up to 3 in the Control Head)"))
