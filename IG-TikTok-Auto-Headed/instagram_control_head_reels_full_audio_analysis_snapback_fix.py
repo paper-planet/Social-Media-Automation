@@ -323,6 +323,12 @@ POST_SYNTHESIS_AI_TIMEOUT_SECONDS = max(
 POST_FINAL_AI_TIMEOUT_SECONDS = max(
     20, min(90, int(os.environ.get("IG_POST_FINAL_AI_TIMEOUT_SECONDS", "35")))
 )
+POST_IMAGE_VERIFY_AI_TIMEOUT_SECONDS = max(
+    30, min(120, int(os.environ.get("IG_POST_IMAGE_VERIFY_AI_TIMEOUT_SECONDS", "70")))
+)
+POST_CAPTION_QA_TIMEOUT_SECONDS = max(
+    12, min(60, int(os.environ.get("IG_POST_CAPTION_QA_TIMEOUT_SECONDS", "24")))
+)
 REEL_VISION_AI_TIMEOUT_SECONDS = max(
     45, min(180, int(os.environ.get("IG_REEL_VISION_AI_TIMEOUT_SECONDS", "100")))
 )
@@ -1520,6 +1526,79 @@ def _transcribe_local_post_media(video_path, username):
             pass
 
 
+def _static_image_analysis_views(image_path, max_views=5):
+    """Create high-resolution overlapping views so a static image is not judged from one thumbnail-like pass."""
+    image_path = Path(image_path)
+    views = [image_path]
+    try:
+        from PIL import Image, ImageOps
+        root = DOWNLOAD_ROOT / "static_image_grounding_views"
+        root.mkdir(parents=True, exist_ok=True)
+        with Image.open(image_path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            w, h = im.size
+            if w < 320 or h < 320:
+                return views
+
+            # Four overlapping crops preserve context while making small medical/text/detail cues easier to see.
+            cw = max(240, int(w * 0.68))
+            ch = max(240, int(h * 0.68))
+            boxes = [
+                (0, 0, cw, ch),
+                (max(0, w-cw), 0, w, ch),
+                (0, max(0, h-ch), cw, h),
+                (max(0, w-cw), max(0, h-ch), w, h),
+            ]
+            stamp = f"{image_path.stat().st_size}_{image_path.stat().st_mtime_ns}"
+            safe = re.sub(r"[^A-Za-z0-9_-]+", "_", image_path.stem)[:60]
+            for i, box in enumerate(boxes, 1):
+                crop = im.crop(box)
+                # Keep enough pixels for small text/details without sending absurdly huge images.
+                max_dim = max(crop.size)
+                if max_dim > 1800:
+                    scale = 1800 / float(max_dim)
+                    crop = crop.resize((max(1, int(crop.width*scale)), max(1, int(crop.height*scale))))
+                p = root / f"{safe}_{stamp}_{i}.jpg"
+                if not p.exists() or p.stat().st_size < 2048:
+                    crop.save(p, quality=92)
+                views.append(p)
+                if len(views) >= max_views:
+                    break
+    except Exception:
+        pass
+    return views[:max_views]
+
+
+def _static_image_local_ocr(image_path):
+    """Best-effort OCR. It is evidence only; failure never blocks posting."""
+    exe = shutil.which("tesseract")
+    if not exe:
+        return ""
+    try:
+        r = subprocess.run(
+            [exe, str(image_path), "stdout", "--psm", "6"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode == 0:
+            value = re.sub(r"[ \t]+", " ", str(r.stdout or "")).strip()
+            return value[:8000]
+    except Exception:
+        pass
+    return ""
+
+
+def _image_audit_conflicts(primary, audit):
+    """Return True when the independent audit clearly says the first visual read was wrong."""
+    a = str(audit or "").lower()
+    if re.search(r"VERDICT\s*:\s*(?:CORRECT|REJECT|DISAGREE|OVERRIDE)", a):
+        return True
+    if "first interpretation is incorrect" in a or "primary interpretation is incorrect" in a:
+        return True
+    return False
+
+
 def analyze_media_for_caption(
     media_files,
     sidecar_text="",
@@ -1549,7 +1628,10 @@ def analyze_media_for_caption(
         except Exception:
             visual_files = []
     elif image:
-        visual_files = [image]
+        # Static images get the full image plus overlapping detail crops. This makes
+        # small text, illness/injury cues, charts, labels, and facial/body details much
+        # harder for a single thumbnail-like vision pass to miss.
+        visual_files = _static_image_analysis_views(image, max_views=5)
 
     if video and require_video_vision and (not vision_model or len(visual_files) < 3):
         return {
@@ -1590,23 +1672,41 @@ Rules:
 - Do not mention source handles, filenames, reposting, or archive metadata.
 """.strip()
         else:
-            prompt = """
-Analyze this social-media image carefully for caption and hashtag writing.
-If it contains substantial text, a screenshot, meme, sign, quote, argument,
-chart annotation, or written opinion, the WRITTEN CONTENT is a primary subject.
-Read and interpret it before describing background scenery.
+            local_ocr = _static_image_local_ocr(image) if image else ""
+            prompt = f"""
+Analyze this ONE static social-media image as a careful visual fact-checker, not a vibe generator.
+You are receiving the full image plus overlapping detail crops from that SAME image.
 
-Return:
+LOCAL OCR (may be imperfect; verify it against the image):
+{local_ocr or "(none available)"}
+
+First determine what the image ACTUALLY depicts from concrete evidence. Explicitly distinguish:
+- celebration / music / dance / nightlife
+- illness / injury / distress / medical or radiation-themed imagery
+- ordinary portrait / street / landscape / object / screenshot / meme / chart / text post
+Do not choose a positive/celebratory interpretation merely because there are bright colors, lights, poses, or motion-like shapes.
+Do not diagnose a medical condition or call something radiation sickness unless readable text or unmistakable depicted context supports it.
+If the image is an illustration, meme, screenshot, poster, diagram, or staged scene, say so.
+
+Return exactly these labeled sections:
 PERSPECTIVE: SELFIE_VLOG | THIRD_PERSON | UNKNOWN
-VISIBLE_TEXT: transcribe/summarize important readable text accurately.
-VISUAL_CONTEXT: what is physically visible besides the text.
-MAIN_POINT: what the image/text is actually communicating or arguing.
-KEY_DETAILS: 4-8 specific grounded details.
+SUBJECT: the most likely literal subject/category of the image.
+VISUAL_EVIDENCE: 5-10 concrete visible cues supporting SUBJECT.
+VISIBLE_TEXT: important readable text; quote only text you can actually read.
+AFFECT_OR_CONDITION: what the depicted mood/condition appears to be, with uncertainty.
+MAIN_POINT: what the image/text is actually communicating or depicting.
+WHAT_IT_IS_NOT: plausible but unsupported interpretations that should be rejected.
+CONFIDENCE: HIGH | MEDIUM | LOW
 CAPTION_ANGLES: 3-5 grounded caption angles.
 HASHTAG_TOPICS: 6-10 specific searchable subject/topic phrases.
 AVOID_CLAIMS: unsupported inferences to avoid.
 
-Do not identify people by name, infer private traits, mention usernames/files, or invent topics.
+Rules:
+- Ground every conclusion in visible evidence or readable text.
+- If evidence is ambiguous, say LOW confidence and use neutral language.
+- Do not invent music, dancing, parties, celebration, freedom, medical diagnoses, identities, locations, or events.
+- Do not identify people by name or infer private traits.
+- Do not mention usernames, filenames, source accounts, reposting, or archive metadata.
 """.strip()
 
         def run_vision():
@@ -1674,9 +1774,83 @@ Do not identify people by name, infer private traits, mention usernames/files, o
             except Exception:
                 pass
 
+    image_audit = ""
+    image_audit_conflict = False
+    if media_kind == "image" and vision_model and visual_files and visual_description:
+        audit_prompt = f"""
+Independently audit a FIRST visual interpretation of this SAME static image.
+You are also receiving the full image and detail crops. Do not trust the first interpretation.
+
+FIRST INTERPRETATION:
+{visual_description[:7000]}
+
+Your job is to catch a confident but wrong theme before it becomes a caption.
+Check especially for these failure modes:
+- calling illness, injury, distress, medical/radiation imagery a party, dance, music, freedom, or celebration
+- calling an ordinary wall/street scene climbing because a wall is visible
+- injecting finance/trading because the account happens to target those hashtags
+- ignoring large readable text, warning symbols, charts, diagrams, rashes/lesions, protective gear, hospital/medical cues, or other subject-defining details
+
+Return exactly:
+VERDICT: AGREE | CORRECT | UNCERTAIN
+CORRECTED_SUBJECT: literal subject/category if correction is needed.
+CONCRETE_EVIDENCE: 4-8 visual facts you can point to.
+CONTRADICTIONS: anything in the first interpretation not supported by the image.
+SAFE_SUMMARY: 1-3 grounded sentences a caption writer can trust.
+SAFE_HASHTAG_TOPICS: 5-8 specific subjects actually supported by the image.
+CONFIDENCE: HIGH | MEDIUM | LOW
+
+Do not diagnose a medical condition or assert radiation exposure unless the image/text actually supports that specific claim.
+If uncertain, choose UNCERTAIN and neutral wording instead of guessing.
+""".strip()
+        try:
+            audit_response = _ollama_chat_bounded(
+                model=vision_model,
+                messages=[{
+                    "role": "user",
+                    "content": audit_prompt,
+                    "images": [str(p) for p in visual_files],
+                }],
+                options=_ollama_hybrid_options(
+                    account_username,
+                    temperature=0.02,
+                    top_p=0.65,
+                    num_predict=360,
+                ),
+                timeout_seconds=POST_IMAGE_VERIFY_AI_TIMEOUT_SECONDS,
+            )
+            image_audit = str(
+                audit_response.get("message", {}).get("content", "")
+                if isinstance(audit_response, dict)
+                else ""
+            ).strip()
+            image_audit = re.sub(r"(?<!\w)@[A-Za-z0-9._]{2,}", "", image_audit).strip()[:6000]
+            image_audit_conflict = _image_audit_conflicts(visual_description, image_audit)
+            if account_username:
+                update_account_metric(
+                    account_username,
+                    "add_history",
+                    value=(
+                        "🔎 Static-image truth check finished: "
+                        + ("first visual read was corrected." if image_audit_conflict else "independent audit completed.")
+                    ),
+                )
+        except Exception as exc:
+            if account_username:
+                try:
+                    update_account_metric(
+                        account_username,
+                        "add_history",
+                        value=f"⚠️ Static-image truth check unavailable ({type(exc).__name__}); using primary grounded read.",
+                    )
+                except Exception:
+                    pass
+
     pieces = []
     if visual_description:
         pieces.append("VIDEO/IMAGE VISUAL ANALYSIS:\n" + visual_description)
+    if image_audit:
+        pieces.append("INDEPENDENT STATIC-IMAGE AUDIT:\n" + image_audit)
     if audio_transcript:
         pieces.append(
             "LOCAL AUDIO TRANSCRIPT"
@@ -1709,6 +1883,12 @@ KEY_DETAILS: 5-9 concrete details grounded in evidence.
 CAPTION_DIRECTIONS: 3-5 specific angles that fit this exact post.
 HASHTAG_CONCEPTS: 6-10 specific searchable concepts grounded in this post.
 AVOID_CLAIMS: unsupported facts/identities/locations to avoid.
+
+Additional grounding rules:
+- For static images, the INDEPENDENT STATIC-IMAGE AUDIT is a deliberate contradiction check. If it corrects the primary visual read, follow the correction.
+- Do not turn illness, injury, distress, medical/radiation imagery into celebratory/party/music language unless the evidence actually shows that.
+- Do not name a diagnosis, exposure, or cause unless readable text or unmistakable evidence supports it.
+- If confidence is low or the visual passes disagree, write a neutral literal summary and mark uncertain details as uncertain.
 
 Do not write the final caption yet. Do not invent missing facts.
 """.strip()
@@ -1768,6 +1948,8 @@ Do not write the final caption yet. Do not invent missing facts.
         "audio_transcript_chars": len(audio_transcript),
         "audio_backend": audio_backend,
         "deep_interpreted": bool(interpreted),
+        "image_audit": image_audit,
+        "image_audit_conflict": bool(image_audit_conflict),
     }
 
 
@@ -12888,9 +13070,12 @@ def _browser_post_topic(selection, analysis=None) -> str:
     finance_score = sum(term in blob for term in finance_terms)
     climbing_score = sum(term in blob for term in climbing_terms)
 
-    if finance_score > climbing_score and finance_score > 0:
+    strong_finance = any(term in blob for term in ("trading", "trader", "forex", "xau", "futures", "candlestick", "price action", "nasdaq", "options"))
+    strong_climbing = any(term in blob for term in ("climb", "climbing", "boulder", "bouldering", "rock climbing", "crag", "climbing gym", "route", "climber"))
+
+    if finance_score > climbing_score and (finance_score >= 2 or strong_finance):
         return "finance"
-    if climbing_score > finance_score and climbing_score > 0:
+    if climbing_score > finance_score and (climbing_score >= 2 or strong_climbing):
         return "climbing"
     return "general"
 
@@ -13387,6 +13572,9 @@ Rules:
 - Base BOTH the caption and hashtags on the supplied deep multimodal interpretation.
 - Use spoken words/audio, readable on-screen text, and beginning-to-end visual progression when present.
 - Prefer a specific observation/interpretation over a generic scene description.
+- Treat the independent image audit as a correction layer when present; do not revive themes it explicitly rejected.
+- Never describe illness/injury/distress imagery as carefree, celebratory, musical, dancing, partying, freedom, or self-expression unless those elements are concretely supported.
+- Never name a diagnosis or exposure that the analysis marks as uncertain.
 - Never mention source usernames, repost metadata, archive folders, or filenames.
 - Do not invent a location, identity, profession, event, or stock/trading topic.
 - Keep the caption under {char_limit} characters before hashtags.
@@ -13466,6 +13654,83 @@ Rules:
             max(20, char_limit - len(tag_line) - 2),
         )
     )
+
+    # Final semantic QA: catch a fluent caption that contradicts the grounded analysis.
+    qa_prompt = f"""
+Audit this proposed Instagram caption and hashtags against the grounded media analysis.
+
+GROUNDED ANALYSIS:
+{semantic_context[:12000]}
+
+PROPOSED CAPTION:
+{caption}
+
+PROPOSED HASHTAGS:
+{tag_line}
+
+Return exactly:
+VERDICT: KEEP | REWRITE
+CAPTION: <caption text>
+HASHTAGS: #tag1 #tag2 #tag3 #tag4 #tag5
+
+Rewrite if the proposal invents a theme, mood, event, diagnosis, identity, location, or subject not supported by the analysis.
+In particular, reject party/music/dance/celebration/freedom language for illness, injury, distress, or medical imagery unless the grounded evidence actually supports those themes.
+If the media is uncertain, prefer literal neutral wording rather than an imaginative interpretation.
+""".strip()
+    try:
+        qa_response = _ollama_chat_bounded(
+            model=OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a strict semantic consistency checker."},
+                {"role": "user", "content": qa_prompt},
+            ],
+            options=_ollama_hybrid_options(
+                username,
+                temperature=0.02,
+                top_p=0.65,
+                num_predict=150,
+            ),
+            timeout_seconds=POST_CAPTION_QA_TIMEOUT_SECONDS,
+        )
+        qa_raw = str(
+            qa_response.get("message", {}).get("content", "")
+            if isinstance(qa_response, dict)
+            else ""
+        ).strip()
+        verdict = re.search(r"VERDICT\s*:\s*(KEEP|REWRITE)", qa_raw, re.I)
+        if verdict and verdict.group(1).upper() == "REWRITE":
+            corrected_caption = _browser_extract_caption_from_ai(qa_raw)
+            corrected_tags = []
+            hm = re.search(r"HASHTAGS:\s*(.*)", qa_raw, re.I | re.S)
+            for token in re.findall(r"#[A-Za-z0-9_]+", hm.group(1) if hm else qa_raw):
+                if token not in corrected_tags:
+                    corrected_tags.append(token)
+                if len(corrected_tags) == 5:
+                    break
+            corrected_tags = _browser_preferred_post_hashtags(
+                username,
+                selection,
+                analysis,
+                ai_tags=corrected_tags,
+            )
+            if corrected_caption:
+                tag_line = " ".join(corrected_tags[:5])
+                caption = _strip_generation_edge_quotes(
+                    _clip_chars(
+                        corrected_caption,
+                        max(20, char_limit - len(tag_line) - 2),
+                    )
+                )
+                try:
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value="🧪 Caption semantic QA corrected a mismatch before posting.",
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     return {
         "caption": f"{caption}\n\n{tag_line}".strip(),
