@@ -132,6 +132,27 @@ MEDIA_FOLDER_CACHE = {"root":"", "mtime_ns":-1, "cached_at":0.0, "folders":[]}
 MEDIA_FOLDER_CACHE_SECONDS = max(10, int(os.environ.get("IG_MEDIA_FOLDER_CACHE_SECONDS", "60")))
 AUTH_RETRY_AFTER = {}  # username -> datetime; prevents rapid login loops
 
+# --- LOW-REQUEST / COMPLIANCE-FIRST BROWSER COORDINATION ---
+# These controls reduce redundant Instagram requests and repeated session churn.
+# They are intentionally not "stealth" controls and do not bypass platform limits.
+BROWSER_LAST_NAV_AT = {}          # (username, canonical_url) -> monotonic timestamp
+BROWSER_LAST_RELOAD_AT = {}       # username -> monotonic timestamp
+BROWSER_LAST_STORAGE_SAVE_AT = {} # username -> monotonic timestamp
+BROWSER_LAST_PREFLIGHT_AT = {}     # username -> monotonic timestamp
+BROWSER_PREFLIGHT_OK = {}          # username -> bool
+BROWSER_NAV_REVISIT_SECONDS = max(15, int(os.environ.get("IG_BROWSER_NAV_REVISIT_SECONDS", "45")))
+BROWSER_RELOAD_COOLDOWN_SECONDS = max(60, int(os.environ.get("IG_BROWSER_RELOAD_COOLDOWN_SECONDS", "120")))
+BROWSER_STORAGE_SAVE_INTERVAL_SECONDS = max(60, int(os.environ.get("IG_BROWSER_STORAGE_SAVE_INTERVAL_SECONDS", "180")))
+BROWSER_PREFLIGHT_CACHE_SECONDS = max(30, int(os.environ.get("IG_BROWSER_PREFLIGHT_CACHE_SECONDS", "90")))
+BROWSER_REEL_POOL_TTL_SECONDS = max(120, int(os.environ.get("IG_BROWSER_REEL_POOL_TTL_SECONDS", "600")))
+# Browser login stays browser-native by default. The private API can be explicitly
+# re-enabled for users who need it, but avoiding the extra login/feed probe reduces
+# duplicate authenticated request paths.
+BROWSER_PRIVATE_API_UPGRADE = os.environ.get("IG_BROWSER_PRIVATE_API_UPGRADE", "0").strip().lower() in {"1","true","yes","on"}
+# Auto-follow is deliberately conservative. User setting remains a ceiling, but
+# compliance-first Auto will never bundle more than this many writes in one popup.
+AUTO_FOLLOW_COMPLIANCE_CAP = max(1, min(3, int(os.environ.get("IG_AUTO_FOLLOW_COMPLIANCE_CAP", "3"))) )
+
 # One-account instances can keep DMs responsive without making posting/actions frequent.
 DM_POLL_SECONDS = max(300, int(os.environ.get("IG_DM_POLL_SECONDS", "1800")))
 WORKFLOW_SLEEP_MIN = max(DM_POLL_SECONDS, int(os.environ.get("IG_WORKFLOW_SLEEP_MIN", "420")))
@@ -257,11 +278,11 @@ DM_MAX_MESSAGE_AGE_HOURS = max(1, int(os.environ.get("IG_DM_MAX_MESSAGE_AGE_HOUR
 # --- CONSERVATIVE WRITE PACING ---
 # These govern WRITE actions only (likes, follows, comments, DMs, uploads).
 # Read/polling actions such as DM checks do not consume the write budget.
-WRITE_MIN_GAP_SECONDS = max(10, int(os.environ.get("IG_WRITE_MIN_GAP_SECONDS", "40")))
-GLOBAL_WRITE_MIN_GAP_SECONDS = max(8, int(os.environ.get("IG_GLOBAL_WRITE_MIN_GAP_SECONDS", "18")))
-WRITE_WINDOW_SECONDS = max(60, int(os.environ.get("IG_WRITE_WINDOW_SECONDS", "1200")))
-MAX_WRITES_PER_WINDOW = max(1, int(os.environ.get("IG_MAX_WRITES_PER_WINDOW", "6")))
-MAX_WRITES_PER_WORKFLOW = max(1, int(os.environ.get("IG_MAX_WRITES_PER_WORKFLOW", "3")))
+WRITE_MIN_GAP_SECONDS = max(30, int(os.environ.get("IG_WRITE_MIN_GAP_SECONDS", "75")))
+GLOBAL_WRITE_MIN_GAP_SECONDS = max(20, int(os.environ.get("IG_GLOBAL_WRITE_MIN_GAP_SECONDS", "45")))
+WRITE_WINDOW_SECONDS = max(300, int(os.environ.get("IG_WRITE_WINDOW_SECONDS", "1800")))
+MAX_WRITES_PER_WINDOW = max(1, min(6, int(os.environ.get("IG_MAX_WRITES_PER_WINDOW", "4"))))
+MAX_WRITES_PER_WORKFLOW = max(1, min(4, int(os.environ.get("IG_MAX_WRITES_PER_WORKFLOW", "2"))))
 
 BROWSER_FOLLOW_MIN_GAP_SECONDS = max(
     4,
@@ -415,10 +436,10 @@ def apply_account_safety_backoff(username, reason, level="restricted", hours=Non
 
     if hours is None:
         hours = {
-            "restricted": 12,
-            "throttle": 2,
-            "verification": 4,
-        }.get(level, 2)
+            "restricted": 24,
+            "throttle": 6,
+            "verification": 12,
+        }.get(level, 6)
 
     reason = re.sub(r"\s+", " ", str(reason or "Instagram restriction signal")).strip()[:500]
     until_ts = time.time() + float(hours) * 3600.0
@@ -4879,6 +4900,69 @@ Return the token only.
             pass
 
 
+def _browser_canonical_url(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    value = value.split("#", 1)[0]
+    # Query strings on Instagram are often tracking/UI state and should not force
+    # a duplicate navigation when the underlying page is already visible.
+    value = value.split("?", 1)[0]
+    return value.rstrip("/") or value
+
+
+def _browser_nav_if_needed(page, username: str, url: str, *, settle_ms: int = 650, force: bool = False) -> bool:
+    """Navigate only when the requested Instagram page is not already current.
+
+    This removes redundant page.goto()/refresh traffic. It is a request-reduction
+    helper, not an anti-detection mechanism.
+    """
+    wanted = _browser_canonical_url(url)
+    try:
+        current = _browser_canonical_url(page.url)
+    except Exception:
+        current = ""
+
+    if not force and current == wanted and current:
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        if settle_ms:
+            page.wait_for_timeout(min(350, max(0, int(settle_ms))))
+        return False
+
+    key = (str(username or "").strip().lstrip("@"), wanted)
+    now = time.monotonic()
+    last = float(BROWSER_LAST_NAV_AT.get(key, 0.0) or 0.0)
+    # If we are already on the same page, the check above returned. If not, a real
+    # navigation is required; the timestamp is telemetry only, not a bypass.
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    BROWSER_LAST_NAV_AT[key] = now
+    if settle_ms:
+        page.wait_for_timeout(max(0, int(settle_ms)))
+    return True
+
+
+def _browser_reload_if_due(page, username: str, *, reason: str = "") -> bool:
+    username = str(username or "").strip().lstrip("@")
+    now = time.monotonic()
+    last = float(BROWSER_LAST_RELOAD_AT.get(username, 0.0) or 0.0)
+    if now - last < BROWSER_RELOAD_COOLDOWN_SECONDS:
+        update_account_metric(
+            username, "add_history",
+            value=(
+                f"🧊 Suppressed redundant reload during {reason or 'browser recovery'}; "
+                f"reload cooldown has {int(BROWSER_RELOAD_COOLDOWN_SECONDS - (now-last))}s remaining."
+            ),
+        )
+        return False
+    page.reload(wait_until="domcontentloaded", timeout=60000)
+    BROWSER_LAST_RELOAD_AT[username] = now
+    page.wait_for_timeout(900)
+    return True
+
+
 def _browser_execute_safe_nav_action(page, context, username: str, action: str) -> bool:
     """Execute only the fixed safe-action allowlist."""
     action = str(action or "").strip().upper()
@@ -4928,9 +5012,7 @@ def _browser_execute_safe_nav_action(page, context, username: str, action: str) 
 
     if action == "RELOAD":
         try:
-            page.reload(wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(900)
-            return True
+            return _browser_reload_if_due(page, username, reason="adaptive recovery")
         except Exception:
             return False
 
@@ -5393,10 +5475,19 @@ def _restore_saved_browser_session(context, username: str) -> bool:
     return _browser_context_logged_in(context)
 
 
-def _browser_refresh_saved_sessionid(context, username: str) -> None:
+def _browser_refresh_saved_sessionid(context, username: str, *, force: bool = False) -> None:
+    """Persist rotated auth state, but not after every tiny browser operation.
+
+    Storage-state snapshots are local disk work, yet fetching cookie/storage state
+    on every pass adds unnecessary browser/CDP churn. Save at a bounded interval
+    unless a login/explicit caller forces it.
     """
-    Persist rotated sessionid and refresh the complete Playwright storage state.
-    """
+    username = str(username or "").strip().lstrip("@")
+    now = time.monotonic()
+    last = float(BROWSER_LAST_STORAGE_SAVE_AT.get(username, 0.0) or 0.0)
+    if not force and now - last < BROWSER_STORAGE_SAVE_INTERVAL_SECONDS:
+        return
+
     try:
         cookies = context.cookies("https://www.instagram.com/")
         sessionid = next(
@@ -5416,6 +5507,7 @@ def _browser_refresh_saved_sessionid(context, username: str) -> None:
         _save_full_browser_storage_state(context, username)
     except Exception:
         pass
+    BROWSER_LAST_STORAGE_SAVE_AT[username] = now
 
 
 
@@ -5766,66 +5858,54 @@ def _browser_close_context(context) -> None:
 
 
 def _browser_preflight_login(username: str, *, headed: bool = False) -> bool:
-    """
-    Fast Browser Mode auth preflight.
+    """Low-request Browser Mode auth preflight.
 
-    When attached to the exact live Chromium session, inspect the current page
-    first instead of reloading it and potentially forcing Instagram back into a
-    saved-account resume state.
+    A recently verified live session is reused without a reload. A page reload is
+    reserved for an actual transient-load error and is separately rate-limited.
     """
     if sync_playwright is None:
         raise RuntimeError("Playwright is required for Browser Mode.")
 
+    username = str(username or "").strip().lstrip("@")
+    now = time.monotonic()
+    last = float(BROWSER_LAST_PREFLIGHT_AT.get(username, 0.0) or 0.0)
+    if BROWSER_PREFLIGHT_OK.get(username) and now - last < BROWSER_PREFLIGHT_CACHE_SECONDS and _browser_live_port_open(username):
+        return True
+
     with sync_playwright() as p:
-        context = _browser_launch(
-            p,
-            username,
-            headed=headed,
-        )
-        page = context.pages[0] if context.pages else context.new_page()
-        live_context = id(context) in LIVE_CDP_CONTEXT_IDS
+        context = _browser_launch(p, username, headed=headed)
+        page = _browser_pick_active_instagram_page(context)
 
         try:
             if "instagram.com" not in str(page.url or "").lower():
-                page.goto(
-                    "https://www.instagram.com/",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.wait_for_timeout(900)
-            elif live_context:
+                _browser_nav_if_needed(page, username, "https://www.instagram.com/", settle_ms=700)
+            else:
                 try:
                     page.bring_to_front()
                 except Exception:
                     pass
-                page.wait_for_timeout(500)
-            else:
-                page.reload(
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.wait_for_timeout(900)
+                page.wait_for_timeout(300)
 
-            _browser_check_ready(
-                page,
-                context,
-                username,
-            )
-            _browser_refresh_saved_sessionid(
-                context,
-                username,
-            )
+            problem = _browser_page_problem(page)
+            if problem:
+                raise RuntimeError(problem)
 
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "✅ Browser auth preflight passed against the current "
-                    "live Instagram page."
-                ),
-            )
+            # Do not reload an authenticated Instagram shell just to prove it again.
+            if not _browser_page_authenticated(page, username):
+                transient = _browser_transient_load_error(page)
+                if transient:
+                    _browser_reload_if_due(page, username, reason=f"preflight transient: {transient}")
+                _browser_safe_recover_page(page, context, username, reason="low-request auth preflight", max_steps=2)
+
+            _browser_check_ready(page, context, username)
+            _browser_refresh_saved_sessionid(context, username)
+            BROWSER_LAST_PREFLIGHT_AT[username] = time.monotonic()
+            BROWSER_PREFLIGHT_OK[username] = True
             return True
-
+        except Exception:
+            BROWSER_LAST_PREFLIGHT_AT[username] = time.monotonic()
+            BROWSER_PREFLIGHT_OK[username] = False
+            raise
         finally:
             _browser_close_context(context)
 
@@ -5948,14 +6028,15 @@ def _browser_click_text_button(scope, pattern, timeout=5000):
     return False
 
 
-def _browser_collect_profile_media_links(page, username: str) -> set[str]:
+def _browser_collect_profile_media_links(page, username: str, *, navigate: bool = True) -> set[str]:
     try:
-        page.goto(
-            f"https://www.instagram.com/{username.lstrip('@')}/",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        page.wait_for_timeout(1400)
+        if navigate:
+            _browser_nav_if_needed(
+                page,
+                username,
+                f"https://www.instagram.com/{username.lstrip('@')}/",
+                settle_ms=900,
+            )
         hrefs = page.locator(
             "a[href*='/p/'], a[href*='/reel/']"
         ).evaluate_all(
@@ -7299,7 +7380,7 @@ def _next_overnight_auto_delay(username: str, result: str, *, manual_run: bool =
             return max(WORKFLOW_RETRY_IDLE_SECONDS, 300), "idle/disconnected"
         return WORKFLOW_RETRY_IDLE_SECONDS, "retry"
     if manual_run:
-        return random.randint(15, 30), "brief rest after manual action"
+        return random.randint(60, 120), "brief rest after manual action"
 
     pace_mode = _runtime_pace_mode(username)
     if pace_mode == "overnight":
@@ -7366,10 +7447,12 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
             min(
                 AUTO_FOLLOW_BATCH_MAX,
                 int(settings.get("auto_follow_batch_max", AUTO_FOLLOW_BATCH_MAX)),
-                12,
+                AUTO_FOLLOW_COMPLIANCE_CAP,
             ),
         )
-        limit = random.randint(AUTO_FOLLOW_BATCH_MIN, auto_cap)
+        # Variable batch sizes spread workload across sessions, but the compliance
+        # cap remains the hard ceiling and is intentionally small.
+        limit = random.randint(1, auto_cap)
 
     daily_used, daily_cap = _daily_follow_attempts_status(username)
 
@@ -7410,12 +7493,9 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
         page = context.pages[0] if context.pages else context.new_page()
 
         try:
-            page.goto(
-                f"https://www.instagram.com/{target}/",
-                wait_until="domcontentloaded",
-                timeout=60000,
+            _browser_nav_if_needed(
+                page, username, f"https://www.instagram.com/{target}/", settle_ms=900
             )
-            page.wait_for_timeout(1400)
 
             # Recover the normal saved-profile chooser at most once, then
             # return to the requested target profile once.
@@ -7425,12 +7505,9 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                     context,
                     username,
                 )
-                page.goto(
-                    f"https://www.instagram.com/{target}/",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
+                _browser_nav_if_needed(
+                    page, username, f"https://www.instagram.com/{target}/", settle_ms=900, force=True
                 )
-                page.wait_for_timeout(1400)
 
             _browser_check_ready(page, context, username)
 
@@ -12352,138 +12429,80 @@ def _browser_pick_active_instagram_page(context):
     return pages[-1]
 
 def _browser_auto_reels(username, history, config) -> int:
-    """
-    Auto Engage now uses the same Reels engine as the manual demo.
+    """Low-request hashtag-focused Reels pass.
 
-    One Auto Engage pass handles one visible reel. Overnight active sessions can
-    perform multiple such passes according to the hub's active-session pass
-    count.
+    Reel permalinks discovered from a configured hashtag are cached and reused
+    across several passes. This avoids reloading the same hashtag page for every
+    single Reel. The action engine and safety checks are unchanged.
     """
     settings = get_account_control_settings(username, config)
-
     if not settings.get("enable_engage", False):
         return 0
 
-    update_account_metric(
-        username,
-        "add_history",
-        value=(
-            "🎞️ Auto Reels pass starting: predefined-hashtag Reel discovery first, "
-            "then shared reel engine with deferred pacing-blocked actions."
-        ),
-    )
-
     with sync_playwright() as p:
-        context = _browser_launch(
-            p,
-            username,
-            headed=None,
-        )
+        context = _browser_launch(p, username, headed=None)
         page = _browser_pick_active_instagram_page(context)
-
         try:
-            # Prefer Reels discovered under the user's configured hashtags.
-            # Generic /reels/ is now only a fallback when a configured hashtag
-            # does not expose any Reel links in the current web layout.
             tags = _normalize_hashtag_list(
-                settings.get("target_hashtags")
-                or list(config.get("target_hashtags") or [])
+                settings.get("target_hashtags") or list(config.get("target_hashtags") or [])
             )
             selected_tag = ""
             selected_reel = ""
 
-            if tags:
+            now = time.time()
+            pool = history.get("browser_reels_cached_pool", [])
+            pool = pool if isinstance(pool, list) else []
+            pool_tag = str(history.get("browser_reels_cached_tag", "") or "")
+            pool_at = float(history.get("browser_reels_cached_at", 0.0) or 0.0)
+            seen = set(history.get("browser_liked_urls", [])) | set(history.get("browser_commented_urls", []))
+            pool = [str(x) for x in pool if str(x) and str(x) not in seen]
+
+            # Reuse a fresh hashtag pool before making another hashtag-page request.
+            if pool and now - pool_at <= BROWSER_REEL_POOL_TTL_SECONDS:
+                selected_tag = pool_tag
+                selected_reel = pool.pop(0)
+                history["browser_reels_cached_pool"] = pool
+                update_account_metric(
+                    username, "add_history",
+                    value=(
+                        f"♻️ Reusing cached #{selected_tag} Reel pool; "
+                        f"{len(pool)} cached Reel(s) remain. No hashtag refresh this pass."
+                    ),
+                )
+            elif tags:
                 tag_index = int(history.get("browser_reels_hashtag_index", 0) or 0)
                 selected_tag = tags[tag_index % len(tags)].lstrip("#")
                 history["browser_reels_hashtag_index"] = tag_index + 1
 
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        f"#️⃣ Auto Reels focusing on predefined hashtag #{selected_tag}; "
-                        "collecting Reel links only."
-                    ),
-                )
-
-                page.goto(
-                    f"https://www.instagram.com/explore/tags/{selected_tag}/",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.wait_for_timeout(1200)
+                tag_url = f"https://www.instagram.com/explore/tags/{selected_tag}/"
+                _browser_nav_if_needed(page, username, tag_url, settle_ms=900)
                 _browser_check_ready(page, context, username)
 
                 reel_links = _browser_collect_hashtag_reel_links(
                     page,
                     username,
-                    target_count=max(8, int(settings.get("engage_clips_per_pass", 12))),
-                    scroll_steps=max(3, min(10, int(settings.get("engage_scroll_steps", 8)))),
-                )
-
-                seen = set(history.get("browser_liked_urls", [])) | set(
-                    history.get("browser_commented_urls", [])
+                    target_count=max(6, min(16, int(settings.get("engage_clips_per_pass", 12)))),
+                    scroll_steps=max(2, min(6, int(settings.get("engage_scroll_steps", 8)))),
                 )
                 fresh_links = [href for href in reel_links if href not in seen]
-                pool = fresh_links or reel_links
-                if pool:
-                    selected_reel = random.choice(pool[: max(1, min(len(pool), 20))])
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value=(
-                            f"🎯 Hashtag Reels selected a Reel from #{selected_tag}: "
-                            f"{selected_reel}"
-                        ),
-                    )
-                    page.goto(
-                        selected_reel,
-                        wait_until="domcontentloaded",
-                        timeout=60000,
-                    )
-                    page.wait_for_timeout(1000)
+                if fresh_links:
+                    # Preserve discovery order and consume sequentially; this avoids
+                    # repeatedly querying the hashtag grid between individual Reels.
+                    selected_reel = fresh_links[0]
+                    history["browser_reels_cached_pool"] = fresh_links[1:12]
+                    history["browser_reels_cached_tag"] = selected_tag
+                    history["browser_reels_cached_at"] = now
 
-            if not selected_reel:
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        "ℹ️ No Reel permalink was available from the selected configured "
-                        "hashtag; falling back to the generic Reels feed for this pass."
-                        if tags
-                        else "ℹ️ No target hashtags configured; using the generic Reels feed."
-                    ),
-                )
-                page.goto(
-                    "https://www.instagram.com/reels/",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                page.wait_for_timeout(1200)
+            if selected_reel:
+                _browser_nav_if_needed(page, username, selected_reel, settle_ms=700)
+            else:
+                _browser_nav_if_needed(page, username, "https://www.instagram.com/reels/", settle_ms=900)
 
             _browser_check_ready(page, context, username)
-
             if get_account_safety_state(username)["active"]:
                 return 0
 
-            comment_intent = _reels_should_comment_auto(
-                username,
-                settings,
-            )
-
-            update_account_metric(
-                username,
-                "add_history",
-                value=(
-                    "🎯 Auto Reels comment decision: "
-                    + (
-                        "COMMENT — running deep analysis."
-                        if comment_intent
-                        else "NO COMMENT — skipping deep vision analysis."
-                    )
-                ),
-            )
-
+            comment_intent = _reels_should_comment_auto(username, settings)
             confirmed = _browser_run_one_reel(
                 page,
                 username,
@@ -12494,49 +12513,20 @@ def _browser_auto_reels(username, history, config) -> int:
             )
 
             update_account_metric(
-                username,
-                "add_history",
+                username, "add_history",
                 value=(
-                    f"🎞️ Auto Reels pass finished; "
-                    f"confirmed/retained actions={confirmed}. "
-                    "This entire reel counts as exactly 1 active-session pass."
+                    f"🎞️ Auto Reels pass finished; confirmed/retained actions={confirmed}. "
+                    + (f"Source=#{selected_tag}." if selected_tag else "Generic fallback source.")
                 ),
             )
-
-            # Hashtag-focused Auto Reels deliberately re-enters the configured
-            # hashtag source on the next pass instead of drifting into Instagram's
-            # unrelated generic Reel recommendations.
-            if selected_tag:
-                update_account_metric(
-                    username,
-                    "add_history",
-                    value=(
-                        f"#️⃣ Auto Reels will source the next pass from the configured "
-                        f"hashtag rotation instead of continuing the generic Reel feed."
-                    ),
-                )
-            else:
-                try:
-                    if _browser_reels_scroll_next(page):
-                        update_account_metric(
-                            username,
-                            "add_history",
-                            value=(
-                                "↕️ Auto Reels advanced once and left the next reel "
-                                "visible for the next pass."
-                            ),
-                        )
-                except Exception:
-                    pass
-
             return confirmed
-
         finally:
             try:
                 _browser_refresh_saved_sessionid(context, username)
             except Exception:
                 pass
             _browser_close_context(context)
+
 
 def _browser_reels_demo(username, history, config) -> int:
     """
@@ -13802,19 +13792,29 @@ def _browser_upload_failure_signal(page) -> str:
     return ""
 
 def _browser_find_new_permalink_after_share(page, username: str, before_links: set[str], timeout_seconds: int = 60) -> str:
-    """Resolve a permalink only after Instagram explicitly confirmed the share."""
+    """Resolve a permalink after Instagram explicitly confirmed the share.
+
+    Low-request version: at most four profile checks, with one navigation per
+    check. The upload is already considered successful from Instagram's explicit
+    confirmation even if permalink resolution is delayed.
+    """
     deadline = time.time() + max(10, int(timeout_seconds))
-    while time.time() < deadline:
+    attempts = 0
+    while time.time() < deadline and attempts < 4:
+        attempts += 1
         try:
-            page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1200)
+            _browser_nav_if_needed(
+                page, username, f"https://www.instagram.com/{username}/",
+                settle_ms=900, force=(attempts > 1),
+            )
         except Exception:
             pass
-        current = _browser_collect_profile_media_links(page, username)
+        current = _browser_collect_profile_media_links(page, username, navigate=False)
         new_links = current - before_links
         if new_links:
             return sorted(new_links)[-1]
-        page.wait_for_timeout(2500)
+        if attempts < 4 and time.time() < deadline:
+            page.wait_for_timeout(6000)
     return ""
 
 def _browser_post(username, history, folder_pool, manual=False) -> bool:
@@ -14547,10 +14547,12 @@ def _browser_maybe_run_readonly_listeners(username: str) -> None:
 def _browser_auto_choices(username: str, settings: dict, folder_pool) -> list[str]:
     choices = []
 
+    # Weight read-heavy Reel observation more than follow writes. This keeps the
+    # session active without turning activity into a dense stream of account writes.
+    if settings.get("enable_engage", False):
+        choices.extend(["reels", "reels"])
     if settings.get("enable_follow", False):
         choices.append("networking")
-    if settings.get("enable_engage", False):
-        choices.append("reels")
 
     if settings.get("enable_posts", False) and folder_pool:
         # Do not let a long upload cooldown stall an active browsing session.
@@ -15462,6 +15464,7 @@ def _control_browser_login_impl(username, timeout_seconds=600):
 
         _save_browser_sessionid(username, sessionid)
         _save_full_browser_storage_state(context, username)
+        BROWSER_LAST_STORAGE_SAVE_AT[username] = time.monotonic()
 
         # Do not close the external browser.
         LIVE_CDP_CONTEXT_IDS.discard(id(context))
@@ -15476,7 +15479,32 @@ def _control_browser_login_impl(username, timeout_seconds=600):
         ),
     )
 
+    # Browser-native is the default authenticated path. Mark it connected before
+    # any optional private-API probe so an API failure can never invalidate the
+    # already-working Chromium session.
+    _activate_browser_native_mode(
+        username,
+        "Authenticated Instagram Web session verified; low-request Browser Mode is active.",
+    )
+
     private_api_ready = False
+    if not BROWSER_PRIVATE_API_UPGRADE:
+        update_account_metric(
+            username, "add_history",
+            value=(
+                "🌐 Low-request mode: skipped duplicate instagrapi login/feed probe after "
+                "Browser Login. Set IG_BROWSER_PRIVATE_API_UPGRADE=1 only if you explicitly need it."
+            ),
+        )
+        return {
+            "ok": True,
+            "mode": "live_browser",
+            "browser_saved": True,
+            "live_browser": True,
+            "private_api_ready": False,
+            "message": "Live Instagram browser is authenticated; low-request Browser Mode is active.",
+        }
+
     cl = Client()
     _refresh_instagram_app_profile(cl, username)
 
@@ -17450,6 +17478,7 @@ def main():
     print("Dashboard account cap: 3")
     print("Boot mode: DISCONNECTED / AUTO OFF")
     print(f"Daily follow hard cap: {DAILY_FOLLOW_HARD_CAP} attempts per local day")
+    print(f"Low-request mode: browser-native default; private API upgrade={'ON' if BROWSER_PRIVATE_API_UPGRADE else 'OFF'}; auto follow bundle cap={AUTO_FOLLOW_COMPLIANCE_CAP}")
     print(
         "Auto cadence: Normal single-pass; Overnight uses "
         f"{ACTIVE_SESSION_MIN_SECONDS//60}-{ACTIVE_SESSION_MAX_SECONDS//60} min active sessions, "
