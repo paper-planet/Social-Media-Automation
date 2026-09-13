@@ -1,4 +1,5 @@
 import json
+import base64
 import hashlib
 import os
 import random
@@ -302,7 +303,7 @@ BROWSER_POST_AI_TIMEOUT_SECONDS = max(
     90,
     min(
         600,
-        int(os.environ.get("IG_BROWSER_POST_AI_TIMEOUT_SECONDS", "300")),
+        int(os.environ.get("IG_BROWSER_POST_AI_TIMEOUT_SECONDS", "420")),
     ),
 )
 BROWSER_POST_VISION_FRAMES = max(
@@ -311,6 +312,25 @@ BROWSER_POST_VISION_FRAMES = max(
         12,
         int(os.environ.get("IG_BROWSER_POST_VISION_FRAMES", "10")),
     ),
+)
+
+POST_VISION_AI_TIMEOUT_SECONDS = max(
+    45, min(180, int(os.environ.get("IG_POST_VISION_AI_TIMEOUT_SECONDS", "110")))
+)
+POST_SYNTHESIS_AI_TIMEOUT_SECONDS = max(
+    30, min(120, int(os.environ.get("IG_POST_SYNTHESIS_AI_TIMEOUT_SECONDS", "55")))
+)
+POST_FINAL_AI_TIMEOUT_SECONDS = max(
+    20, min(90, int(os.environ.get("IG_POST_FINAL_AI_TIMEOUT_SECONDS", "35")))
+)
+REEL_VISION_AI_TIMEOUT_SECONDS = max(
+    45, min(180, int(os.environ.get("IG_REEL_VISION_AI_TIMEOUT_SECONDS", "100")))
+)
+REEL_SYNTHESIS_AI_TIMEOUT_SECONDS = max(
+    30, min(120, int(os.environ.get("IG_REEL_SYNTHESIS_AI_TIMEOUT_SECONDS", "50")))
+)
+REEL_COMMENT_AI_TIMEOUT_SECONDS = max(
+    20, min(90, int(os.environ.get("IG_REEL_COMMENT_AI_TIMEOUT_SECONDS", "35")))
 )
 
 WORKFLOW_RETRY_IDLE_SECONDS = max(15, int(os.environ.get("IG_WORKFLOW_RETRY_IDLE_SECONDS", "45")))
@@ -1508,128 +1528,167 @@ def analyze_media_for_caption(
     require_video_vision=True,
     account_username=None,
 ):
-    clean_text=_sanitize_post_context(sidecar_text,source_account)
-    vision_model=get_ollama_vision_model()
+    """
+    Analyze one upload deeply without serially stacking every expensive step.
 
-    video=next((p for p in media_files if p.suffix.lower()==".mp4"),None)
-    image=next((p for p in media_files if p.suffix.lower() in {".jpg",".jpeg",".png"}),None)
+    For videos, visual interpretation and local audio transcription overlap:
+    Ollama uses the GPU while Whisper can use CPU. This preserves a long listen
+    window while keeping the overall caption path bounded.
+    """
+    clean_text = _sanitize_post_context(sidecar_text, source_account)
+    vision_model = get_ollama_vision_model()
 
-    media_kind="video" if video else ("image" if image else "unknown")
-    visual_files=[]
+    video = next((p for p in media_files if p.suffix.lower() == ".mp4"), None)
+    image = next((p for p in media_files if p.suffix.lower() in {".jpg", ".jpeg", ".png"}), None)
+    media_kind = "video" if video else ("image" if image else "unknown")
+
+    visual_files = []
     if video:
         try:
-            visual_files=extract_video_story_frames(video,frame_count)
+            visual_files = extract_video_story_frames(video, frame_count)
         except Exception:
-            visual_files=[]
+            visual_files = []
     elif image:
-        visual_files=[image]
+        visual_files = [image]
 
-    audio_transcript = ""
-    audio_backend = ""
-    if video and account_username:
-        audio_transcript, audio_backend = _transcribe_local_post_media(
-            video, account_username
-        )
-
-    if video and require_video_vision and (not vision_model or len(visual_files)<3):
+    if video and require_video_vision and (not vision_model or len(visual_files) < 3):
         return {
-            "context":"",
-            "perspective":"UNKNOWN",
-            "vision_model":vision_model,
-            "media_kind":"video",
-            "vision_required_failed":True,
-            "frames_analyzed":len(visual_files),
+            "context": "",
+            "perspective": "UNKNOWN",
+            "vision_model": vision_model,
+            "media_kind": "video",
+            "vision_required_failed": True,
+            "frames_analyzed": len(visual_files),
         }
 
-    visual_description=""
-    perspective="UNKNOWN"
+    visual_description = ""
+    perspective = "UNKNOWN"
+    vision_executor = None
+    vision_future = None
 
     if vision_model and visual_files:
-        if media_kind=="video":
+        if media_kind == "video":
             prompt = """
-These images are chronological frames sampled across ONE social-media video.
-Actually watch the sequence by comparing all frames from earliest to latest.
+These are chronological frames sampled across ONE social-media video.
+Interpret the full sequence from earliest to latest before anyone writes a caption.
 
 Return:
 PERSPECTIVE: POV_FIRST_PERSON | SELFIE_VLOG | THIRD_PERSON | UNKNOWN
-SEQUENCE: 5-10 concise sentences explaining what happens from beginning to end.
+SEQUENCE: 5-9 concise sentences explaining what changes from beginning to end.
 VISIBLE_TEXT: important readable text/signs/captions and how they affect meaning.
-KEY_DETAILS: 5-10 concrete objects/actions/results/details that distinguish this media.
-MAIN_POINT: what the clip is actually showing, arguing, demonstrating, joking about, or trying to convey.
+KEY_DETAILS: 5-9 concrete objects/actions/results/details unique to this media.
+MAIN_POINT: what the clip is showing, explaining, arguing, joking about, or demonstrating.
 CAPTION_ANGLES: 3-5 grounded caption angles.
-HASHTAG_TOPICS: 5-10 specific searchable subject/topic phrases, not generic social tags.
-AVOID_CLAIMS: anything the evidence does not support.
+HASHTAG_TOPICS: 6-10 specific searchable subject/topic phrases.
+AVOID_CLAIMS: unsupported claims to avoid.
 
 Rules:
-- Base the answer only on visible evidence across ALL chronological frames.
-- Compare early/middle/late frames instead of describing one frame.
-- Read visible text carefully and use it when it changes the meaning.
-- If this is POV/selfie/vlog footage, make that explicit.
-- Do not identify people by name or infer private traits.
-- Do not mention usernames, filenames, source accounts, reposting, or archive metadata.
-- Do not introduce trading or another topic unless it is visibly present.
+- Use all chronological frames; do not anchor on one frame.
+- Read visible text carefully.
+- Preserve uncertainty.
+- Do not invent identities, locations, relationships, expertise, or topics.
+- Do not mention source handles, filenames, reposting, or archive metadata.
 """.strip()
         else:
             prompt = """
 Analyze this social-media image carefully for caption and hashtag writing.
-If the image contains substantial text, a screenshot, meme, sign, quote, argument,
-chart annotation, or written opinion, the WRITTEN CONTENT is a primary subject:
-read it before describing the background.
+If it contains substantial text, a screenshot, meme, sign, quote, argument,
+chart annotation, or written opinion, the WRITTEN CONTENT is a primary subject.
+Read and interpret it before describing background scenery.
 
 Return:
 PERSPECTIVE: SELFIE_VLOG | THIRD_PERSON | UNKNOWN
-VISIBLE_TEXT: transcribe/summarize the important readable text as accurately as possible.
+VISIBLE_TEXT: transcribe/summarize important readable text accurately.
 VISUAL_CONTEXT: what is physically visible besides the text.
 MAIN_POINT: what the image/text is actually communicating or arguing.
 KEY_DETAILS: 4-8 specific grounded details.
 CAPTION_ANGLES: 3-5 grounded caption angles.
-HASHTAG_TOPICS: 5-10 specific searchable subject/topic phrases.
+HASHTAG_TOPICS: 6-10 specific searchable subject/topic phrases.
 AVOID_CLAIMS: unsupported inferences to avoid.
 
 Do not identify people by name, infer private traits, mention usernames/files, or invent topics.
 """.strip()
-        try:
-            response=ollama.chat(
+
+        def run_vision():
+            return _ollama_chat_bounded(
                 model=vision_model,
                 messages=[{
-                    "role":"user",
-                    "content":prompt,
-                    "images":[str(p) for p in visual_files],
+                    "role": "user",
+                    "content": prompt,
+                    "images": [str(p) for p in visual_files],
                 }],
-                options={"temperature":0.12,"top_p":0.8},
+                options=_ollama_hybrid_options(
+                    account_username,
+                    temperature=0.10,
+                    top_p=0.78,
+                    num_predict=520,
+                ),
+                timeout_seconds=POST_VISION_AI_TIMEOUT_SECONDS,
             )
-            raw=str(
-                response.get("message",{}).get("content","")
-                if isinstance(response,dict)
-                else getattr(getattr(response,"message",None),"content","")
-            ).strip()
-            m=re.search(
+
+        # Run GPU vision while CPU Whisper listens to the upload.
+        vision_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ig-post-vision")
+        vision_future = vision_executor.submit(run_vision)
+
+    audio_transcript = ""
+    audio_backend = ""
+    if video and account_username:
+        try:
+            update_account_metric(
+                account_username,
+                "add_history",
+                value=(
+                    "🎧 Browser Post listening to local upload audio while vision analyzes "
+                    "chronological frames in parallel."
+                ),
+            )
+        except Exception:
+            pass
+        audio_transcript, audio_backend = _transcribe_local_post_media(video, account_username)
+
+    if vision_future is not None:
+        try:
+            response = vision_future.result(timeout=POST_VISION_AI_TIMEOUT_SECONDS + 5)
+            raw = str(response.get("message", {}).get("content", "") if isinstance(response, dict) else "").strip()
+            m = re.search(
                 r"PERSPECTIVE:\s*(POV_FIRST_PERSON|SELFIE_VLOG|THIRD_PERSON|UNKNOWN)",
-                raw,re.I
+                raw,
+                re.I,
             )
             if m:
-                perspective=m.group(1).upper()
-            visual_description=re.sub(
-                r"(?<!\w)@[A-Za-z0-9._]{2,}","",raw
-            ).strip()[:3500]
-        except Exception:
-            visual_description=""
+                perspective = m.group(1).upper()
+            visual_description = re.sub(r"(?<!\w)@[A-Za-z0-9._]{2,}", "", raw).strip()[:6000]
+        except Exception as exc:
+            if account_username:
+                try:
+                    update_account_metric(
+                        account_username,
+                        "add_history",
+                        value=f"⚠️ Post vision stage bounded out ({type(exc).__name__}); continuing with audio/text evidence.",
+                    )
+                except Exception:
+                    pass
+        finally:
+            try:
+                vision_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
-    pieces=[]
+    pieces = []
     if visual_description:
-        pieces.append("VIDEO/IMAGE VISUAL ANALYSIS:\n"+visual_description)
+        pieces.append("VIDEO/IMAGE VISUAL ANALYSIS:\n" + visual_description)
     if audio_transcript:
         pieces.append(
             "LOCAL AUDIO TRANSCRIPT"
             + (f" ({audio_backend})" if audio_backend else "")
-            + ":\n" + audio_transcript
+            + ":\n"
+            + audio_transcript
         )
     if clean_text:
-        pieces.append("SUPPORTING TEXT CONTEXT:\n"+clean_text)
+        pieces.append("SUPPORTING TEXT CONTEXT:\n" + clean_text)
     if not pieces:
         pieces.append(
-            "No reliable semantic description is available. Do not invent a topic, "
-            "identity, profession, location, or event."
+            "No reliable semantic description is available. Do not invent a topic, identity, profession, location, or event."
         )
 
     evidence = "\n\n".join(pieces)
@@ -1637,41 +1696,45 @@ Do not identify people by name, infer private traits, mention usernames/files, o
     if visual_description or audio_transcript or clean_text:
         synthesis_prompt = f"""
 Interpret this ONE social-media post before anyone writes its caption or hashtags.
-Use all available visual, audio, and written evidence together.
+Use visual progression, actual local audio transcript, and written evidence together.
 
 EVIDENCE:
-{evidence[:16000]}
+{evidence[:15000]}
 
 Return:
-POST_SUMMARY: a specific beginning-to-end / whole-image understanding.
+POST_SUMMARY: a specific whole-post understanding.
 MAIN_POINT: what the post is really about or trying to communicate.
 IMPORTANT_WORDS_OR_SPEECH: key written/spoken content that changes meaning.
-KEY_DETAILS: 6-12 concrete details grounded in evidence.
-CAPTION_DIRECTIONS: 4-6 specific possible angles that fit this exact post.
-HASHTAG_CONCEPTS: 8-12 specific searchable concepts grounded in this post.
-AVOID_CLAIMS: facts/identities/locations not supported by the evidence.
+KEY_DETAILS: 5-9 concrete details grounded in evidence.
+CAPTION_DIRECTIONS: 3-5 specific angles that fit this exact post.
+HASHTAG_CONCEPTS: 6-10 specific searchable concepts grounded in this post.
+AVOID_CLAIMS: unsupported facts/identities/locations to avoid.
 
 Do not write the final caption yet. Do not invent missing facts.
 """.strip()
         try:
-            response = ollama.chat(
+            response = _ollama_chat_bounded(
                 model=OLLAMA_MODEL,
                 messages=[
                     {
-                        "role":"system",
-                        "content":(
-                            "Interpret multimodal social media evidence carefully. "
-                            "Specificity and accuracy matter more than cleverness."
-                        ),
+                        "role": "system",
+                        "content": "Interpret multimodal social-media evidence accurately and concisely.",
                     },
-                    {"role":"user","content":synthesis_prompt},
+                    {"role": "user", "content": synthesis_prompt},
                 ],
-                options={"temperature":0.08,"top_p":0.75,"num_predict":900},
+                options=_ollama_hybrid_options(
+                    account_username,
+                    temperature=0.06,
+                    top_p=0.75,
+                    num_predict=420,
+                ),
+                timeout_seconds=POST_SYNTHESIS_AI_TIMEOUT_SECONDS,
             )
-            interpreted = _clean_ollama_output(
-                response.get("message",{}).get("content","")
-                if isinstance(response,dict)
-                else getattr(getattr(response,"message",None),"content","")
+            interpreted = str(
+                response.get("message", {}).get("content", "") if isinstance(response, dict) else ""
+            ).strip()
+            interpreted = _strip_generation_edge_quotes(
+                re.sub(r"(?<!\w)@[A-Za-z0-9._]{2,}", "", interpreted)
             ).strip()
         except Exception:
             interpreted = ""
@@ -1682,16 +1745,29 @@ Do not write the final caption yet. Do not invent missing facts.
         else evidence
     )
 
+    if account_username:
+        try:
+            update_account_metric(
+                account_username,
+                "add_history",
+                value=(
+                    f"🔬 Post context ready: frames={len(visual_files)}, "
+                    f"audio_chars={len(audio_transcript)}, synthesis={'yes' if interpreted else 'fallback-to-evidence'}."
+                ),
+            )
+        except Exception:
+            pass
+
     return {
-        "context":context[:20000],
-        "perspective":perspective,
-        "vision_model":vision_model,
-        "media_kind":media_kind,
-        "vision_required_failed":False,
-        "frames_analyzed":len(visual_files),
-        "audio_transcript_chars":len(audio_transcript),
-        "audio_backend":audio_backend,
-        "deep_interpreted":bool(interpreted),
+        "context": context[:20000],
+        "perspective": perspective,
+        "vision_model": vision_model,
+        "media_kind": media_kind,
+        "vision_required_failed": False,
+        "frames_analyzed": len(visual_files),
+        "audio_transcript_chars": len(audio_transcript),
+        "audio_backend": audio_backend,
+        "deep_interpreted": bool(interpreted),
     }
 
 
@@ -5772,6 +5848,99 @@ def _browser_wait_for_follow_gap(username: str) -> bool:
     return False
 
 
+def _browser_reserve_follow_slot_in_place(username: str, max_wait_seconds: int = 45) -> tuple[bool, str]:
+    """
+    Reserve the next Browser Follow write without abandoning the already-open
+    Followers/Following dialog just because the shared cross-process gap has a
+    few seconds remaining. Rolling-budget, daily-cap, and safety failures still
+    stop the batch immediately.
+    """
+    deadline = time.monotonic() + max(5, int(max_wait_seconds))
+    last_reason = ""
+    notice_sent = False
+
+    while time.monotonic() < deadline:
+        ok, reason = _reserve_browser_follow_slot(username)
+        if ok:
+            return True, ""
+
+        last_reason = str(reason or "")
+        lower = last_reason.lower()
+
+        # Temporary contention/gap: keep the current people-list popup open and
+        # wait it out rather than closing/reopening profiles between every follow.
+        retryable = (
+            "shared global gap" in lower
+            or "shared pacing lock busy" in lower
+        )
+        if not retryable:
+            return False, last_reason
+
+        wait_match = re.search(r"retry in ~?(\d+)s", last_reason, re.I)
+        remaining = int(wait_match.group(1)) if wait_match else 2
+        remaining = max(1, min(remaining + 1, 20))
+
+        if not notice_sent:
+            update_account_metric(
+                username,
+                "add_history",
+                value=(
+                    f"⏳ Follow bundle keeping the same people-list popup open; "
+                    f"waiting ~{remaining}s for the shared write gap instead of "
+                    "refreshing/reopening the target."
+                ),
+            )
+            notice_sent = True
+
+        sleep_for = min(1.0, max(0.25, deadline - time.monotonic()))
+        if sleep_for <= 0:
+            break
+        time.sleep(sleep_for)
+
+    return False, last_reason or "follow write slot wait expired"
+
+
+def _browser_scroll_network_dialog(root, page, username: str, *, reason: str = "") -> bool:
+    """Scroll the actual scrollable element inside the already-open people list."""
+    try:
+        moved = root.evaluate(
+            """(el) => {
+                const nodes = [el, ...el.querySelectorAll('div')];
+                const scrollables = nodes.filter(n => {
+                    try {
+                        const st = getComputedStyle(n);
+                        const oy = st.overflowY || '';
+                        return n.scrollHeight > n.clientHeight + 60 &&
+                               (oy === 'auto' || oy === 'scroll' || n === el);
+                    } catch (e) { return false; }
+                });
+                const target = scrollables.sort((a,b) =>
+                    (b.scrollHeight-b.clientHeight) - (a.scrollHeight-a.clientHeight)
+                )[0];
+                if (!target) return false;
+                const before = target.scrollTop;
+                const amount = Math.max(460, target.clientHeight * 0.78);
+                target.scrollBy({top: amount, behavior: 'smooth'});
+                return target.scrollTop !== before || target.scrollHeight > target.clientHeight;
+            }"""
+        )
+    except Exception:
+        moved = False
+
+    try:
+        page.wait_for_timeout(random.randint(550, 850))
+    except Exception:
+        pass
+
+    if moved and reason:
+        update_account_metric(
+            username,
+            "add_history",
+            value=f"↕️ Follow bundle scrolled inside the same people-list popup ({reason}).",
+        )
+    return bool(moved)
+
+
 def _browser_candidate_row(root, candidate_name: str):
     """
     Re-query the live follower/following row by username after Instagram rerenders.
@@ -7040,7 +7209,7 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
             f"🌐 Browser Follow: @{target} {source}; "
             f"batch target={limit}; "
             f"mode={'visible-manual' if manual else 'visible-auto'}; "
-            f"visible rows only; no list refresh/scroll; "
+            f"same popup; scroll-through bundle; no profile refresh between follows; "
             f"daily follows={daily_used}/{daily_cap}; "
             f"browser gap≈{BROWSER_FOLLOW_MIN_GAP_SECONDS}s"
         ),
@@ -7176,12 +7345,15 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                         update_account_metric(username,"add_history",value="👁️ Auto Follow: no additional Follow rows loaded after in-popup scrolling; ending without refreshing/reopening.")
                         break
                     update_account_metric(username,"add_history",value=f"↕️ Auto Follow needs {limit-attempt_count} more attempt(s); scrolling inside the same open people-list popup.")
-                    try:
-                        root.evaluate("(el) => el.scrollBy(0, Math.max(420, el.clientHeight * 0.72))")
-                    except Exception:
-                        try: root.locator("div").last.scroll_into_view_if_needed(timeout=900)
-                        except Exception: pass
-                    page.wait_for_timeout(800)
+                    moved = _browser_scroll_network_dialog(
+                        root, page, username, reason="looking for additional Follow rows"
+                    )
+                    if not moved:
+                        try:
+                            root.locator("div").last.scroll_into_view_if_needed(timeout=900)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(700)
                     continue
 
                 idle_rounds = 0
@@ -7196,14 +7368,17 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                     )
                     break
 
-                slot_ok, slot_reason = _reserve_browser_follow_slot(username)
+                slot_ok, slot_reason = _browser_reserve_follow_slot_in_place(
+                    username,
+                    max_wait_seconds=max(30, GLOBAL_WRITE_MIN_GAP_SECONDS + 15),
+                )
                 if not slot_ok:
                     update_account_metric(
                         username,
                         "add_history",
                         value=(
-                            "⏳ Browser Follow batch stopped by rolling "
-                            f"write budget: {slot_reason}"
+                            "⏳ Browser Follow bundle stopped by a real pacing/safety "
+                            f"limit: {slot_reason}"
                         ),
                     )
                     break
@@ -7314,17 +7489,22 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                         ),
                     )
 
-                # Keep the same people-list viewport fixed for the entire
-                # batch. We only act on Follow buttons that are already visible.
-
+                # Progress through the same open people-list instead of ending
+                # the workflow and reopening a target profile on the next session step.
                 if attempt_count < limit:
-                    between_follow_gap = random.uniform(3.0, 6.0)
+                    _browser_scroll_network_dialog(
+                        root,
+                        page,
+                        username,
+                        reason=f"advancing bundle after attempt {attempt_count}/{limit}",
+                    )
+                    between_follow_gap = random.uniform(1.5, 3.0)
                     update_account_metric(
                         username,
                         "add_history",
                         value=(
-                            f"… Visible follow batch gap ~{between_follow_gap:.1f}s "
-                            "before the next currently visible row."
+                            f"… Follow bundle UI settle ~{between_follow_gap:.1f}s; "
+                            "the same popup remains open while the shared write gap is enforced."
                         ),
                     )
                     page.wait_for_timeout(int(between_follow_gap * 1000))
@@ -7351,7 +7531,7 @@ def _browser_follow_network(username, history, config, manual=False) -> int:
                 username,
                 "add_history",
                 value=(
-                    f"🌐 Browser Follow visible batch finished: "
+                    f"🌐 Browser Follow scroll-through bundle finished: "
                     f"{attempt_count}/{limit} attempt(s), "
                     f"{confirmed_count} confirmed; popup stayed in place; "
                     f"daily follows={daily_used_after}/{daily_cap_after}."
@@ -7905,6 +8085,59 @@ def _browser_collect_engage_links(
             break
 
     return links
+
+
+def _browser_collect_hashtag_reel_links(
+    page,
+    username: str,
+    target_count: int = 12,
+    scroll_steps: int = 6,
+) -> list[str]:
+    """Collect Reel permalinks only from the currently open hashtag page."""
+    links: list[str] = []
+
+    def collect() -> None:
+        try:
+            hrefs = page.locator("a[href*='/reel/']").evaluate_all(
+                """els => els.map(e => e.href || e.getAttribute('href') || '').filter(Boolean)"""
+            )
+        except Exception:
+            hrefs = []
+        for href in hrefs:
+            clean = str(href or "").split("?", 1)[0]
+            if "/reel/" in clean and clean not in links:
+                links.append(clean)
+
+    collect()
+    for step in range(max(1, int(scroll_steps))):
+        if len(links) >= max(3, int(target_count)):
+            break
+        problem = _browser_page_problem(page)
+        if problem:
+            _browser_pause_for_manual_security(username, problem)
+            break
+        try:
+            page.mouse.wheel(0, random.randint(700, 1250))
+        except Exception:
+            try:
+                page.evaluate(
+                    "(y) => window.scrollBy({top:y,behavior:'smooth'})",
+                    random.randint(700, 1250),
+                )
+            except Exception:
+                pass
+        page.wait_for_timeout(random.randint(500, 850))
+        collect()
+        update_account_metric(
+            username,
+            "add_history",
+            value=(
+                f"↕️ Hashtag Reels discovery scroll {step + 1}/{scroll_steps}; "
+                f"reel links={len(links)}."
+            ),
+        )
+    return links
+
 
 def _browser_visible_reel_scope(page):
     """
@@ -8665,7 +8898,7 @@ Rules:
 """.strip()
 
     try:
-        response = ollama.chat(
+        response = _ollama_chat_bounded(
             model=model,
             messages=[{
                 "role": "user",
@@ -8676,8 +8909,9 @@ Rules:
                 username,
                 temperature=0.04,
                 top_p=0.70,
-                num_predict=850,
+                num_predict=520,
             ),
+            timeout_seconds=REEL_VISION_AI_TIMEOUT_SECONDS,
         )
 
         raw = str(
@@ -8908,6 +9142,102 @@ def _ollama_hybrid_options(
         options["num_predict"] = int(num_predict)
 
     return options
+
+
+def _ollama_chat_bounded(*, model, messages, options=None, timeout_seconds=60):
+    """
+    Call the local Ollama HTTP API with a real socket timeout.
+
+    This prevents a slow caption/comment stage from surviving in a background
+    worker after the outer workflow has already fallen back. Image paths are
+    converted to base64 exactly for Ollama's /api/chat endpoint.
+    """
+    host = str(os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434") or "").strip()
+    if not host:
+        host = "http://127.0.0.1:11434"
+    if not re.match(r"^https?://", host, re.I):
+        host = "http://" + host
+    host = host.rstrip("/")
+
+    cooked = []
+    for message in messages or []:
+        row = dict(message)
+        image_values = []
+        for image_path in row.get("images") or []:
+            try:
+                image_values.append(
+                    base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+                )
+            except Exception:
+                continue
+        if image_values:
+            row["images"] = image_values
+        else:
+            row.pop("images", None)
+        cooked.append(row)
+
+    payload = json.dumps({
+        "model": model,
+        "messages": cooked,
+        "stream": False,
+        "options": options or {},
+        "keep_alive": "5m",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        host + "/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=max(5, float(timeout_seconds))) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _ollama_generate_bounded(
+    task_prompt,
+    *,
+    username=None,
+    system_prompt=None,
+    min_words=3,
+    max_words=80,
+    timeout_seconds=35,
+    attempts=2,
+):
+    """Small, bounded text generation for final captions/comments."""
+    system_prompt = str(system_prompt or RAGE_BAIT_PERSONA).strip()
+    for attempt in range(max(1, int(attempts))):
+        repair = "" if attempt == 0 else (
+            "\nRewrite once. Output one complete natural response only; no labels, quotes, or analysis."
+        )
+        try:
+            response = _ollama_chat_bounded(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": str(task_prompt) + repair},
+                ],
+                options=_ollama_hybrid_options(
+                    username,
+                    temperature=0.55 if attempt == 0 else 0.35,
+                    top_p=0.85,
+                    num_predict=max(80, min(220, max_words * 6)),
+                ),
+                timeout_seconds=timeout_seconds,
+            )
+            raw = (
+                response.get("message", {}).get("content", "")
+                if isinstance(response, dict)
+                else ""
+            )
+            candidate = _clean_ollama_output(raw)
+        except Exception:
+            continue
+
+        words = candidate.split()
+        if min_words <= len(words) <= max_words and candidate:
+            return candidate
+    return ""
 
 
 def _browser_reel_video_metadata(page, scope=None) -> dict:
@@ -9611,7 +9941,7 @@ Do not invent facts beyond the evidence.
 """.strip()
 
             try:
-                response = ollama.chat(
+                response = _ollama_chat_bounded(
                     model=OLLAMA_MODEL,
                     messages=[
                         {
@@ -9630,8 +9960,9 @@ Do not invent facts beyond the evidence.
                         username,
                         temperature=0.05,
                         top_p=0.72,
-                        num_predict=700,
+                        num_predict=380,
                     ),
+                    timeout_seconds=REEL_SYNTHESIS_AI_TIMEOUT_SECONDS,
                 )
                 merged = _clean_ollama_output(
                     response.get("message", {}).get("content", "")
@@ -9754,7 +10085,7 @@ AVOID_CLAIMS: unsupported claims to avoid.
 
 Do not write the final comment yet. Do not invent facts.
 """.strip()
-        response = ollama.chat(
+        response = _ollama_chat_bounded(
             model=OLLAMA_MODEL,
             messages=[
                 {
@@ -9767,8 +10098,9 @@ Do not write the final comment yet. Do not invent facts.
                 {"role":"user","content":interpretation_prompt},
             ],
             options=_ollama_hybrid_options(
-                username, temperature=0.08, top_p=0.75, num_predict=650
+                username, temperature=0.08, top_p=0.75, num_predict=360
             ),
+            timeout_seconds=REEL_SYNTHESIS_AI_TIMEOUT_SECONDS,
         )
         interpretation = _clean_ollama_output(
             response.get("message",{}).get("content","")
@@ -9838,11 +10170,12 @@ Requirements:
     )
 
     try:
-        result = _ollama_generate(
+        result = _ollama_generate_bounded(
             prompt,
             min_words=5,
             max_words=28,
-            attempts=3,
+            attempts=2,
+            timeout_seconds=REEL_COMMENT_AI_TIMEOUT_SECONDS,
             system_prompt=system_prompt,
             username=username,
         )
@@ -11853,8 +12186,8 @@ def _browser_auto_reels(username, history, config) -> int:
         username,
         "add_history",
         value=(
-            "🎞️ Auto Reels pass starting: shared reel engine, random action "
-            "order, deferred pacing-blocked actions."
+            "🎞️ Auto Reels pass starting: predefined-hashtag Reel discovery first, "
+            "then shared reel engine with deferred pacing-blocked actions."
         ),
     )
 
@@ -11867,15 +12200,78 @@ def _browser_auto_reels(username, history, config) -> int:
         page = _browser_pick_active_instagram_page(context)
 
         try:
-            try:
-                current_url = str(page.url or "").lower()
-            except Exception:
-                current_url = ""
+            # Prefer Reels discovered under the user's configured hashtags.
+            # Generic /reels/ is now only a fallback when a configured hashtag
+            # does not expose any Reel links in the current web layout.
+            tags = _normalize_hashtag_list(
+                settings.get("target_hashtags")
+                or list(config.get("target_hashtags") or [])
+            )
+            selected_tag = ""
+            selected_reel = ""
 
-            if (
-                "instagram.com/reel/" not in current_url
-                and "instagram.com/reels" not in current_url
-            ):
+            if tags:
+                tag_index = int(history.get("browser_reels_hashtag_index", 0) or 0)
+                selected_tag = tags[tag_index % len(tags)].lstrip("#")
+                history["browser_reels_hashtag_index"] = tag_index + 1
+
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"#️⃣ Auto Reels focusing on predefined hashtag #{selected_tag}; "
+                        "collecting Reel links only."
+                    ),
+                )
+
+                page.goto(
+                    f"https://www.instagram.com/explore/tags/{selected_tag}/",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(1200)
+                _browser_check_ready(page, context, username)
+
+                reel_links = _browser_collect_hashtag_reel_links(
+                    page,
+                    username,
+                    target_count=max(8, int(settings.get("engage_clips_per_pass", 12))),
+                    scroll_steps=max(3, min(10, int(settings.get("engage_scroll_steps", 8)))),
+                )
+
+                seen = set(history.get("browser_liked_urls", [])) | set(
+                    history.get("browser_commented_urls", [])
+                )
+                fresh_links = [href for href in reel_links if href not in seen]
+                pool = fresh_links or reel_links
+                if pool:
+                    selected_reel = random.choice(pool[: max(1, min(len(pool), 20))])
+                    update_account_metric(
+                        username,
+                        "add_history",
+                        value=(
+                            f"🎯 Hashtag Reels selected a Reel from #{selected_tag}: "
+                            f"{selected_reel}"
+                        ),
+                    )
+                    page.goto(
+                        selected_reel,
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    page.wait_for_timeout(1000)
+
+            if not selected_reel:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        "ℹ️ No Reel permalink was available from the selected configured "
+                        "hashtag; falling back to the generic Reels feed for this pass."
+                        if tags
+                        else "ℹ️ No target hashtags configured; using the generic Reels feed."
+                    ),
+                )
                 page.goto(
                     "https://www.instagram.com/reels/",
                     wait_until="domcontentloaded",
@@ -11925,20 +12321,31 @@ def _browser_auto_reels(username, history, config) -> int:
                 ),
             )
 
-            # Prepare the next reel for the next Auto pass. The current pass
-            # still counts only once regardless of its five sub-actions.
-            try:
-                if _browser_reels_scroll_next(page):
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value=(
-                            "↕️ Auto Reels advanced once and left the next reel "
-                            "visible for the next pass."
-                        ),
-                    )
-            except Exception:
-                pass
+            # Hashtag-focused Auto Reels deliberately re-enters the configured
+            # hashtag source on the next pass instead of drifting into Instagram's
+            # unrelated generic Reel recommendations.
+            if selected_tag:
+                update_account_metric(
+                    username,
+                    "add_history",
+                    value=(
+                        f"#️⃣ Auto Reels will source the next pass from the configured "
+                        f"hashtag rotation instead of continuing the generic Reel feed."
+                    ),
+                )
+            else:
+                try:
+                    if _browser_reels_scroll_next(page):
+                        update_account_metric(
+                            username,
+                            "add_history",
+                            value=(
+                                "↕️ Auto Reels advanced once and left the next reel "
+                                "visible for the next pass."
+                            ),
+                        )
+                except Exception:
+                    pass
 
             return confirmed
 
@@ -12823,11 +13230,18 @@ def _browser_fallback_caption(
         selection["folder"].get("source", ""),
     ).strip()
 
-    if clean_sidecar:
-        caption = _clip_chars(
-            clean_sidecar.splitlines()[0].strip(),
-            260,
-        )
+    analysis_context = str((analysis or {}).get("context") or "").strip()
+    analysis_caption = ""
+    for label in ("POST_SUMMARY", "MAIN_POINT", "CAPTION_DIRECTIONS"):
+        m = re.search(rf"{label}:\s*([^\n]+)", analysis_context, re.I)
+        if m and m.group(1).strip():
+            analysis_caption = m.group(1).strip()
+            break
+
+    if analysis_caption:
+        caption = _clip_chars(_strip_generation_edge_quotes(analysis_caption), 280)
+    elif clean_sidecar:
+        caption = _clip_chars(clean_sidecar.splitlines()[0].strip(), 260)
     else:
         topic = _browser_post_topic(selection, analysis)
         if topic == "finance":
@@ -12837,10 +13251,23 @@ def _browser_fallback_caption(
         else:
             caption = "Worth a closer look."
 
+    concept_tags = []
+    m = re.search(
+        r"(?:HASHTAG_CONCEPTS|HASHTAG_TOPICS):\s*([^\n]+)",
+        analysis_context,
+        re.I,
+    )
+    if m:
+        for item in re.split(r"[,;|]", m.group(1)):
+            cleaned = _browser_clean_hashtag(item.replace(" ", ""))
+            if cleaned and cleaned not in concept_tags:
+                concept_tags.append(cleaned)
+
     tags = _browser_preferred_post_hashtags(
         username,
         selection,
         analysis,
+        ai_tags=concept_tags,
     )
     tag_line = " ".join(tags)
 
@@ -12969,17 +13396,19 @@ Rules:
 """.strip()
 
     try:
-        response = ollama.chat(
+        response = _ollama_chat_bounded(
             model=OLLAMA_MODEL,
             messages=[
                 {"role": "system", "content": persona},
                 {"role": "user", "content": prompt},
             ],
-            options={
-                "temperature": 0.5,
-                "top_p": 0.85,
-                "num_predict": 220,
-            },
+            options=_ollama_hybrid_options(
+                username,
+                temperature=0.45,
+                top_p=0.84,
+                num_predict=160,
+            ),
+            timeout_seconds=POST_FINAL_AI_TIMEOUT_SECONDS,
         )
 
         raw = str(
@@ -13340,8 +13769,8 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
                 "add_history",
                 value=(
                     "🧠 Browser Post AI started AFTER media attachment. "
-                    f"Vision uses up to {BROWSER_POST_VISION_FRAMES} frame(s); "
-                    "caption + hashtags use one text-model call."
+                    f"Vision uses up to {BROWSER_POST_VISION_FRAMES} chronological frame(s); "
+                    "audio + vision overlap, then a bounded interpretation and final caption/hashtag pass."
                 ),
             )
 
