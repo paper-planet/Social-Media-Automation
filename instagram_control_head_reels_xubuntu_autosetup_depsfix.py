@@ -539,13 +539,9 @@ BROWSER_LOGIN_FINISH_SECONDS = max(
 )
 
 
-BROWSER_POST_AI_TIMEOUT_SECONDS = max(
-    90,
-    min(
-        600,
-        int(os.environ.get("IG_BROWSER_POST_AI_TIMEOUT_SECONDS", "300")),
-    ),
-)
+# Retained for backwards-compatible configuration display only. Browser Post AI
+# no longer uses a hard timeout; local analysis may take as long as necessary.
+BROWSER_POST_AI_TIMEOUT_SECONDS = 0
 BROWSER_POST_VISION_FRAMES = max(
     6,
     min(
@@ -559,7 +555,7 @@ BROWSER_POST_VISION_FRAMES = max(
 # chronological frames plus OCR/audio can exceed that default even when the
 # textual prompt is modest. Keep a bounded, user-overridable context instead
 # of letting Ollama reject the request at ~4k tokens.
-OLLAMA_VISION_CONTEXT = max(8192, min(32768, int(os.environ.get("IG_OLLAMA_VISION_CONTEXT", "16384"))))
+OLLAMA_VISION_CONTEXT = max(8192, min(65536, int(os.environ.get("IG_OLLAMA_VISION_CONTEXT", "32768"))))
 OLLAMA_TEXT_CONTEXT = max(4096, min(16384, int(os.environ.get("IG_OLLAMA_TEXT_CONTEXT", "8192"))))
 
 WORKFLOW_RETRY_IDLE_SECONDS = max(15, int(os.environ.get("IG_WORKFLOW_RETRY_IDLE_SECONDS", "45")))
@@ -16521,31 +16517,13 @@ def _browser_post(username, history, folder_pool, manual=False) -> bool:
 
             while generated is None:
                 elapsed = time.time() - ai_started
-                remaining = BROWSER_POST_AI_TIMEOUT_SECONDS - elapsed
 
-                if remaining <= 0:
-                    generated = _browser_fallback_caption(
-                        username,
-                        selection,
-                        reason=(
-                            f"AI exceeded "
-                            f"{BROWSER_POST_AI_TIMEOUT_SECONDS}s timeout"
-                        ),
-                    )
-                    update_account_metric(
-                        username,
-                        "add_history",
-                        value=(
-                            "⚠️ Browser Post AI timed out; continuing with "
-                            "fallback caption instead of cancelling upload."
-                        ),
-                    )
-                    break
-
+                # Quality-first mode: do not abandon local caption analysis just
+                # because a large vision/audio job takes several minutes. The
+                # worker may take as long as the local models need; this loop only
+                # polls so the dashboard can keep reporting progress.
                 try:
-                    generated = ai_future.result(
-                        timeout=min(12, max(1, remaining))
-                    )
+                    generated = ai_future.result(timeout=12)
                 except FutureTimeoutError:
                     if time.time() - last_notice >= 15:
                         update_account_metric(
